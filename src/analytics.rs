@@ -556,6 +556,47 @@ mod tests {
     }
 
     #[test]
+    fn scan_query_rejects_ambiguous_or_unknown_contract_inputs() {
+        for query in [
+            "unknown=value",
+            "columns=timestamp&columns=message",
+            "columns=timestamp,timestamp",
+            "columns=timestamp,unknown",
+            "columns=",
+            "start_ns=20&end_ns=20",
+            "start_ns=21&end_ns=20",
+            "start_ns=-1",
+            "limit=-1",
+            "label.=value",
+            "metadata.=value",
+        ] {
+            assert!(
+                parse_scan_request("tenant-a".to_owned(), Some(query)).is_err(),
+                "query must fail closed: {query}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_limit_is_a_valid_empty_scan() {
+        let entries = vec![LokiEntry {
+            timestamp_unix_nanos: 11,
+            labels: BTreeMap::new(),
+            line: "must not be emitted".to_owned(),
+            structured_metadata: BTreeMap::new(),
+        }];
+        let request = parse_scan_request("tenant-a".to_owned(), Some("limit=0"))
+            .expect("zero limit is valid");
+        let mut called = false;
+        scan_entries(entries, &request, &mut |_| {
+            called = true;
+            Ok(())
+        })
+        .expect("empty scan");
+        assert!(!called);
+    }
+
+    #[test]
     fn projected_arrow_batch_preserves_timestamp_message_and_maps() {
         let rows = vec![AnalyticsLogRow {
             tenant: Arc::from("tenant-a"),

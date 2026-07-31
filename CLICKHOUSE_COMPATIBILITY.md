@@ -1,9 +1,11 @@
 # ClickHouse query compatibility
 
-ShardLog delegates analytical SQL semantics to an unmodified ClickHouse query
-node and remains responsible for log ingestion, indexing, compression, and
-tiered storage. The pinned compatibility target is
-`ClickHouse 26.3.17.56 LTS`. The Adam acceptance image is pinned as
+ShardLog delegates analytical SQL semantics to a pinned ClickHouse query node
+and remains responsible for log ingestion, indexing, compression, and tiered
+storage. The query evaluator remains unmodified. Production automatic pushdown
+uses the narrow in-tree `StorageShardLog` adapter described below; the generic
+URL path remains available for an entirely stock ClickHouse binary. The pinned
+compatibility target is `ClickHouse 26.3.17.56 LTS`. The Adam acceptance image is pinned as
 `clickhouse@sha256:badd3bb0d34055bfa521b7b71bbee92aa7ec0025a90f1a1a5ec49c5b8ee0ba90`.
 
 This boundary makes ClickHouse, rather than a second SQL implementation, the
@@ -69,10 +71,16 @@ translated to `LogQuery` before records are reconstructed. Projection controls
 which Arrow arrays are allocated and transmitted.
 
 The generic ClickHouse `URL` engine does not infer these parameters from a SQL
-`WHERE` clause. The initial adapter therefore supports explicit pushdown in the
-source URL. A native `StorageShardLog` integration will translate the
-ClickHouse query plan into the same scan request automatically; it must not
-define a second storage contract.
+`WHERE` clause. It therefore supports explicit pushdown in the source URL.
+
+The pinned `StorageShardLog` adapter in `clickhouse/adapter` subclasses
+ClickHouse's `StorageURL` and overrides only its URI-parameter hook. It obtains
+the physical projection and analyzed filter DAG from `SelectQueryInfo` and
+automatically translates safe timestamp and exact map equalities into the same
+scan contract. The original filter remains in ClickHouse as a residual, so an
+unsupported expression loses performance rather than correctness. See
+`clickhouse/adapter/README.md` for installation, DDL, and the exact pushdown
+rules.
 
 ## ClickHouse source
 
@@ -97,8 +105,9 @@ GROUP BY service
 ORDER BY records DESC;
 ```
 
-`clickhouse/shardlog-url.sql` contains the corresponding table-engine
-template. ClickHouse stores URL-engine headers in table metadata, so production
+`clickhouse/shardlog-url.sql` contains the generic URL-engine template and
+`clickhouse/shardlog-engine.sql` contains the automatic-pushdown template.
+ClickHouse stores engine headers in table metadata, so production
 deployments should inject a short-lived credential or use a trusted local
 proxy rather than committing a token to SQL.
 
@@ -111,9 +120,16 @@ query matrix against:
 2. an equivalent ClickHouse `Memory` table populated from that source.
 
 It compares exact serialized results for filters, native-map grouping,
-conditional and exact aggregates, arrays, windows, CTEs, and joins. The
-harness refuses a ClickHouse version other than `26.3.17.56` unless
+conditional and exact aggregates, arrays, windows, CTEs, joins, timestamp/map
+predicates, mixed residual predicates, disjunctions, missing-map default-value
+semantics, aliases, subqueries, and aggregate combinators. The harness refuses
+a ClickHouse version other than `26.3.17.56` unless
 `STRICT_CLICKHOUSE_VERSION=0` is supplied for developer smoke testing.
+
+Set `SHARDLOG_ADAPTER_MODE=1`, or run
+`scripts/run-clickhouse-adapter-compatibility.sh`, to create a
+`StorageShardLog` source table and exercise automatic pushdown. Adapter mode
+requires a ClickHouse binary or image built with the pinned adapter.
 
 This proves the adapter and evaluator path; it does not replace the larger
 compatibility corpus. The release gate is the applicable ClickHouse SQL test
@@ -129,7 +145,7 @@ types, aliases, lambdas, aggregate combinators, joins, windows, and errors.
 | Authentication and tenant selection | Implemented; route disabled by default |
 | Explicit timestamp/term/label/metadata pushdown | Implemented |
 | Explicit column projection | Implemented |
-| Automatic plan-to-scan pushdown | Pending `StorageShardLog` integration |
+| Automatic plan-to-scan pushdown | Implemented for projection, timestamp bounds, exact label/metadata equality, and safe trivial limits; custom-binary acceptance pending |
 | ClickHouse native/HTTP client surface | Supplied by ClickHouse query node |
 | Full ClickHouse SQL regression corpus | Pending import and classification |
 | 80 GiB cold/warm analytical benchmark | Pending adapter acceptance run |
@@ -140,8 +156,9 @@ On 2026-07-31, the differential smoke ran on Adam against the exact official
 ClickHouse `26.3.17.56` image above. The final native-map Arrow stream had
 SHA-256 `be3c7f12f4ecbcee5132c1474521e49008cfd6ea0fee5c96647b1f2b8883c01d`.
 Three synthetic records covered two streams, labels, metadata, multiple
-timestamps, and case-varying error terms. Exact serialized results matched for
-all six gates:
+timestamps, and case-varying error terms. The initial six gates and the
+expanded predicate/semantic gates all produced byte-identical serialized
+results:
 
 ```text
 PASS row-count
@@ -150,12 +167,32 @@ PASS aggregates
 PASS window
 PASS cte-array
 PASS self-join
+PASS timestamp-map-filter
+PASS mixed-residual
+PASS disjunction
+PASS missing-map-key
+PASS missing-map-equality
+PASS alias-subquery
+PASS aggregate-combinators
 ClickHouse compatibility smoke passed with 26.3.17.56
 ```
 
-The isolated 581 MiB source/build/data directory was removed after the run
-because Adam was at 93% disk utilization. The pinned ClickHouse image remains
-installed for the full corpus campaign.
+The exact 26.3 analyzer was also inspected on Adam. It rewrites constant map
+lookups to dynamic inputs such as `labels.key_app` and `metadata.key_code` and
+constant-folds time bounds to `DateTime64(9, 'UTC')` values. The adapter handles
+those canonical forms using ClickHouse's own String text deserializer and
+retains every original filter as a residual.
+
+The installer applied cleanly to a sparse checkout of the exact tag, and the
+Rust API, formatting, and strict Clippy gates pass. A custom ClickHouse binary
+has not yet been built: Adam currently has 56 GiB free at 94% utilization and
+has no retained ClickHouse source/build cache. The adapter performance gate
+must run on a build worker with enough scratch capacity, then transfer only the
+pinned image to Adam.
+
+The isolated 581 MiB source/build/data directory from the initial run was
+removed because Adam was at 93% disk utilization. The pinned stock ClickHouse
+image remains installed for the full corpus campaign.
 
 ShardLog must not claim standalone ClickHouse compatibility while the pending
 gates remain open. The current claim is narrower and precise: the pinned

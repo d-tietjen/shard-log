@@ -2065,3 +2065,38 @@ Adam used framework revision
 `bd1c4ba7eff99a5f324a5434b1a9d23444e32582`; its framework checkout was
 dirty, and ShardLog still has an unborn revision. This is native
 host-scheduled benchmark evidence, not exact task-schedule replay.
+
+## ClickHouse analytical compatibility gate
+
+The authenticated Arrow scan boundary and stock ClickHouse evaluator path pass
+13 exact-result query classes: row count, native-map grouping, conditional and
+exact aggregates, windows, CTE/array aggregation, self-join, timestamp plus map
+filtering, mixed pushed/residual filtering, disjunction, missing-map grouping,
+missing-map empty-default equality, alias/subquery evaluation, and aggregate
+combinators. The expanded matrix passed locally on ClickHouse 26.6.1.1193 and
+on Adam with the pinned `26.3.17.56` image.
+
+`clickhouse/adapter` now contains the pinned `StorageShardLog` implementation.
+It reuses `StorageURL` and adds automatic projection, timestamp, exact nonempty
+label/metadata equality, and safe filtered trivial-limit pushdown. The exact
+26.3 analyzer emits the map subcolumn forms handled by the adapter. Unsupported
+expressions and empty map equality remain ClickHouse residuals.
+
+The next command after producing a custom image from exact tag
+`v26.3.17.56-lts` is:
+
+```bash
+SHARDLOG_CLICKHOUSE_TOKEN_FILE=/run/secrets/shardlog-clickhouse-token \
+CLICKHOUSE_IMAGE=shardlog-clickhouse@sha256:REPLACE_WITH_BUILT_DIGEST \
+SHARDLOG_URL=http://127.0.0.1:3100/shardlog/api/v1/clickhouse/scan \
+SHARDLOG_TENANT=fake \
+scripts/run-clickhouse-adapter-compatibility.sh
+```
+
+The 80 GiB cold/warm head-to-head follows only after that functional gate
+passes. It must sequentially query the same loaded
+ShardLog corpus through `StorageShardLog` and the retained
+`benchmark.logs` MergeTree snapshot on CPUs 0-15, with equal `max_threads`,
+cache state, result checksums, and query ordering. Adam had only 56 GiB free at
+94% utilization when this adapter was added, so a full ClickHouse source build
+was deliberately not started there.

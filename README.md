@@ -116,18 +116,19 @@ correctness boundary, persistent format, and measured lookup costs.
 
 ## ClickHouse analytical compatibility
 
-ShardLog exposes an opt-in authenticated Arrow IPC scan boundary for an
-unmodified ClickHouse query node. ClickHouse 26.3.17.56 LTS is the pinned SQL
-semantic authority; ShardLog pushes explicit tenant, timestamp, term, label,
-metadata, and projection constraints into its stripe indexes and streams
-bounded columnar batches. This supplies ClickHouse expressions, aggregates,
-joins, windows, JSON functions, subqueries, materialized views, protocols, and
-formats without implementing a divergent SQL engine in Rust.
+ShardLog exposes an opt-in authenticated Arrow IPC scan boundary for the
+pinned ClickHouse 26.3.17.56 LTS query evaluator. A stock ClickHouse binary can
+use the generic URL source with explicit constraints. The narrow
+`StorageShardLog` adapter in `clickhouse/adapter` additionally converts
+analyzed projections, timestamp ranges, and exact map predicates into
+automatic storage pushdown. ShardLog streams bounded columnar batches while
+ClickHouse remains responsible for expressions, aggregates, joins, windows,
+JSON functions, subqueries, materialized views, protocols, and formats.
 
 The scan route is absent unless `--clickhouse-token-file` is supplied. See
 [CLICKHOUSE_COMPATIBILITY.md](CLICKHOUSE_COMPATIBILITY.md) for the schema,
-security requirements, URL-engine adapter, differential harness, and remaining
-native `StorageShardLog` pushdown gate.
+security requirements, adapter installation, differential harness, and
+remaining production acceptance gates.
 
 ## Thread-local compression and dictionary reuse
 

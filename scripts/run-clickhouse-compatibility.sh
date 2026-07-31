@@ -1,7 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-: "${SHARDLOG_CLICKHOUSE_TOKEN:?set SHARDLOG_CLICKHOUSE_TOKEN from the protected token file}"
+if [[ -z ${SHARDLOG_CLICKHOUSE_TOKEN:-} ]]; then
+    : "${SHARDLOG_CLICKHOUSE_TOKEN_FILE:?set SHARDLOG_CLICKHOUSE_TOKEN or SHARDLOG_CLICKHOUSE_TOKEN_FILE}"
+    [[ -f $SHARDLOG_CLICKHOUSE_TOKEN_FILE ]] || {
+        echo "token file does not exist: $SHARDLOG_CLICKHOUSE_TOKEN_FILE" >&2
+        exit 2
+    }
+    SHARDLOG_CLICKHOUSE_TOKEN=$(<"$SHARDLOG_CLICKHOUSE_TOKEN_FILE")
+fi
+[[ -n $SHARDLOG_CLICKHOUSE_TOKEN ]] || {
+    echo "ShardLog ClickHouse token must not be empty" >&2
+    exit 2
+}
 
 CLICKHOUSE_BIN=${CLICKHOUSE_BIN:-clickhouse}
 CLICKHOUSE_IMAGE=${CLICKHOUSE_IMAGE:-}
@@ -10,6 +21,7 @@ SHARDLOG_URL=${SHARDLOG_URL:-http://127.0.0.1:3100/shardlog/api/v1/clickhouse/sc
 SHARDLOG_TENANT=${SHARDLOG_TENANT:-fake}
 EXPECTED_CLICKHOUSE_VERSION=${EXPECTED_CLICKHOUSE_VERSION:-26.3.17.56}
 STRICT_CLICKHOUSE_VERSION=${STRICT_CLICKHOUSE_VERSION:-1}
+SHARDLOG_ADAPTER_MODE=${SHARDLOG_ADAPTER_MODE:-0}
 
 if [[ -n $CLICKHOUSE_IMAGE ]]; then
     command -v docker >/dev/null || {
@@ -52,7 +64,13 @@ TOKEN_SQL=$(escape_sql "$SHARDLOG_CLICKHOUSE_TOKEN")
 TENANT_SQL=$(escape_sql "$SHARDLOG_TENANT")
 STRUCTURE="tenant String, timestamp DateTime64(9, 'UTC'), partition UInt32, offset UInt64, message String, labels Map(String, String), metadata Map(String, String)"
 STRUCTURE_SQL=$(escape_sql "$STRUCTURE")
-SOURCE="url('$URL_SQL', 'ArrowStream', '$STRUCTURE_SQL', headers('Authorization' = 'Bearer $TOKEN_SQL', 'X-Scope-OrgID' = '$TENANT_SQL'))"
+if [[ $SHARDLOG_ADAPTER_MODE -eq 1 ]]; then
+    SOURCE=shardlog_source
+    SOURCE_SETUP="CREATE TABLE shardlog_source ($STRUCTURE) ENGINE = ShardLog('$URL_SQL', 'ArrowStream', headers('Authorization' = 'Bearer $TOKEN_SQL', 'X-Scope-OrgID' = '$TENANT_SQL'));"
+else
+    SOURCE="url('$URL_SQL', 'ArrowStream', '$STRUCTURE_SQL', headers('Authorization' = 'Bearer $TOKEN_SQL', 'X-Scope-OrgID' = '$TENANT_SQL'))"
+    SOURCE_SETUP=
+fi
 
 RESULT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/shard-log-clickhouse-compat.XXXXXX")
 cleanup() {
@@ -67,6 +85,13 @@ queries=(
     "window|SELECT timestamp, partition, offset, row_number() OVER (PARTITION BY labels['app'] ORDER BY timestamp, partition, offset) AS row_number FROM __TABLE__ ORDER BY timestamp, partition, offset"
     "cte-array|WITH parsed AS (SELECT labels['app'] AS app, metadata['code'] AS code FROM __TABLE__) SELECT app, arraySort(groupArray(code)) AS codes FROM parsed GROUP BY app ORDER BY app"
     "self-join|SELECT count() AS matching_rows FROM __TABLE__ AS left_logs INNER JOIN __TABLE__ AS right_logs ON left_logs.partition = right_logs.partition AND left_logs.offset = right_logs.offset"
+    "timestamp-map-filter|SELECT partition, offset, message FROM __TABLE__ WHERE timestamp >= toDateTime64(0, 9, 'UTC') AND timestamp < toDateTime64(4102444800, 9, 'UTC') AND labels['app'] = 'api' AND metadata['code'] = '500' ORDER BY partition, offset"
+    "mixed-residual|SELECT partition, offset FROM __TABLE__ WHERE labels['app'] = 'api' AND positionCaseInsensitive(message, 'error') > 0 ORDER BY partition, offset"
+    "disjunction|SELECT partition, offset FROM __TABLE__ WHERE labels['app'] = 'api' OR metadata['code'] = '200' ORDER BY partition, offset"
+    "missing-map-key|SELECT labels['missing'] AS missing, count() AS rows FROM __TABLE__ GROUP BY missing ORDER BY missing"
+    "missing-map-equality|SELECT count() AS rows FROM __TABLE__ WHERE labels['missing'] = ''"
+    "alias-subquery|SELECT app, count() AS rows FROM (SELECT labels['app'] AS app, offset FROM __TABLE__ WHERE timestamp >= toDateTime64(0, 9, 'UTC')) GROUP BY app ORDER BY app"
+    "aggregate-combinators|SELECT countIf(metadata['code'] = '500') AS failures, uniqExactIf(offset, labels['app'] = 'api') AS api_offsets FROM __TABLE__"
 )
 
 for entry in "${queries[@]}"; do
@@ -77,10 +102,13 @@ for entry in "${queries[@]}"; do
     external_output=$RESULT_DIR/$name.external
     reference_output=$RESULT_DIR/$name.reference
 
-    printf '%s FORMAT JSONCompactEachRow\n' "$external_query" |
-        run_clickhouse local >"$external_output"
+    {
+        [[ -z $SOURCE_SETUP ]] || printf '%s\n' "$SOURCE_SETUP"
+        printf '%s FORMAT JSONCompactEachRow\n' "$external_query"
+    } | run_clickhouse local --multiquery >"$external_output"
 
     {
+        [[ -z $SOURCE_SETUP ]] || printf '%s\n' "$SOURCE_SETUP"
         printf '%s\n' "CREATE TABLE reference ($STRUCTURE) ENGINE = Memory;"
         printf '%s\n' "INSERT INTO reference SELECT * FROM $SOURCE;"
         printf '%s FORMAT JSONCompactEachRow\n' "$reference_query"
@@ -94,4 +122,8 @@ for entry in "${queries[@]}"; do
     echo "PASS $name"
 done
 
-echo "ClickHouse compatibility smoke passed with $OBSERVED_CLICKHOUSE_VERSION"
+if [[ $SHARDLOG_ADAPTER_MODE -eq 1 ]]; then
+    echo "StorageShardLog compatibility smoke passed with $OBSERVED_CLICKHOUSE_VERSION"
+else
+    echo "ClickHouse compatibility smoke passed with $OBSERVED_CLICKHOUSE_VERSION"
+fi
