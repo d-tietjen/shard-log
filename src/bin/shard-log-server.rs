@@ -4,8 +4,9 @@ use std::sync::Arc;
 
 use clap::Parser;
 use shard_log::{
-    DurableLokiConfig, DurableLokiStore, LokiApiConfig, NativeServerConfig, StripeConfig,
-    loki_router, loki_router_with_clickhouse, serve_native,
+    DurableLokiConfig, DurableLokiStore, LokiApiConfig, NativeServerConfig, ProductionRuntime,
+    ServiceLifecycle, SingleTenantConfig, StripeConfig, loki_router, loki_router_with_clickhouse,
+    serve_native, single_tenant_loki_router,
 };
 
 #[derive(Debug, Parser)]
@@ -15,14 +16,20 @@ use shard_log::{
 )]
 struct Arguments {
     /// HTTP listen address.
-    #[arg(long, default_value = "0.0.0.0:3100")]
+    #[arg(long, default_value = "127.0.0.1:3100")]
     listen: SocketAddr,
     /// High-throughput native binary protocol listen address.
-    #[arg(long, default_value = "0.0.0.0:3101")]
+    #[arg(long, default_value = "127.0.0.1:3101")]
     native_listen: SocketAddr,
     /// Tenant used when X-Scope-OrgID is absent.
     #[arg(long, default_value = "fake")]
     default_tenant: String,
+    /// File containing the bearer token required by Loki, OTLP, and native TCP.
+    #[arg(long)]
+    auth_token_file: Option<PathBuf>,
+    /// Explicitly starts without production authentication and admission controls.
+    #[arg(long, default_value_t = false)]
+    insecure_development_mode: bool,
     /// Maximum number of entries returned by one query.
     #[arg(long, default_value_t = 5_000)]
     max_query_limit: usize,
@@ -35,6 +42,12 @@ struct Arguments {
     /// Retain a duplicate raw-payload journal to accelerate hot-index recovery.
     #[arg(long, default_value_t = false)]
     recovery_journal: bool,
+    /// Retain logs for this many seconds; zero retains them indefinitely.
+    #[arg(long, default_value_t = 0)]
+    retention_seconds: u64,
+    /// Seconds between batch-aligned physical retention passes.
+    #[arg(long, default_value_t = 300)]
+    retention_compaction_interval_seconds: u64,
     /// Number of physical owner stripes.
     #[arg(long, default_value_t = 16)]
     shards: u32,
@@ -55,6 +68,36 @@ struct Arguments {
     /// When omitted, the route is not registered.
     #[arg(long)]
     clickhouse_token_file: Option<PathBuf>,
+    /// Maximum concurrent HTTP requests in single-tenant production mode.
+    #[arg(long, default_value_t = 1_024)]
+    max_http_in_flight: usize,
+    /// Maximum concurrent ingest requests across HTTP and native TCP.
+    #[arg(long, default_value_t = 256)]
+    max_ingest_in_flight: usize,
+    /// Maximum concurrent query requests across HTTP and native TCP.
+    #[arg(long, default_value_t = 256)]
+    max_query_in_flight: usize,
+    /// Sustained ingest byte rate; zero disables byte-rate limiting.
+    #[arg(long, default_value_t = 0)]
+    ingest_bytes_per_second: u64,
+    /// Ingest byte burst accepted by the token bucket.
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    ingest_burst_bytes: u64,
+    /// Maximum concurrent Loki tail subscribers.
+    #[arg(long, default_value_t = 128)]
+    max_tail_subscribers: usize,
+    /// Maximum simultaneously connected native TCP clients.
+    #[arg(long, default_value_t = 4_096)]
+    max_native_connections: usize,
+    /// Maximum seconds allowed for one Loki, Arrow, or native query.
+    #[arg(long, default_value_t = 30)]
+    query_timeout_seconds: u64,
+    /// Maximum seconds a native connection may wait before authentication.
+    #[arg(long, default_value_t = 5)]
+    native_auth_timeout_seconds: u64,
+    /// Maximum seconds allowed for an administrative flush.
+    #[arg(long, default_value_t = 300)]
+    flush_timeout_seconds: u64,
 }
 
 #[tokio::main]
@@ -63,12 +106,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if arguments.max_query_limit == 0 {
         return Err("--max-query-limit must be nonzero".into());
     }
+    if arguments.flush_timeout_seconds == 0 {
+        return Err("--flush-timeout-seconds must be nonzero".into());
+    }
+    if arguments.query_timeout_seconds == 0 {
+        return Err("--query-timeout-seconds must be nonzero".into());
+    }
+    if arguments.native_auth_timeout_seconds == 0 {
+        return Err("--native-auth-timeout-seconds must be nonzero".into());
+    }
+    if arguments.retention_seconds > 0 && arguments.retention_compaction_interval_seconds == 0 {
+        return Err(
+            "--retention-compaction-interval-seconds must be nonzero when retention is enabled"
+                .into(),
+        );
+    }
+    if arguments.insecure_development_mode && arguments.auth_token_file.is_some() {
+        return Err("--insecure-development-mode conflicts with --auth-token-file".into());
+    }
+    let lifecycle = Arc::new(ServiceLifecycle::new());
+    let production = match arguments.auth_token_file.as_ref() {
+        Some(path) => {
+            let token = read_secret(path, "production authentication")?;
+            Some(Arc::new(ProductionRuntime::new(
+                SingleTenantConfig {
+                    tenant: Arc::from(arguments.default_tenant.as_str()),
+                    bearer_token: token,
+                    max_http_in_flight: arguments.max_http_in_flight,
+                    max_ingest_in_flight: arguments.max_ingest_in_flight,
+                    max_query_in_flight: arguments.max_query_in_flight,
+                    ingest_bytes_per_second: arguments.ingest_bytes_per_second,
+                    ingest_burst_bytes: arguments.ingest_burst_bytes,
+                    max_tail_subscribers: arguments.max_tail_subscribers,
+                    max_native_connections: arguments.max_native_connections,
+                    query_timeout: std::time::Duration::from_secs(arguments.query_timeout_seconds),
+                    native_auth_timeout: std::time::Duration::from_secs(
+                        arguments.native_auth_timeout_seconds,
+                    ),
+                },
+                Arc::clone(&lifecycle),
+            )?))
+        }
+        None if arguments.insecure_development_mode => None,
+        None => {
+            return Err(
+                "--auth-token-file is required unless --insecure-development-mode is explicit"
+                    .into(),
+            );
+        }
+    };
     let listener = tokio::net::TcpListener::bind(arguments.listen).await?;
     let native_listener = tokio::net::TcpListener::bind(arguments.native_listen).await?;
     let store = Arc::new(DurableLokiStore::open(DurableLokiConfig {
         data_directory: arguments.data_directory,
         object_store_directory: arguments.object_store_directory,
-        recovery_journal: arguments.recovery_journal,
+        recovery_journal: production.is_some() || arguments.recovery_journal,
+        retention: (arguments.retention_seconds > 0)
+            .then(|| std::time::Duration::from_secs(arguments.retention_seconds)),
         shard_count: arguments.shards,
         tenant_partitions: arguments.tenant_partitions,
         append_linger: std::time::Duration::from_micros(arguments.append_linger_micros),
@@ -79,33 +173,107 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         default_tenant: Arc::from(arguments.default_tenant),
         max_query_limit: arguments.max_query_limit,
     };
-    let app = match arguments.clickhouse_token_file {
-        Some(path) => {
-            let token = std::fs::read_to_string(&path)?;
-            let token = token.trim();
-            if token.is_empty() {
-                return Err(format!("ClickHouse token file {} is empty", path.display()).into());
-            }
-            loki_router_with_clickhouse(store.clone(), api_config, Arc::from(token))?
-        }
-        None => loki_router(store.clone(), api_config),
+    let clickhouse_token = arguments
+        .clickhouse_token_file
+        .as_ref()
+        .map(|path| read_secret(path, "ClickHouse"))
+        .transpose()?;
+    let flush_timeout = std::time::Duration::from_secs(arguments.flush_timeout_seconds);
+    let app = match production.as_ref() {
+        Some(runtime) => single_tenant_loki_router(
+            store.clone(),
+            api_config,
+            Arc::clone(runtime),
+            clickhouse_token,
+            flush_timeout,
+        )?,
+        None => match clickhouse_token {
+            Some(token) => loki_router_with_clickhouse(store.clone(), api_config, token)?,
+            None => loki_router(store.clone(), api_config),
+        },
     };
+    lifecycle.mark_ready();
     let (shutdown, _) = tokio::sync::broadcast::channel::<()>(1);
     let signal = shutdown.clone();
+    let mut administrative_shutdown = lifecycle.subscribe_shutdown();
+    let shutdown_lifecycle = Arc::clone(&lifecycle);
+    let shutdown_store = Arc::clone(&store);
     tokio::spawn(async move {
-        shutdown_signal().await;
+        let administrative = tokio::select! {
+            () = shutdown_signal() => false,
+            result = administrative_shutdown.changed() => {
+                if result.is_ok() && !*administrative_shutdown.borrow() {
+                    return;
+                }
+                true
+            }
+        };
+        if !administrative {
+            shutdown_lifecycle.begin_draining();
+            let result = tokio::task::spawn_blocking(move || {
+                shard_log::LokiStore::flush(shutdown_store.as_ref(), flush_timeout)
+            })
+            .await;
+            match result {
+                Ok(Ok(())) => shutdown_lifecycle.request_shutdown(),
+                Ok(Err(error)) => {
+                    shutdown_lifecycle.mark_failed(format!("shutdown flush failed: {error}"));
+                    shutdown_lifecycle.request_shutdown();
+                }
+                Err(error) => {
+                    shutdown_lifecycle.mark_failed(format!("shutdown flush task failed: {error}"));
+                    shutdown_lifecycle.request_shutdown();
+                }
+            }
+        }
         let _ = signal.send(());
     });
     let mut http_shutdown = shutdown.subscribe();
     let mut native_shutdown = shutdown.subscribe();
+    if arguments.retention_seconds > 0 {
+        let retention_store = Arc::clone(&store);
+        let retention_lifecycle = Arc::clone(&lifecycle);
+        let mut retention_shutdown = shutdown.subscribe();
+        let interval =
+            std::time::Duration::from_secs(arguments.retention_compaction_interval_seconds);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = retention_shutdown.recv() => break,
+                    _ = ticker.tick() => {
+                        let store = Arc::clone(&retention_store);
+                        match tokio::task::spawn_blocking(move || store.compact_retention()).await {
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                retention_lifecycle.mark_failed(format!(
+                                    "retention compaction failed: {error}"
+                                ));
+                                break;
+                            }
+                            Err(error) => {
+                                retention_lifecycle.mark_failed(format!(
+                                    "retention compaction task failed: {error}"
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
     let http = axum::serve(listener, app).with_graceful_shutdown(async move {
         let _ = http_shutdown.recv().await;
     });
     let native = serve_native(
         native_listener,
-        store,
+        Arc::clone(&store),
         NativeServerConfig {
             wait_for_index: !arguments.native_durable_ack,
+            production,
             ..NativeServerConfig::default()
         },
         async move {
@@ -114,6 +282,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     tokio::try_join!(http, native)?;
     Ok(())
+}
+
+fn read_secret(
+    path: &std::path::Path,
+    purpose: &str,
+) -> Result<Arc<str>, Box<dyn std::error::Error>> {
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(format!("{purpose} token path {} is not a file", path.display()).into());
+    }
+    if metadata.len() > 4_096 {
+        return Err(format!("{purpose} token file {} exceeds 4096 bytes", path.display()).into());
+    }
+    let token = std::fs::read_to_string(path)?;
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(format!("{purpose} token file {} is empty", path.display()).into());
+    }
+    Ok(Arc::from(token))
 }
 
 async fn shutdown_signal() {

@@ -428,13 +428,21 @@ cargo clippy -- -D warnings
 ```
 ## Standalone Loki-compatible server
 
-The pre-release standalone server accepts Loki push/query traffic and OTLP Logs
-while using shard-stream for the acknowledged append and one owner-only
-ShardLog index per physical stripe:
+The standalone server has a fail-closed single-tenant production mode. Loki,
+OTLP, ClickHouse scans, and the native protocol share one immutable tenant,
+global bearer authentication, bounded concurrency, ingest byte-rate admission,
+query deadlines, real readiness and metrics, and one drain/flush/shutdown
+lifecycle. HA, replication, and automatic failover are reserved for the
+licensed distribution; the open server always uses one durable replica.
+
+Create a root-readable token file containing at least 16 bytes, then start the
+server behind a TLS-terminating reverse proxy. Both listeners bind to loopback
+unless explicitly changed:
 
 ```bash
 cargo run --release --bin shard-log-server -- \
-  --listen 0.0.0.0:3100 \
+  --auth-token-file /run/secrets/shard-log-token \
+  --default-tenant production \
   --data-directory /var/lib/shard-log \
   --object-store-directory /var/lib/shard-log-objects \
   --shards 16 \
@@ -442,15 +450,36 @@ cargo run --release --bin shard-log-server -- \
   --append-linger-micros 250
 ```
 
+HTTP callers send `Authorization: Bearer <token>`. `X-Scope-OrgID` may be
+omitted; if supplied, it must equal `--default-tenant`. A native connection
+must send opcode `4` with the token before ping, append, or query. Starting
+without authentication requires the explicit `--insecure-development-mode`
+flag.
+
+Production mode validates an on-disk format marker, exclusively locks the data
+directory, keeps CPU and durable storage work off asynchronous I/O workers,
+persists checksummed deletion requests atomically, and applies deletions to
+Loki, native, tail, and Arrow reads. `--retention-seconds` enforces an immediate
+query cutoff and periodically advances shard-stream's durable log start only
+across fully expired append batches. OS signals and Loki shutdown endpoints
+stop admission, flush the source log and index checkpoint, close tail/native
+connections, and then stop listeners.
+
 To opt into the administrative ClickHouse scan route, create a protected token
 file and add `--clickhouse-token-file /run/secrets/shard-log-clickhouse`. Keep
 the listener on loopback or behind TLS/mTLS; the route is intentionally not
 registered without that option.
 
-The authoritative shard-stream packs are sufficient for recovery. A duplicate
-raw index-recovery journal is disabled unless `--recovery-journal` is supplied.
+The authoritative shard-stream packs are sufficient for recovery in explicit
+development mode. Production mode currently enables the bounded index-recovery
+journal; physical retention requires that durable checkpoint. Segmenting this
+journal and the resident embedded indexes into the existing immutable object
+tier remains the principal petabyte-scale production gate.
 
 See [LOKI_COMPATIBILITY.md](LOKI_COMPATIBILITY.md) for the executable API
 surface, differential target, current release blockers, and wire-path
-benchmarks. The server is pre-release and is not yet a complete Loki
-replacement.
+benchmarks. The HTTP surface includes lossless stream filters, labels, series,
+stats, volume, structural patterns, detected JSON/logfmt fields, tailing, and
+durable logical deletion. Full metric LogQL, parser pipelines, Parquet results,
+and ruler APIs remain compatibility gaps, so this is not yet a universal Loki
+binary replacement.

@@ -10,6 +10,7 @@
 
 mod analytics;
 mod block;
+mod deletion;
 mod dictionary;
 mod error;
 mod ingest_pack;
@@ -19,11 +20,13 @@ mod loki_store;
 mod native_protocol;
 mod native_server;
 mod otlp;
+mod production;
 mod query;
 mod query_index;
 mod realtime_dictionary;
 mod sink;
 mod sink_journal;
+mod storage_format;
 mod stripe;
 mod structural;
 mod tier;
@@ -34,6 +37,7 @@ pub use analytics::{
     CLICKHOUSE_COMPATIBILITY_TARGET,
 };
 pub use block::{BlockCatalog, BlockDescriptor, BlockId, CompressionCodec};
+pub use deletion::DeleteRequest;
 pub use dictionary::{
     CompressionCohortId, DictionaryCache, DictionaryCatalog, DictionaryCatalogSnapshot,
     DictionaryId, DictionaryInsert, DictionaryPublication,
@@ -47,10 +51,10 @@ pub use locality::{
     scan_message_terms,
 };
 pub use loki_api::{
-    LokiApiConfig, LokiApiError, LokiApiStore, LokiEntry, LokiStore, loki_router,
-    loki_router_with_clickhouse,
+    LokiApiConfig, LokiApiError, LokiApiStore, LokiEntry, LokiStore, StoreHealth, StoreMetrics,
+    loki_router, loki_router_with_clickhouse, single_tenant_loki_router,
 };
-pub use loki_store::{DurableLokiConfig, DurableLokiStore};
+pub use loki_store::{DurableLokiConfig, DurableLokiStore, RetentionReport};
 pub use native_protocol::{
     MAX_NATIVE_FRAME_BYTES, NATIVE_FRAME_HEADER_BYTES, NativeAppendAck, NativeBatchInfo,
     NativeFrame, NativeFrameHeader, NativeLogBatch, NativeOpcode, NativeProtocolError, NativeQuery,
@@ -60,6 +64,10 @@ pub use native_protocol::{
 };
 pub use native_server::{NativeServerConfig, serve_native};
 pub use otlp::{OtlpLogDecoder, OtlpLogEvent};
+pub use production::{
+    ProductionMetricsSnapshot, ProductionRuntime, ServiceLifecycle, ServiceState,
+    SingleTenantConfig,
+};
 pub use query_index::{BlockQueryIndex, PersistentQueryIndex, QueryBlockMetadata, QueryHit};
 pub use realtime_dictionary::{
     RealtimeDictionaryConfig, RealtimeDictionaryObserver, RealtimeDictionaryStats,
@@ -71,6 +79,7 @@ pub use structural::{
     DecodedStructuralRecord, EmbeddedFrameIndex, IndexedStructuralBlock, StructuralRecordView,
     decode_embedded_frame_index, decode_structural_block, decode_structural_records,
     encode_indexed_structural_records, encode_structural_block, encode_structural_records,
+    message_pattern,
 };
 pub use tier::{
     CatalogGroupEntry, CatalogPage, CatalogPageRef, CatalogPointer, CatalogRoot, LocalObjectStore,

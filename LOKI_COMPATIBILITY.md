@@ -8,9 +8,11 @@ grafana/loki:3.7.2
 sha256:191d4fdfb7264f16989f0a57f320872620a5a7c2ceeec6229212c4190ec49b86
 ```
 
-Compatibility is tested with Loki multi-tenancy headers enabled at the protocol
-boundary. `X-Scope-OrgID` scopes ingestion, lookup, metadata, live tailing, and
-deletion requests.
+Compatibility tests retain Loki multi-tenancy headers. The production binary is
+intentionally single-tenant: a global bearer token authenticates the request,
+an omitted `X-Scope-OrgID` resolves to the configured tenant, and any different
+tenant header is rejected. Multi-tenant isolation and HA belong to the licensed
+distribution.
 
 ## Implemented wire surface
 
@@ -46,7 +48,8 @@ The route matrix is executable in
 `loki_api::tests::stable_loki_route_surface_has_no_missing_or_wrong_method_routes`.
 Behavior tests cover tenant-scoped JSON push and query, labels, repeated
 `match[]`, series, index statistics, structured metadata, detected fields,
-native Snappy protobuf, and durable restart recovery.
+native Snappy protobuf, structural pattern samples, durable logical deletion,
+production authentication/draining, and durable restart recovery.
 
 Push responses are not acknowledged until shard-stream durability and the
 stripe-owned indexed checkpoint have both advanced. A tenant is transparently
@@ -72,12 +75,20 @@ replacement:
   binary operators, grouping, and vector matching remain release blockers.
 - POST form-body parameters need differential coverage in addition to URL
   parameters.
-- Pattern detection is currently an empty successful result.
-- Delete requests have Loki-compatible lifecycle endpoints but do not yet
-  filter or physically compact matching records.
-- Query statistics expose the stable envelope but not all Loki 3.7 counters.
+- Pattern detection reuses the structural compressor's dynamic-value
+  classifier and emits Loki's pattern/sample envelope, but still needs
+  differential clustering tests against Loki's probabilistic pattern ingester.
+- Delete requests are checksummed, atomically persisted, and immediately filter
+  Loki, native, tail, and Arrow reads. General selector deletion is logical;
+  physical compaction currently occurs only for whole append batches expired by
+  the global retention window.
+- Query statistics report measured lines, bytes, return count, and elapsed
+  throughput, but not every Loki 3.7 storage-stage counter.
 - Durable compressed-block publication, sealed-block cold reads, and source-WAL
-  reclamation are not complete. Until they are, total disk usage includes the
+  reclamation are not complete. shard-stream can offload source packs and
+  batch-aligned retention advances its durable log start, but the resident
+  embedded indexes and bounded recovery journal are not yet segmented into the
+  immutable ShardLog object tier. Until then, total disk usage includes the
   authoritative shard-stream pack and sink recovery journal.
 
 No full-corpus result is accepted while any of these gates is open.

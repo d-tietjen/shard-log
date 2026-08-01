@@ -1,0 +1,45 @@
+[Unit]
+Description=ShardLog single-tenant log database
+Documentation=https://github.com/d-tietjen/shard-log
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=shard-log
+Group=shard-log
+UMask=0077
+StateDirectory=shard-log shard-log-objects
+RuntimeDirectory=shard-log
+ExecStart=/usr/local/bin/shard-log-server \
+  --auth-token-file=/etc/shard-log/auth-token \
+  --default-tenant=production \
+  --data-directory=/var/lib/shard-log \
+  --object-store-directory=/var/lib/shard-log-objects \
+  --listen=127.0.0.1:3100 \
+  --native-listen=127.0.0.1:3101 \
+  --shards=16 \
+  --tenant-partitions=256
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=330s
+LimitNOFILE=1048576
+TasksMax=16384
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/shard-log /var/lib/shard-log-objects
+
+[Install]
+WantedBy=multi-user.target

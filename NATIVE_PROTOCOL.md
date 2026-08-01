@@ -4,8 +4,8 @@ The native protocol is the high-throughput binary boundary for ShardLog.
 Loki HTTP and OTLP remain compatibility interfaces; native clients avoid JSON,
 HTTP header parsing, and OTLP protobuf transcoding.
 
-The current pre-release protocol is version 1. It supports grouped append,
-indexed query, and ping over a persistent TCP connection. A connection may
+The current pre-release protocol is version 1. It supports authentication,
+grouped append, indexed query, and ping over a persistent TCP connection. A connection may
 carry multiple in-flight requests. Responses can complete out of order and
 are correlated by the caller's 128-bit request ID.
 
@@ -17,9 +17,9 @@ Every request and response starts with a fixed 32-byte little-endian header:
 | ---: | ---: | --- |
 | 0 | 4 | Magic `SLNP` |
 | 4 | 1 | Version, currently `1` |
-| 5 | 1 | Opcode: append `1`, query `2`, ping `3` |
+| 5 | 1 | Opcode: append `1`, query `2`, ping `3`, authenticate `4` |
 | 6 | 1 | Flags; bit 0 marks a response |
-| 7 | 1 | Status: OK `0`, bad request `1`, internal `2`, unsupported `3` |
+| 7 | 1 | Status: OK `0`, bad request `1`, internal `2`, unsupported `3`, unauthorized `4`, unavailable `5`, too many requests `6`, timeout `7` |
 | 8 | 16 | Request ID |
 | 24 | 4 | Payload length |
 | 28 | 4 | First four bytes of the BLAKE3 payload digest |
@@ -27,6 +27,13 @@ Every request and response starts with a fixed 32-byte little-endian header:
 Payloads are limited to 16 MiB before allocation. Unknown flags, versions,
 opcodes, oversized payloads, invalid UTF-8, truncation, trailing bytes, count
 mismatches, and checksum mismatches fail closed.
+
+In production mode the first frame on every connection must be authenticate
+opcode `4`, with the configured bearer token as its UTF-8 payload. The server
+closes the connection after a failed authentication and rejects repeated
+authentication after success. Every append and query tenant must equal the
+single configured tenant. Authentication is omitted only in explicit insecure
+development mode.
 
 ## Grouped append batch
 
@@ -109,6 +116,8 @@ default:
 
 ```text
 shard-log-server \
+  --auth-token-file /run/secrets/shard-log-token \
+  --default-tenant production \
   --listen 0.0.0.0:3100 \
   --native-listen 0.0.0.0:3101 \
   --shards 16 \

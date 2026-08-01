@@ -2031,6 +2031,24 @@ fn parse_message(message: &[u8]) -> ParsedMessage<'_> {
     }
 }
 
+/// Reuses the structural encoder's lossless token classifier to render a
+/// Loki-compatible pattern with dynamic values replaced by `<_>`.
+#[must_use]
+pub fn message_pattern(message: &str) -> String {
+    let parsed = parse_message(message.as_bytes());
+    if parsed.values.is_empty() {
+        return message.to_owned();
+    }
+    let mut pattern = String::with_capacity(message.len());
+    for (index, literal) in parsed.literals.iter().enumerate() {
+        pattern.push_str(&message[literal.clone()]);
+        if index < parsed.values.len() {
+            pattern.push_str("<_>");
+        }
+    }
+    pattern
+}
+
 fn unicode_term_ranges(message: &[u8]) -> Vec<Range<usize>> {
     let message = std::str::from_utf8(message).expect("structural messages originate as UTF-8");
     let mut terms = Vec::new();
@@ -2933,6 +2951,15 @@ mod tests {
                 b" card declined".to_vec(),
             ]
         );
+    }
+
+    #[test]
+    fn rendered_patterns_use_the_structural_dynamic_value_classifier() {
+        assert_eq!(
+            message_pattern("request id=123456 duration=42ms complete"),
+            "request id=<_> duration=<_> complete"
+        );
+        assert_eq!(message_pattern("static message"), "static message");
     }
 
     #[test]

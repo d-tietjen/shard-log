@@ -38,6 +38,8 @@ pub enum NativeOpcode {
     Query = 2,
     /// Verify the connection and echo the request payload.
     Ping = 3,
+    /// Authenticates a connection before any tenant operation is accepted.
+    Authenticate = 4,
 }
 
 impl NativeOpcode {
@@ -46,6 +48,7 @@ impl NativeOpcode {
             1 => Ok(Self::Append),
             2 => Ok(Self::Query),
             3 => Ok(Self::Ping),
+            4 => Ok(Self::Authenticate),
             _ => Err(NativeProtocolError::new(format!(
                 "unsupported native opcode {value}"
             ))),
@@ -65,6 +68,14 @@ pub enum NativeStatus {
     Internal = 2,
     /// The requested version or operation is unsupported.
     Unsupported = 3,
+    /// The connection did not supply the configured production credential.
+    Unauthorized = 4,
+    /// The service is draining or temporarily unavailable.
+    Unavailable = 5,
+    /// A bounded admission or rate limit rejected the request.
+    TooManyRequests = 6,
+    /// Query execution exceeded the configured response deadline.
+    Timeout = 7,
 }
 
 impl NativeStatus {
@@ -74,6 +85,10 @@ impl NativeStatus {
             1 => Ok(Self::BadRequest),
             2 => Ok(Self::Internal),
             3 => Ok(Self::Unsupported),
+            4 => Ok(Self::Unauthorized),
+            5 => Ok(Self::Unavailable),
+            6 => Ok(Self::TooManyRequests),
+            7 => Ok(Self::Timeout),
             _ => Err(NativeProtocolError::new(format!(
                 "unsupported native status {value}"
             ))),

@@ -51,7 +51,7 @@ shard-stream-core = { path = "../shard-stream/crates/shard-stream-core", version
 shard-stream-engine = { path = "../shard-stream/crates/shard-stream-engine", version = "0.1.0" }
 shard-stream-protocol = { path = "../shard-stream/crates/shard-stream-protocol", version = "0.1.0" }
 snap = "1"
-tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync"] }
+tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
 tower = { version = "0.5", features = ["util"] }
 xz2 = "0.1"
