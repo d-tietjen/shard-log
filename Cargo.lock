@@ -1387,6 +1387,7 @@ dependencies = [
 [[package]]
 name = "ordered-segment-map"
 version = "0.1.0"
+source = "git+https://github.com/d-tietjen/shard-stream.git?rev=c658e97862cea83160dcc0110583649f8ede0e60#c658e97862cea83160dcc0110583649f8ede0e60"
 dependencies = [
  "hashbrown",
  "xxhash-rust",
@@ -1804,6 +1805,7 @@ dependencies = [
 [[package]]
 name = "shard-stream-core"
 version = "0.1.0"
+source = "git+https://github.com/d-tietjen/shard-stream.git?rev=c658e97862cea83160dcc0110583649f8ede0e60#c658e97862cea83160dcc0110583649f8ede0e60"
 dependencies = [
  "serde",
  "shardlog",
@@ -1812,6 +1814,7 @@ dependencies = [
 [[package]]
 name = "shard-stream-engine"
 version = "0.1.0"
+source = "git+https://github.com/d-tietjen/shard-stream.git?rev=c658e97862cea83160dcc0110583649f8ede0e60#c658e97862cea83160dcc0110583649f8ede0e60"
 dependencies = [
  "bytes",
  "ordered-segment-map",
@@ -1824,6 +1827,7 @@ dependencies = [
 [[package]]
 name = "shard-stream-protocol"
 version = "0.1.0"
+source = "git+https://github.com/d-tietjen/shard-stream.git?rev=c658e97862cea83160dcc0110583649f8ede0e60#c658e97862cea83160dcc0110583649f8ede0e60"
 dependencies = [
  "bytes",
  "crc32fast",
@@ -1834,6 +1838,7 @@ dependencies = [
 [[package]]
 name = "shardlog"
 version = "0.1.0"
+source = "git+https://github.com/d-tietjen/shard-stream.git?rev=c658e97862cea83160dcc0110583649f8ede0e60#c658e97862cea83160dcc0110583649f8ede0e60"
 dependencies = [
  "blake3",
  "bytes",

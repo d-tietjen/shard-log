@@ -47,9 +47,9 @@ rustix = { version = "1.1", features = ["fs"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_urlencoded = "0.7"
-shard-stream-core = { path = "../shard-stream/crates/shard-stream-core", version = "0.1.0" }
-shard-stream-engine = { path = "../shard-stream/crates/shard-stream-engine", version = "0.1.0" }
-shard-stream-protocol = { path = "../shard-stream/crates/shard-stream-protocol", version = "0.1.0" }
+shard-stream-core = { git = "https://github.com/d-tietjen/shard-stream.git", rev = "c658e97862cea83160dcc0110583649f8ede0e60", version = "=0.1.0" }
+shard-stream-engine = { git = "https://github.com/d-tietjen/shard-stream.git", rev = "c658e97862cea83160dcc0110583649f8ede0e60", version = "=0.1.0" }
+shard-stream-protocol = { git = "https://github.com/d-tietjen/shard-stream.git", rev = "c658e97862cea83160dcc0110583649f8ede0e60", version = "=0.1.0" }
 snap = "1"
 tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
