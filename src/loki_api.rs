@@ -235,7 +235,7 @@ impl LokiStore for LokiApiStore {
 
 /// Builds the stable Loki 3.7-compatible HTTP route surface.
 pub fn loki_router(store: Arc<dyn LokiStore>, api_config: LokiApiConfig) -> Router {
-    build_loki_router(store, api_config, None, None, Duration::from_secs(30))
+    build_loki_router(store, api_config, None, None, Duration::from_secs(30), true)
 }
 
 /// Builds the Loki surface plus the authenticated ClickHouse Arrow scan route.
@@ -258,6 +258,7 @@ pub fn loki_router_with_clickhouse(
         Some(bearer_token),
         None,
         Duration::from_secs(30),
+        true,
     ))
 }
 
@@ -287,6 +288,31 @@ pub fn single_tenant_loki_router(
         analytics_bearer_token,
         Some(runtime),
         flush_timeout,
+        true,
+    ))
+}
+
+/// Builds the authenticated Loki/OTLP compatibility routes for embedding in a
+/// host which already owns health, readiness, metrics, and shutdown routes.
+pub fn single_tenant_loki_api_router(
+    store: Arc<dyn LokiStore>,
+    api_config: LokiApiConfig,
+    runtime: Arc<ProductionRuntime>,
+    analytics_bearer_token: Option<Arc<str>>,
+    flush_timeout: Duration,
+) -> Result<Router, LokiApiError> {
+    if flush_timeout.is_zero() {
+        return Err(LokiApiError::configuration(
+            "production flush timeout must be nonzero",
+        ));
+    }
+    Ok(build_loki_router(
+        store,
+        api_config,
+        analytics_bearer_token,
+        Some(runtime),
+        flush_timeout,
+        false,
     ))
 }
 
@@ -296,6 +322,7 @@ fn build_loki_router(
     analytics_bearer_token: Option<Arc<str>>,
     production: Option<Arc<ProductionRuntime>>,
     flush_timeout: Duration,
+    include_operational_routes: bool,
 ) -> Router {
     let (live, _) = broadcast::channel(1_024);
     let analytics_enabled = analytics_bearer_token.is_some();
@@ -308,14 +335,6 @@ fn build_loki_router(
         flush_timeout,
     };
     let router = Router::new()
-        .route("/ready", get(ready))
-        .route("/metrics", get(metrics))
-        .route("/config", get(current_config))
-        .route("/services", get(services))
-        .route("/log_level", get(log_level).post(log_level))
-        .route("/flush", post(flush))
-        .route("/ingester/prepare_shutdown", post(prepare_shutdown))
-        .route("/ingester/shutdown", post(shutdown))
         .route("/loki/api/v1/status/buildinfo", get(build_info))
         .route("/loki/api/v1/push", post(push_logs))
         .route("/otlp/v1/logs", post(push_otlp))
@@ -369,6 +388,19 @@ fn build_loki_router(
         .route("/api/prom/label/{name}/values", get(label_values))
         .route("/api/prom/series", get(series))
         .route("/api/prom/tail", get(tail));
+    let router = if include_operational_routes {
+        router
+            .route("/ready", get(ready))
+            .route("/metrics", get(metrics))
+            .route("/config", get(current_config))
+            .route("/services", get(services))
+            .route("/log_level", get(log_level).post(log_level))
+            .route("/flush", post(flush))
+            .route("/ingester/prepare_shutdown", post(prepare_shutdown))
+            .route("/ingester/shutdown", post(shutdown))
+    } else {
+        router
+    };
     let router = if analytics_enabled {
         router.route("/shardlog/api/v1/clickhouse/scan", get(clickhouse_scan))
     } else {

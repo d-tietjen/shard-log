@@ -151,6 +151,49 @@ impl DeleteCatalog {
         Ok(true)
     }
 
+    pub(crate) fn replace_tenant(
+        &self,
+        tenant: &str,
+        mut requests: Vec<DeleteRequest>,
+    ) -> Result<(), LokiApiError> {
+        if tenant.is_empty() {
+            return Err(LokiApiError::bad_request("delete tenant must not be empty"));
+        }
+        requests.sort_unstable_by(|left, right| left.request_id.cmp(&right.request_id));
+        if requests.iter().any(|request| {
+            request.request_id.is_empty()
+                || request.start_time > request.end_time
+                || !matches!(request.status.as_str(), "received" | "canceled")
+        }) || requests
+            .windows(2)
+            .any(|pair| pair[0].request_id == pair[1].request_id)
+        {
+            return Err(LokiApiError::bad_request(
+                "replicated delete requests are invalid or duplicated",
+            ));
+        }
+        let next_request_id = requests
+            .iter()
+            .filter_map(|request| u64::from_str_radix(&request.request_id, 16).ok())
+            .max()
+            .and_then(|maximum| maximum.checked_add(1))
+            .unwrap_or(1);
+        let mut current = self
+            .state
+            .write()
+            .map_err(|_| LokiApiError::internal("delete catalog lock is poisoned"))?;
+        let mut next = current.clone();
+        next.next_request_id = next.next_request_id.max(next_request_id);
+        if requests.is_empty() {
+            next.tenants.remove(tenant);
+        } else {
+            next.tenants.insert(tenant.to_owned(), requests);
+        }
+        self.persist(&next)?;
+        *current = next;
+        Ok(())
+    }
+
     fn persist(&self, state: &DeleteState) -> Result<(), LokiApiError> {
         let Some(path) = &self.path else {
             return Ok(());

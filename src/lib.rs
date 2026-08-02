@@ -52,7 +52,8 @@ pub use locality::{
 };
 pub use loki_api::{
     LokiApiConfig, LokiApiError, LokiApiStore, LokiEntry, LokiStore, StoreHealth, StoreMetrics,
-    loki_router, loki_router_with_clickhouse, single_tenant_loki_router,
+    loki_router, loki_router_with_clickhouse, single_tenant_loki_api_router,
+    single_tenant_loki_router,
 };
 pub use loki_store::{DurableLokiConfig, DurableLokiStore, RetentionReport};
 pub use native_protocol::{

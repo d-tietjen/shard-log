@@ -94,7 +94,7 @@ impl DurableLokiConfig {
 /// appends and whose reads execute on the owning ShardLog stripe workers.
 pub struct DurableLokiStore {
     _data_directory_lease: DataDirectoryLease,
-    engine: StreamEngine,
+    engine: Arc<StreamEngine>,
     service: ShardLogService,
     tenant_partitions: u32,
     ingest_stripes_per_tenant: u32,
@@ -167,11 +167,13 @@ impl DurableLokiStore {
             recovery_timeout: config.indexed_ack_timeout,
             ..DurableSinkOptions::default()
         };
-        let engine = StreamEngine::open_with_durable_sink(
-            engine_config,
-            DurableSinkConfig::new(factory).with_options(sink_options),
-        )
-        .map_err(engine_error)?;
+        let engine = Arc::new(
+            StreamEngine::open_with_durable_sink(
+                engine_config,
+                DurableSinkConfig::new(factory).with_options(sink_options),
+            )
+            .map_err(engine_error)?,
+        );
         match engine.create_topic(TopicConfig {
             topic_id: LOKI_TOPIC_ID,
             partitions: config.tenant_partitions,
@@ -194,6 +196,81 @@ impl DurableLokiStore {
             retention_advanced_offsets: AtomicU64::new(0),
             retention_failures: AtomicU64::new(0),
         })
+    }
+
+    /// Attaches ShardLog's Loki/query surface to a stream engine opened by an
+    /// external HA host.
+    ///
+    /// The host must install the matching [`ShardLogSinkFactory`] as the
+    /// engine's durable sink before recovery. This constructor never opens a
+    /// second WAL and never changes the host's replication or fencing policy.
+    pub fn attach(
+        data_directory: PathBuf,
+        engine: Arc<StreamEngine>,
+        service: ShardLogService,
+        tenant_partitions: u32,
+        ingest_stripes_per_tenant: u32,
+        indexed_ack_timeout: Duration,
+        retention: Option<Duration>,
+    ) -> Result<Self, LokiApiError> {
+        if tenant_partitions == 0 || ingest_stripes_per_tenant == 0 {
+            return Err(LokiApiError::configuration(
+                "tenant and ingest stripe counts must be nonzero",
+            ));
+        }
+        if ingest_stripes_per_tenant > tenant_partitions {
+            return Err(LokiApiError::configuration(
+                "ingest stripe count cannot exceed tenant partitions",
+            ));
+        }
+        if indexed_ack_timeout.is_zero() {
+            return Err(LokiApiError::configuration(
+                "indexed_ack_timeout must be nonzero",
+            ));
+        }
+        if retention.is_some_and(|retention| retention.is_zero()) {
+            return Err(LokiApiError::configuration(
+                "retention must be nonzero when configured",
+            ));
+        }
+        let data_directory_lease = DataDirectoryLease::acquire(&data_directory)?;
+        let deletes = DeleteCatalog::open(data_directory.join("delete-catalog-v1.json"))?;
+        match engine.create_topic(TopicConfig {
+            topic_id: LOKI_TOPIC_ID,
+            partitions: tenant_partitions,
+            shards: None,
+        }) {
+            Ok(()) | Err(EngineError::TopicAlreadyExists(_)) => {}
+            Err(error) => return Err(engine_error(error)),
+        }
+        Ok(Self {
+            _data_directory_lease: data_directory_lease,
+            engine,
+            service,
+            tenant_partitions,
+            ingest_stripes_per_tenant,
+            indexed_ack_timeout,
+            next_request_id: AtomicU64::new(1),
+            deletes,
+            retention,
+            retention_runs: AtomicU64::new(0),
+            retention_advanced_offsets: AtomicU64::new(0),
+            retention_failures: AtomicU64::new(0),
+        })
+    }
+
+    /// Atomically replaces one tenant's local delete view from replicated HA
+    /// control state.
+    ///
+    /// The caller must supply only records which have already reached its
+    /// cluster finality boundary. Query filtering observes the replacement
+    /// only after the local catalog is durably synchronized.
+    pub fn synchronize_delete_requests(
+        &self,
+        tenant: &str,
+        requests: Vec<DeleteRequest>,
+    ) -> Result<(), LokiApiError> {
+        self.deletes.replace_tenant(tenant, requests)
     }
 
     fn tenant_partition_base(&self, tenant: &str) -> u32 {
