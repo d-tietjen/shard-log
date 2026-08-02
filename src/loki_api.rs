@@ -564,6 +564,12 @@ impl std::fmt::Display for LokiApiError {
 impl std::error::Error for LokiApiError {}
 
 impl LokiApiError {
+    /// Creates a retryable storage/control-plane availability error for an
+    /// embedded backend implementation.
+    pub fn backend_unavailable(message: impl Into<String>) -> Self {
+        Self::unavailable(message)
+    }
+
     pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
