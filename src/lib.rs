@@ -63,7 +63,7 @@ pub use native_protocol::{
     decode_native_query, encode_native_log_batch, encode_native_query, inspect_native_log_batch,
     is_native_log_batch, validate_native_log_batch,
 };
-pub use native_server::{NativeServerConfig, serve_native};
+pub use native_server::{NativeRequestGate, NativeServerConfig, serve_native};
 pub use otlp::{OtlpLogDecoder, OtlpLogEvent};
 pub use production::{
     ProductionMetricsSnapshot, ProductionRuntime, ServiceLifecycle, ServiceState,

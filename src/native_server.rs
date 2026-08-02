@@ -13,6 +13,15 @@ use crate::{
     decode_native_query, encode_native_log_batch,
 };
 
+/// Product-owned admission check evaluated for every native append and query.
+///
+/// HA distributions use this to fence direct native traffic on followers while
+/// allowing an existing connection to follow leadership changes safely.
+pub trait NativeRequestGate: Send + Sync + std::fmt::Debug + 'static {
+    /// Returns `Ok` only when this process may execute the request.
+    fn check(&self) -> Result<(), String>;
+}
+
 /// Runtime limits for the native TCP listener.
 #[derive(Debug, Clone)]
 pub struct NativeServerConfig {
@@ -30,6 +39,8 @@ pub struct NativeServerConfig {
     ///
     /// `None` is intended only for tests and explicit development mode.
     pub production: Option<Arc<ProductionRuntime>>,
+    /// Optional product-owned fencing check for append and query operations.
+    pub request_gate: Option<Arc<dyn NativeRequestGate>>,
 }
 
 impl Default for NativeServerConfig {
@@ -39,6 +50,7 @@ impl Default for NativeServerConfig {
             max_in_flight_per_connection: 64,
             wait_for_index: true,
             production: None,
+            request_gate: None,
         }
     }
 }
@@ -269,6 +281,12 @@ async fn dispatch(
     store: Arc<DurableLokiStore>,
     config: &NativeServerConfig,
 ) -> NativeFrame {
+    if matches!(header.opcode, NativeOpcode::Append | NativeOpcode::Query)
+        && let Some(gate) = &config.request_gate
+        && let Err(error) = gate.check()
+    {
+        return error_frame(header, NativeStatus::Unavailable, &error);
+    }
     match header.opcode {
         NativeOpcode::Ping => ok_frame(header, payload),
         NativeOpcode::Authenticate => error_frame(
@@ -458,6 +476,15 @@ mod tests {
         decode_native_log_batch, encode_native_log_batch, encode_native_query,
     };
 
+    #[derive(Debug)]
+    struct DenyGate;
+
+    impl NativeRequestGate for DenyGate {
+        fn check(&self) -> Result<(), String> {
+            Err("not the current leader".into())
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn tcp_protocol_pings_appends_and_queries_with_request_ids() {
         let nonce = SystemTime::now()
@@ -614,6 +641,7 @@ mod tests {
                 server_store,
                 NativeServerConfig {
                     production: Some(runtime),
+                    request_gate: Some(Arc::new(DenyGate)),
                     ..NativeServerConfig::default()
                 },
                 async {
@@ -652,6 +680,13 @@ mod tests {
         assert_eq!(response.header.request_id, 3);
         assert_eq!(response.header.status, NativeStatus::Ok);
         assert_eq!(response.payload, b"ready");
+
+        let query = NativeFrame::request(NativeOpcode::Query, 4, Vec::new()).expect("query");
+        write_frame(&mut client, &query).await;
+        let response = read_frame(&mut client).await;
+        assert_eq!(response.header.request_id, 4);
+        assert_eq!(response.header.status, NativeStatus::Unavailable);
+        assert_eq!(response.payload, b"not the current leader");
 
         drop(unauthenticated);
         drop(client);
