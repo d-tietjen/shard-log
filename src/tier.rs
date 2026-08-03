@@ -3,8 +3,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use fs2::FileExt;
 use serde::de::DeserializeOwned;
@@ -63,6 +63,61 @@ pub trait LogObjectStore: Send + Sync {
         expected_version: Option<&str>,
         bytes: &[u8],
     ) -> LogDbResult<ObjectMetadata>;
+}
+
+/// Cloneable type-erased object-store handle used by production stripe owners.
+#[derive(Clone)]
+pub struct SharedLogObjectStore(Arc<dyn LogObjectStore>);
+
+impl SharedLogObjectStore {
+    /// Wraps an object-store adapter for use by independently owned stripes.
+    #[must_use]
+    pub fn new(store: Arc<dyn LogObjectStore>) -> Self {
+        Self(store)
+    }
+}
+
+impl std::fmt::Debug for SharedLogObjectStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SharedLogObjectStore(..)")
+    }
+}
+
+impl From<LocalObjectStore> for SharedLogObjectStore {
+    fn from(store: LocalObjectStore) -> Self {
+        Self(Arc::new(store))
+    }
+}
+
+impl LogObjectStore for SharedLogObjectStore {
+    fn put_bytes_if_absent(&self, key: &str, bytes: &[u8]) -> LogDbResult<ObjectMetadata> {
+        self.0.put_bytes_if_absent(key, bytes)
+    }
+
+    fn put_file_if_absent(&self, key: &str, source: &Path) -> LogDbResult<ObjectMetadata> {
+        self.0.put_file_if_absent(key, source)
+    }
+
+    fn get(&self, key: &str, max_bytes: u64) -> LogDbResult<Vec<u8>> {
+        self.0.get(key, max_bytes)
+    }
+
+    fn get_range(&self, key: &str, range: Range<u64>) -> LogDbResult<Vec<u8>> {
+        self.0.get_range(key, range)
+    }
+
+    fn head(&self, key: &str) -> LogDbResult<Option<ObjectMetadata>> {
+        self.0.head(key)
+    }
+
+    fn compare_and_swap(
+        &self,
+        key: &str,
+        expected_version: Option<&str>,
+        bytes: &[u8],
+    ) -> LogDbResult<ObjectMetadata> {
+        self.0.compare_and_swap(key, expected_version, bytes)
+    }
 }
 
 /// Filesystem implementation of [`LogObjectStore`] used for local operation
@@ -331,6 +386,22 @@ pub struct TierBlockEntry {
     pub payload_checksum: String,
 }
 
+/// Durable sink watermark covered by an immutable object-tier group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TierCheckpoint {
+    /// First placement sequence not represented by this or an older group.
+    pub next_placement_sequence: u64,
+    /// First logical offset not represented by this or an older group.
+    pub next_offset: u64,
+}
+
+impl TierCheckpoint {
+    fn covers(self, other: Self) -> bool {
+        self.next_placement_sequence >= other.next_placement_sequence
+            && self.next_offset >= other.next_offset
+    }
+}
+
 impl TierBlockEntry {
     fn from_descriptor(
         descriptor: &BlockDescriptor,
@@ -396,6 +467,8 @@ impl TierBlockEntry {
 pub struct TierGroupSource {
     /// Monotonic sequence within one physical-shard partition namespace.
     pub group_sequence: u64,
+    /// Durable sink watermark covered after this complete group is published.
+    pub checkpoint: TierCheckpoint,
     /// Block payload extents in pack order.
     pub blocks: Vec<TierBlockEntry>,
     /// Sealed local artifacts, including exactly one payload and query index.
@@ -409,6 +482,8 @@ pub struct TierGroupManifest {
     pub format_version: u8,
     /// Monotonic group sequence.
     pub group_sequence: u64,
+    /// Durable sink watermark covered by this complete group.
+    pub checkpoint: TierCheckpoint,
     /// Owning physical shard.
     pub shard_id: u32,
     /// Logical topic as a decimal `u128`.
@@ -442,6 +517,10 @@ impl TierGroupManifest {
             || self.blocks.is_empty()
             || self.blocks.len() > max_blocks_per_group
             || self.artifacts.is_empty()
+            || self
+                .blocks
+                .iter()
+                .any(|block| block.last_offset >= self.checkpoint.next_offset)
         {
             return Err(LogDbError::CorruptTier(
                 "group manifest identity or cardinality is invalid".into(),
@@ -506,6 +585,8 @@ impl TierGroupManifest {
 pub struct CatalogGroupEntry {
     /// Group sequence.
     pub group_sequence: u64,
+    /// Durable sink watermark covered by this group.
+    pub checkpoint: TierCheckpoint,
     /// Immutable group-manifest object key.
     pub manifest_key: String,
     /// Group-manifest length.
@@ -565,6 +646,7 @@ impl CatalogGroupEntry {
             .ok_or_else(|| LogDbError::CorruptTier("group payload bytes overflow".into()))?;
         Ok(Self {
             group_sequence: manifest.group_sequence,
+            checkpoint: manifest.checkpoint,
             manifest_key,
             manifest_bytes: metadata.bytes,
             manifest_checksum: metadata.content_digest.clone(),
@@ -585,6 +667,7 @@ impl CatalogGroupEntry {
             || self.min_timestamp_unix_nanos > self.max_timestamp_unix_nanos
             || self.block_count == 0
             || self.payload_bytes == 0
+            || self.last_offset >= self.checkpoint.next_offset
         {
             return Err(LogDbError::CorruptTier(
                 "catalog contains an invalid group entry".into(),
@@ -630,14 +713,19 @@ impl CatalogPage {
             ));
         }
         let mut previous = None;
+        let mut previous_checkpoint = None;
         for group in &self.groups {
             group.validate()?;
-            if previous.is_some_and(|sequence| sequence >= group.group_sequence) {
+            if previous.is_some_and(|sequence| sequence >= group.group_sequence)
+                || previous_checkpoint
+                    .is_some_and(|checkpoint: TierCheckpoint| !group.checkpoint.covers(checkpoint))
+            {
                 return Err(LogDbError::CorruptTier(
-                    "catalog group sequences are not increasing".into(),
+                    "catalog group sequences or checkpoints are not increasing".into(),
                 ));
             }
             previous = Some(group.group_sequence);
+            previous_checkpoint = Some(group.checkpoint);
         }
         Ok(())
     }
@@ -658,6 +746,8 @@ pub struct CatalogPageRef {
     pub first_group_sequence: u64,
     /// Last group sequence in the page.
     pub last_group_sequence: u64,
+    /// Latest durable sink watermark covered by the page.
+    pub last_checkpoint: TierCheckpoint,
     /// Number of group entries.
     pub group_count: u32,
     /// Lowest logical offset covered by the page.
@@ -691,6 +781,7 @@ impl CatalogPageRef {
             page_checksum: metadata.content_digest.clone(),
             first_group_sequence: first.group_sequence,
             last_group_sequence: last.group_sequence,
+            last_checkpoint: last.checkpoint,
             group_count: u32::try_from(page.groups.len())
                 .map_err(|_| LogDbError::CorruptTier("catalog page is too large".into()))?,
             first_offset: page
@@ -728,6 +819,7 @@ impl CatalogPageRef {
             || self.group_count == 0
             || self.first_offset > self.last_offset
             || self.min_timestamp_unix_nanos > self.max_timestamp_unix_nanos
+            || self.last_offset >= self.last_checkpoint.next_offset
         {
             return Err(LogDbError::CorruptTier(
                 "catalog root contains an invalid page reference".into(),
@@ -750,6 +842,10 @@ pub struct CatalogRoot {
     pub topic_id: String,
     /// Logical partition.
     pub partition_id: u32,
+    /// Latest durable sink watermark selected by this root.
+    pub latest_checkpoint: Option<TierCheckpoint>,
+    /// First block identifier not used by any published group.
+    pub next_block_id: u64,
     /// Ordered immutable catalog pages.
     pub pages: Vec<CatalogPageRef>,
 }
@@ -762,6 +858,8 @@ impl CatalogRoot {
             shard_id: shard_id.get(),
             topic_id: partition.topic_id.get().to_string(),
             partition_id: partition.partition_id.get(),
+            latest_checkpoint: None,
+            next_block_id: 0,
             pages: Vec::new(),
         }
     }
@@ -778,17 +876,27 @@ impl CatalogRoot {
         }
         let mut previous_page = None;
         let mut previous_group = None;
+        let mut previous_checkpoint = None;
         for page in &self.pages {
             page.validate()?;
             if previous_page.is_some_and(|sequence| sequence >= page.page_sequence)
                 || previous_group.is_some_and(|sequence| sequence >= page.first_group_sequence)
+                || previous_checkpoint.is_some_and(|checkpoint: TierCheckpoint| {
+                    !page.last_checkpoint.covers(checkpoint)
+                })
             {
                 return Err(LogDbError::CorruptTier(
-                    "catalog root pages are not strictly increasing".into(),
+                    "catalog root pages or checkpoints are not strictly increasing".into(),
                 ));
             }
             previous_page = Some(page.page_sequence);
             previous_group = Some(page.last_group_sequence);
+            previous_checkpoint = Some(page.last_checkpoint);
+        }
+        if self.latest_checkpoint != previous_checkpoint {
+            return Err(LogDbError::CorruptTier(
+                "catalog root latest checkpoint disagrees with its final page".into(),
+            ));
         }
         Ok(())
     }
@@ -1054,6 +1162,7 @@ impl<S: LogObjectStore> LogObjectTier<S> {
         let manifest = TierGroupManifest {
             format_version: TIER_FORMAT_VERSION,
             group_sequence: source.group_sequence,
+            checkpoint: source.checkpoint,
             shard_id: self.shard_id.get(),
             topic_id: self.partition.topic_id.get().to_string(),
             partition_id: self.partition.partition_id.get(),
@@ -1099,6 +1208,11 @@ impl<S: LogObjectStore> LogObjectTier<S> {
             if source.group_sequence < last_group.group_sequence {
                 return Err(LogDbError::ObjectStore(
                     "group sequences must be published in increasing order".into(),
+                ));
+            }
+            if !source.checkpoint.covers(last_group.checkpoint) {
+                return Err(LogDbError::ObjectStore(
+                    "group checkpoints must advance monotonically".into(),
                 ));
             }
         }
@@ -1157,6 +1271,24 @@ impl<S: LogObjectStore> LogObjectTier<S> {
             .generation
             .checked_add(1)
             .ok_or_else(|| LogDbError::ObjectStore("catalog generation exhausted".into()))?;
+        next_root.latest_checkpoint = Some(source.checkpoint);
+        let first_block_id = manifest
+            .blocks
+            .first()
+            .expect("validated group has blocks")
+            .block_id;
+        if first_block_id < self.root.next_block_id {
+            return Err(LogDbError::ObjectStore(
+                "group block identifiers overlap an older group".into(),
+            ));
+        }
+        next_root.next_block_id = manifest
+            .blocks
+            .last()
+            .expect("validated group has blocks")
+            .block_id
+            .checked_add(1)
+            .ok_or_else(|| LogDbError::ObjectStore("block identifier exhausted".into()))?;
         if replace_last {
             *next_root
                 .pages
@@ -2116,6 +2248,10 @@ mod tests {
         write_test_file(&index_path, format!("query-index-{sequence}").as_bytes());
         TierGroupSource {
             group_sequence: sequence,
+            checkpoint: TierCheckpoint {
+                next_placement_sequence: sequence + 1,
+                next_offset: first_offset + 10,
+            },
             blocks: vec![TierBlockEntry {
                 block_id: sequence,
                 source_compression_cohort: 7,
@@ -2346,6 +2482,10 @@ mod tests {
         let manifest = tier
             .publish_group(TierGroupSource {
                 group_sequence: 0,
+                checkpoint: TierCheckpoint {
+                    next_placement_sequence: 1,
+                    next_offset: 2,
+                },
                 blocks: entries,
                 artifacts: vec![
                     TierArtifactSource {
@@ -2400,6 +2540,10 @@ mod tests {
         let mut manifest = tier
             .publish_group(TierGroupSource {
                 group_sequence: 0,
+                checkpoint: TierCheckpoint {
+                    next_placement_sequence: 1,
+                    next_offset: 2,
+                },
                 blocks: entries,
                 artifacts: vec![
                     TierArtifactSource {

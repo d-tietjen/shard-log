@@ -31,13 +31,11 @@ thread_local! {
             .expect("ingest zstd decompressor initializes"));
 }
 
-#[cfg(test)]
 struct IngestRecordView<'a> {
     ordinal: u32,
     event: &'a OtlpLogEvent,
 }
 
-#[cfg(test)]
 impl StructuralRecordView for IngestRecordView<'_> {
     fn structural_offset(&self) -> LogicalOffset {
         LogicalOffset::new(u64::from(self.ordinal))
@@ -119,6 +117,7 @@ pub(crate) struct PreparedNativeIngestPack {
 
 #[derive(Debug, Clone)]
 pub(crate) struct IndexedIngestFrame {
+    pub(crate) frame_id: u64,
     pub(crate) cohort: CompressionCohortId,
     pub(crate) record_count: u32,
     pub(crate) structural_bytes: usize,
@@ -137,7 +136,6 @@ pub(crate) fn encode_ingest_pack(events: &[OtlpLogEvent]) -> LogDbResult<Vec<u8>
     prepare_ingest_pack(events).map(|prepared| prepared.payload)
 }
 
-#[cfg(test)]
 pub(crate) fn prepare_ingest_pack(events: &[OtlpLogEvent]) -> LogDbResult<PreparedIngestPack> {
     let record_count = u32::try_from(events.len()).map_err(|_| LogDbError::RecordTooLarge)?;
     let mut cohorts = BTreeMap::<CompressionCohortId, Vec<IngestRecordView<'_>>>::new();
@@ -374,6 +372,7 @@ pub(crate) fn decode_indexed_ingest_frames(
             ));
         }
         frames.push(IndexedIngestFrame {
+            frame_id: 0,
             cohort: group.cohort,
             record_count: index.record_count(),
             structural_bytes: group.structural_bytes,

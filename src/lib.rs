@@ -30,6 +30,7 @@ mod storage_format;
 mod stripe;
 mod structural;
 mod tier;
+mod tier_ingest;
 mod types;
 
 pub use analytics::{
@@ -74,7 +75,7 @@ pub use realtime_dictionary::{
     RealtimeDictionaryConfig, RealtimeDictionaryObserver, RealtimeDictionaryStats,
     RealtimeDictionaryTrainer,
 };
-pub use sink::{OtlpSinkConfig, ShardLogService, ShardLogSinkFactory};
+pub use sink::{OtlpSinkConfig, ShardLogService, ShardLogSinkFactory, SinkObjectTierConfig};
 pub use stripe::{IndexReceipt, LogStripe, ShardLogDb, ShardStreamDurableSink, StripeConfig};
 pub use structural::{
     DecodedStructuralRecord, EmbeddedFrameIndex, IndexedStructuralBlock, StructuralRecordView,
@@ -84,10 +85,10 @@ pub use structural::{
 };
 pub use tier::{
     CatalogGroupEntry, CatalogPage, CatalogPageRef, CatalogPointer, CatalogRoot, LocalObjectStore,
-    LogObjectStore, LogObjectTier, ObjectMetadata, ObjectTierConfig, SsdCacheConfig,
-    SsdObjectCache, TierArtifact, TierArtifactKind, TierArtifactSource, TierBlockEntry,
-    TierGroupManifest, TierGroupSource, TierQueryRange, mark_group_offloaded,
-    write_staged_payload_pack,
+    LogObjectStore, LogObjectTier, ObjectMetadata, ObjectTierConfig, SharedLogObjectStore,
+    SsdCacheConfig, SsdObjectCache, TierArtifact, TierArtifactKind, TierArtifactSource,
+    TierBlockEntry, TierCheckpoint, TierGroupManifest, TierGroupSource, TierQueryRange,
+    mark_group_offloaded, write_staged_payload_pack,
 };
 pub use types::{
     CaseSensitivity, DurableLogRecord, LogMatch, LogPredicate, LogQuery, LogRegex, MetadataField,

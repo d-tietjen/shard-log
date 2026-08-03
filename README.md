@@ -1,4 +1,6 @@
-# shard-log
+# ShardLog: A Log-Native Storage Engine
+
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
 `shard-log` is a log database engine built around shard-stream's ordered,
 durable ingestion stripes. It keeps the durable append log as the source of
@@ -221,7 +223,7 @@ gain that repays that cost.
 ## Compression policy and structural roadmap
 
 [Benchmark results and priority-based codec choices](BENCHMARKS.md) record the
-complete 27-engine comparison on the Adam corpus. The implemented online
+complete Apache-compatible 24-engine comparison on the Adam corpus. The implemented online
 default is Pco level 8 for the timestamp column and zstd level 1 for the
 enclosing structural block. LZ4 is a planned low-latency option, and zstd
 level 9 is a future compaction-only cold format. The current pre-release block
@@ -233,7 +235,7 @@ context. The
 the layout, its exact reconstruction rule, and the next measurements needed to
 refine it without introducing a second stored format.
 
-## Deliberate boundaries
+## Durable object tier
 
 The durable object-tier boundary is implemented: immutable artifact upload,
 block-group manifests, 1,024-group catalog pages, conditionally selected roots,
@@ -242,21 +244,26 @@ shallow recovery, exact block ranges, and a recoverable SSD range cache. See
 model, durability states, cold-read path, retention protocol, and capacity
 defaults.
 
-The production stripe still stages compressed payloads in memory. The next
-integration is a shard-stream-style worker coordinator that incrementally
-spools groups and their independent query-index segments to local SSD, then
-drives `LogObjectTier` in sequence order. A concrete cloud-provider adapter
-must implement the generic `LogObjectStore` contract. Until those are wired,
-the structural benchmark's pack writer remains a benchmark path rather than
-the production offloader.
+The stripe worker now closes complete durable append boundaries, synchronizes
+their compressed payload and independent query-index artifacts to the local
+spool, uploads immutable objects, and conditionally publishes the catalog
+root. Resident payload is released only after that catalog commit. Cold
+queries prune catalog pages and groups, load only the selected index segment,
+range-read candidate frames through the bounded SSD cache, verify BLAKE3, and
+reconstruct exact records. Restart begins from the catalog checkpoint without
+loading a corpus-wide posting map.
 
-The durable sink now supports a configured stripe-local transaction journal.
-Each synchronized frame contains the exact indexed native or OTLP appends, the expected
-checkpoint, and the next checkpoint. Startup repairs an incomplete final frame,
-fails closed on committed checksum or checkpoint-chain corruption, reconstructs
-the hot index, and exposes only the recovered checkpoint. Ephemeral tests may
-leave `OtlpSinkConfig::state_directory` unset; production configurations must
-set it and size `max_journal_bytes` as part of their SSD spool budget.
+`LocalObjectStore` is the production adapter shipped by the standalone binary.
+Cloud deployments implement the public `LogObjectStore` contract with
+put-if-absent, bounded reads, range reads, HEAD, and conditional replacement;
+the public core deliberately does not tie storage correctness to one cloud SDK.
+
+The durable sink also supports an optional stripe-local recovery journal for
+deployments without the object tier. Each synchronized frame contains exact
+indexed native or OTLP appends and its checkpoint chain. Startup repairs an
+incomplete final frame and fails closed on committed corruption. Object-tier
+deployments recover from immutable catalog checkpoints and do not need this
+duplicate raw journal.
 
 ## Real-log compression benchmark
 
@@ -314,20 +321,21 @@ cargo run --release --bin shard-log-codec-bench -- /path/to/raw.log --limit-byte
 
 Use `--codecs archive` for the slower ratio-focused sweep: S2-best, Zopfli
 (five iterations), bzip2-9, native XZ-6, pure-Rust XZ-6, Brotli-5, zRip-4,
-and zstd-9. Use `--codecs all` for the complete 27-engine matrix, preferably
+and zstd-9. Use `--codecs all` for the complete 24-engine matrix, preferably
 first at the default 1 GiB limit; Zopfli and the XZ encoders make a full 80 GiB
 all-codec run intentionally long.
 
 Every named implementation can also be selected directly, for example:
 
 ```text
-cargo run --release --bin shard-log-codec-bench -- /path/to/raw.log --limit-bytes 80GiB --codecs lz4_flex,lz4_native,lz4_rust,s2,minlz_balanced,libdeflate-6,zlib_rs-6,zenflate-7,lzfse,lzfse_rust,zrip-1,zstd-1
+cargo run --release --bin shard-log-codec-bench -- /path/to/raw.log --limit-bytes 80GiB --codecs lz4_flex,lz4_native,s2,minlz_balanced,libdeflate-6,zlib_rs-6,lzfse,lzfse_rust,zrip-1,zstd-1
 ```
 
 The full [1 GiB codec screen and 80 GiB validation](BENCHMARKS.md) identify
 zstd-1 as the hot-tier default and zstd-9 as the cold-tier ratio option for the
 tested ClickHouse error-loop corpus. The document also records the complete
-27-codec comparison and its decision guide.
+24-codec comparison and its decision guide. Codecs with GPL, AGPL, or missing
+license metadata are deliberately excluded from the Apache-2.0 distribution.
 
 The final template total includes the template table and block-level static
 term index. It intentionally excludes high-cardinality value postings; those
@@ -465,21 +473,31 @@ across fully expired append batches. OS signals and Loki shutdown endpoints
 stop admission, flush the source log and index checkpoint, close tail/native
 connections, and then stop listeners.
 
+Production mode requires `--object-store-directory`; this is where compressed
+checkpointed groups and their segmented indexes become restart-authoritative.
+The raw recovery journal is opt-in and is intended only as a migration or
+diagnostic fallback.
+
 To opt into the administrative ClickHouse scan route, create a protected token
 file and add `--clickhouse-token-file /run/secrets/shard-log-clickhouse`. Keep
 the listener on loopback or behind TLS/mTLS; the route is intentionally not
 registered without that option.
 
 The authoritative shard-stream packs are sufficient for recovery in explicit
-development mode. Production mode currently enables the bounded index-recovery
-journal; physical retention requires that durable checkpoint. Segmenting this
-journal and the resident embedded indexes into the existing immutable object
-tier remains the principal petabyte-scale production gate.
+development mode. With `--object-store-directory`, production flushes publish
+compressed frames and segmented indexes to the immutable ShardLog catalog;
+restarts use its durable checkpoint and cold reads do not depend on resident
+payload.
 
 See [LOKI_COMPATIBILITY.md](LOKI_COMPATIBILITY.md) for the executable API
-surface, differential target, current release blockers, and wire-path
-benchmarks. The HTTP surface includes lossless stream filters, labels, series,
+surface, differential target, known differences, and wire-path benchmarks. The
+HTTP surface includes lossless stream filters, parser and formatting pipelines,
+unwrapped metric ranges, vector aggregation and matching, labels, series,
 stats, volume, structural patterns, detected JSON/logfmt fields, tailing, and
-durable logical deletion. Full metric LogQL, parser pipelines, Parquet results,
-and ruler APIs remain compatibility gaps, so this is not yet a universal Loki
-binary replacement.
+durable logical deletion. Ruler and multi-tenant control-plane APIs remain
+outside the single-tenant storage engine.
+
+## License
+
+ShardLog is licensed under the [Apache License 2.0](LICENSE). Required
+third-party attributions are retained in [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).

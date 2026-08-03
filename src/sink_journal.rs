@@ -34,6 +34,7 @@ pub(crate) struct RecoveredTransaction {
 struct JournalState {
     file: File,
     bytes: u64,
+    checkpoints: HashMap<TopicPartition, DurableSinkCheckpoint>,
 }
 
 /// Checksummed transaction journal for one physical sink stripe.
@@ -74,6 +75,10 @@ impl SinkJournal {
                 .map_err(|error| journal_io("initialize", error))?;
         }
         let transactions = recover(&mut file, shard_id, max_bytes)?;
+        let checkpoints = transactions
+            .iter()
+            .map(|transaction| (transaction.next.topic_partition, transaction.next))
+            .collect();
         let bytes = file
             .metadata()
             .map_err(|error| journal_io("inspect recovered", error))?
@@ -83,7 +88,11 @@ impl SinkJournal {
         Ok((
             Self {
                 max_bytes,
-                state: Mutex::new(JournalState { file, bytes }),
+                state: Mutex::new(JournalState {
+                    file,
+                    bytes,
+                    checkpoints,
+                }),
             },
             transactions,
         ))
@@ -104,6 +113,19 @@ impl SinkJournal {
             .state
             .lock()
             .map_err(|_| LogDbError::StorageIo("sink journal lock is poisoned".into()))?;
+        let actual = state
+            .checkpoints
+            .get(&expected.topic_partition)
+            .copied()
+            .unwrap_or_else(|| DurableSinkCheckpoint::initial(expected.topic_partition));
+        if checkpoint_covers(actual, next) {
+            return Ok(());
+        }
+        if !checkpoint_allows_lane_gap(actual, expected) {
+            return Err(LogDbError::CorruptSinkJournal(
+                "journal append does not continue its durable checkpoint chain".into(),
+            ));
+        }
         let next_bytes = state
             .bytes
             .checked_add(u64::try_from(frame_bytes).map_err(|_| LogDbError::RecordTooLarge)?)
@@ -126,6 +148,7 @@ impl SinkJournal {
             .and_then(|()| state.file.sync_data())
             .map_err(|error| journal_io("append transaction", error))?;
         state.bytes = next_bytes;
+        state.checkpoints.insert(next.topic_partition, next);
         Ok(())
     }
 }
@@ -226,6 +249,12 @@ pub(crate) fn checkpoint_allows_lane_gap(
     actual.topic_partition == expected.topic_partition
         && actual.next_placement_sequence == expected.next_placement_sequence
         && actual.next_offset <= expected.next_offset
+}
+
+fn checkpoint_covers(checkpoint: DurableSinkCheckpoint, candidate: DurableSinkCheckpoint) -> bool {
+    checkpoint.topic_partition == candidate.topic_partition
+        && checkpoint.next_placement_sequence >= candidate.next_placement_sequence
+        && checkpoint.next_offset >= candidate.next_offset
 }
 
 fn encode_transaction(

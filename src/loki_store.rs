@@ -19,10 +19,10 @@ use crate::ingest_pack::{decode_ingest_pack, prepare_native_ingest_pack};
 use crate::loki_api::{LogicalDeleteFilter, LokiApiError, apply_logical_deletes};
 use crate::storage_format::DataDirectoryLease;
 use crate::{
-    AnalyticsLogRow, AnalyticsScanRequest, DeleteRequest, LogMatch, LogQuery, LokiEntry, LokiStore,
-    NativeAppendAck, NativeQuery, NativeQueryDirection, OtlpSinkConfig, QueryCursor,
-    ShardLogService, ShardLogSinkFactory, StoreHealth, StoreMetrics, StripeConfig,
-    encode_native_log_batch,
+    AnalyticsLogRow, AnalyticsScanRequest, DeleteRequest, LocalObjectStore, LogMatch, LogQuery,
+    LokiEntry, LokiStore, NativeAppendAck, NativeQuery, NativeQueryDirection, ObjectTierConfig,
+    OtlpSinkConfig, QueryCursor, ShardLogService, ShardLogSinkFactory, SinkObjectTierConfig,
+    SsdCacheConfig, StoreHealth, StoreMetrics, StripeConfig, encode_native_log_batch,
 };
 
 const LOKI_TOPIC_ID: TopicId = TopicId::new(1);
@@ -35,7 +35,7 @@ const TENANT_FIELD: &str = "resource.loki.tenant";
 pub struct DurableLokiConfig {
     /// Directory containing shard-stream packs, coordinator state, and index journals.
     pub data_directory: PathBuf,
-    /// Optional local object-store directory used by shard-stream.
+    /// Optional local object-store directory used by shard-stream and ShardLog.
     pub object_store_directory: Option<PathBuf>,
     /// Retain a second raw-payload journal for faster hot-index recovery.
     ///
@@ -81,9 +81,12 @@ impl DurableLokiConfig {
                 "retention must be nonzero when configured",
             ));
         }
-        if self.retention.is_some() && !self.recovery_journal {
+        if self.retention.is_some()
+            && !self.recovery_journal
+            && self.object_store_directory.is_none()
+        {
             return Err(LokiApiError::configuration(
-                "retention currently requires recovery_journal so the durable index checkpoint survives log truncation",
+                "retention requires either the immutable object tier or recovery_journal so the durable index checkpoint survives log truncation",
             ));
         }
         Ok(())
@@ -137,7 +140,7 @@ impl DurableLokiStore {
         let deletes = DeleteCatalog::open(config.data_directory.join("delete-catalog-v1.json"))?;
         let engine_config = EngineConfig {
             data_dir: config.data_directory.join("stream"),
-            object_store_dir: config.object_store_directory,
+            object_store_dir: config.object_store_directory.clone(),
             shard_count: config.shard_count,
             virtual_lane_count: config.shard_count,
             replication_factor: 1,
@@ -150,11 +153,32 @@ impl DurableLokiStore {
             max_fetch_bytes: 16 * 1024 * 1024,
             append_linger: config.append_linger,
         };
+        let sink_object_tier = config
+            .object_store_directory
+            .as_ref()
+            .map(|directory| {
+                let store = LocalObjectStore::open(directory)?;
+                Ok::<_, crate::LogDbError>(SinkObjectTierConfig {
+                    store: store.into(),
+                    spool_directory: config.data_directory.join("tier-spool"),
+                    cache_directory: config.data_directory.join("tier-cache"),
+                    partitions: (0..config.tenant_partitions)
+                        .map(|partition| {
+                            TopicPartition::new(LOKI_TOPIC_ID, LogicalPartitionId::new(partition))
+                        })
+                        .collect(),
+                    tier: ObjectTierConfig::default(),
+                    cache: SsdCacheConfig::default(),
+                })
+            })
+            .transpose()
+            .map_err(|error| LokiApiError::internal(error.to_string()))?;
         let sink_config = OtlpSinkConfig {
             stripe: config.stripe,
             state_directory: config
                 .recovery_journal
                 .then(|| config.data_directory.join("index-journal")),
+            object_tier: sink_object_tier,
             ..OtlpSinkConfig::default()
         };
         let factory = Arc::new(
@@ -849,6 +873,9 @@ impl LokiStore for DurableLokiStore {
                 )));
             }
             if stats.pending_items == 0 && stats.pending_bytes == 0 {
+                self.service
+                    .flush_object_tier()
+                    .map_err(|error| LokiApiError::internal(error.to_string()))?;
                 self.engine.sync().map_err(engine_error)?;
                 return Ok(());
             }
@@ -872,7 +899,7 @@ impl LokiStore for DurableLokiStore {
             retry_attempts: stats.retry_attempts,
             failed_attempts: stats.failed_attempts,
             dirty_partitions: stats.dirty_partitions,
-            retained_payload_bytes: None,
+            retained_payload_bytes: self.service.retained_payload_bytes().ok(),
             retention_runs: self.retention_runs.load(Ordering::Relaxed),
             retention_advanced_offsets: self.retention_advanced_offsets.load(Ordering::Relaxed),
             retention_failures: self.retention_failures.load(Ordering::Relaxed),
@@ -1031,6 +1058,78 @@ mod tests {
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[2].line, "durable message 102");
         assert!(!directory.join("index-journal").exists());
+        drop(recovered);
+        fs::remove_dir_all(directory).expect("remove test store");
+    }
+
+    #[test]
+    fn object_tier_flushes_queries_cold_and_recovers_without_source_replay() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "shard-log-cold-recovery-{}-{nonce}",
+            std::process::id()
+        ));
+        let object_directory = directory.join("objects");
+        let config = DurableLokiConfig {
+            data_directory: directory.clone(),
+            object_store_directory: Some(object_directory.clone()),
+            recovery_journal: false,
+            retention: None,
+            shard_count: 1,
+            tenant_partitions: 1,
+            append_linger: Duration::ZERO,
+            stripe: StripeConfig::default(),
+            indexed_ack_timeout: Duration::from_secs(30),
+        };
+        let store = DurableLokiStore::open(config.clone()).expect("store opens");
+        store
+            .push(
+                "tenant-a",
+                vec![
+                    LokiEntry {
+                        timestamp_unix_nanos: 100,
+                        labels: BTreeMap::from([("app".to_owned(), "api".to_owned())]),
+                        line: "cold request completed".to_owned(),
+                        structured_metadata: BTreeMap::new(),
+                    },
+                    LokiEntry {
+                        timestamp_unix_nanos: 200,
+                        labels: BTreeMap::from([("app".to_owned(), "api".to_owned())]),
+                        line: "cold request failed".to_owned(),
+                        structured_metadata: BTreeMap::from([(
+                            "code".to_owned(),
+                            "500".to_owned(),
+                        )]),
+                    },
+                ],
+            )
+            .expect("push");
+        LokiStore::flush(&store, Duration::from_secs(30)).expect("object tier flushes");
+        assert_eq!(store.operational_metrics().retained_payload_bytes, Some(0));
+        let cold = store
+            .query_native(&NativeQuery {
+                tenant: "tenant-a".to_owned(),
+                labels: BTreeMap::from([("app".to_owned(), "api".to_owned())]),
+                terms: vec!["failed".to_owned()],
+                start_timestamp_unix_nanos: None,
+                end_timestamp_unix_nanos: None,
+                limit: 10,
+                direction: NativeQueryDirection::OldestFirst,
+            })
+            .expect("cold query");
+        assert_eq!(cold.len(), 1);
+        assert_eq!(cold[0].line, "cold request failed");
+        assert!(object_directory.exists());
+        drop(store);
+
+        let recovered = DurableLokiStore::open(config).expect("store recovers from tier root");
+        let entries = recovered.entries("tenant-a").expect("recovered cold query");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].line, "cold request completed");
+        assert_eq!(entries[1].structured_metadata["code"], "500");
         drop(recovered);
         fs::remove_dir_all(directory).expect("remove test store");
     }

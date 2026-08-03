@@ -234,24 +234,27 @@ client so an ingest or query process cannot erase durable data.
 
 ## Worker integration
 
-The next worker-level integration mirrors shard-stream's existing pack
-offloader:
+The worker-level integration mirrors shard-stream's pack offloader:
 
 - one mutable group builder belongs to each shard worker;
 - block compression, query-index construction, and local spool writes remain
   worker local;
-- a group closes on target bytes, block count, maximum age, explicit object
-  durability, or shutdown;
+- a group closes on target bytes, block count, explicit flush, or shutdown;
 - publication runs in sequence order for each shard/partition namespace;
 - backpressure is based on unpublished SSD spool bytes, never total retained
   object bytes; and
 - local spool retention advances only from authoritative catalog generations.
 
-The implemented `BlockCatalog` range fields, `write_staged_payload_pack`,
-`LogObjectTier`, `mark_group_offloaded`, and `SsdObjectCache` are the durable
-boundaries for that coordinator. The automatic worker coordinator and concrete
-cloud-provider adapter are not connected yet; the structural benchmark's
-pack writer remains a benchmark path until that integration is complete.
+`LogStripe::offload_indexed_groups` constructs append-aligned payload and query
+artifacts, publishes them through `LogObjectTier`, and releases resident frames
+only after the new `CURRENT` generation is selected. On restart, catalog
+checkpoints skip already-published recovery transactions. Queries load a group
+index before payload and verify each selected frame checksum after range read.
+
+The standalone binary ships `LocalObjectStore`. The public `LogObjectStore`
+trait is the stable integration point for S3-compatible and other cloud
+adapters; adapters must preserve immutable create and conditional `CURRENT`
+replacement semantics.
 
 ## Required operational metrics
 

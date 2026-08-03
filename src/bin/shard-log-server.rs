@@ -36,7 +36,7 @@ struct Arguments {
     /// Durable local data directory.
     #[arg(long, default_value = "./shard-log-data")]
     data_directory: PathBuf,
-    /// Optional local directory used as the object-store backend.
+    /// Local object-store backend; required with --auth-token-file.
     #[arg(long)]
     object_store_directory: Option<PathBuf>,
     /// Retain a duplicate raw-payload journal to accelerate hot-index recovery.
@@ -155,12 +155,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     };
+    if production.is_some() && arguments.object_store_directory.is_none() {
+        return Err(
+            "--object-store-directory is required in production mode for durable compressed checkpoints"
+                .into(),
+        );
+    }
     let listener = tokio::net::TcpListener::bind(arguments.listen).await?;
     let native_listener = tokio::net::TcpListener::bind(arguments.native_listen).await?;
     let store = Arc::new(DurableLokiStore::open(DurableLokiConfig {
         data_directory: arguments.data_directory,
         object_store_directory: arguments.object_store_directory,
-        recovery_journal: production.is_some() || arguments.recovery_journal,
+        recovery_journal: arguments.recovery_journal,
         retention: (arguments.retention_seconds > 0)
             .then(|| std::time::Duration::from_secs(arguments.retention_seconds)),
         shard_count: arguments.shards,

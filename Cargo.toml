@@ -5,7 +5,18 @@ edition = "2024"
 license = "Apache-2.0"
 description = "Stripe-aligned, object-tiered OTLP log indexing for shard-stream"
 repository = "https://github.com/d-tietjen/shard-log"
+homepage = "https://github.com/d-tietjen/shard-log"
+readme = "README.md"
 rust-version = "1.93"
+publish = false
+keywords = ["logs", "observability", "opentelemetry", "loki", "database"]
+categories = ["database", "development-tools::debugging"]
+exclude = [
+    ".github/",
+    "deploy/",
+    "scripts/",
+    "clickhouse/",
+]
 
 # Keep this standalone repository independent when it is checked out beneath
 # an unrelated Cargo workspace (as it is on the Adam benchmark host).
@@ -22,7 +33,6 @@ bzip2 = "0.6"
 bytes = "1.12"
 bytes-handoff = "1.3"
 clap = { version = "4.5", features = ["derive"] }
-flate3 = "1.2"
 foldhash = "0.2"
 form_urlencoded = "1.2"
 opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "logs"] }
@@ -32,7 +42,6 @@ fs2 = "0.4"
 libdeflater = "1.25"
 lz4 = "1.28"
 lz4_flex = "0.11"
-lz4_rust = { package = "lz4r", version = "1.10" }
 lzfse = "0.2"
 lzfse_rust = "0.2"
 lzma-rust2 = "0.16"
@@ -55,7 +64,6 @@ tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-th
 tokio-stream = "0.1"
 tower = { version = "0.5", features = ["util"] }
 xz2 = "0.1"
-zenflate = "0.3"
 zlib-rs = "0.6"
 zopfli = "0.8"
 zstd = { version = "0.13", features = ["zdict_builder"] }

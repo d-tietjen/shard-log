@@ -6,23 +6,43 @@ use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
+use bytes::Bytes;
 use shard_stream_core::{ShardId, TopicPartition};
 use shard_stream_engine::{
     DurableAppend, DurableAppendSink, DurableAppendSinkFactory, DurableSinkApply,
     DurableSinkCheckpoint, EngineError, EngineResult,
 };
 
-use crate::ingest_pack::{decode_ingest_pack, is_ingest_pack, validate_ingest_pack};
+use crate::ingest_pack::{
+    decode_ingest_pack, is_ingest_pack, prepare_ingest_pack, validate_ingest_pack,
+};
 use crate::sink_journal::{SinkJournal, checkpoint_allows_lane_gap};
 use crate::{
-    DictionaryCatalog, LogDbError, LogDbResult, LogMatch, LogQuery, LogStripe, OtlpLogDecoder,
-    OtlpLogEvent, RealtimeDictionaryObserver, RealtimeDictionaryTrainer, StripeConfig,
-    decode_native_log_events, inspect_native_log_batch, is_native_log_batch,
-    validate_native_log_batch,
+    DictionaryCatalog, LogDbError, LogDbResult, LogMatch, LogQuery, LogStripe, ObjectTierConfig,
+    OtlpLogDecoder, OtlpLogEvent, RealtimeDictionaryObserver, RealtimeDictionaryTrainer,
+    SharedLogObjectStore, SsdCacheConfig, SsdObjectCache, StripeConfig, decode_native_log_events,
+    inspect_native_log_batch, is_native_log_batch, validate_native_log_batch,
 };
 
+/// Immutable object-tier and bounded SSD-cache settings shared by sink stripes.
+#[derive(Debug, Clone)]
+pub struct SinkObjectTierConfig {
+    /// Object-store adapter used for immutable data and catalog publication.
+    pub store: SharedLogObjectStore,
+    /// Local crash-safe staging directory for artifacts being published.
+    pub spool_directory: PathBuf,
+    /// Local SSD range-cache directory.
+    pub cache_directory: PathBuf,
+    /// Logical partitions whose catalogs must be opened without object listing.
+    pub partitions: Vec<TopicPartition>,
+    /// Immutable group and catalog bounds.
+    pub tier: ObjectTierConfig,
+    /// Recoverable SSD range-cache bounds.
+    pub cache: SsdCacheConfig,
+}
+
 /// Configuration for shard-log's per-shard native and OTLP index sinks.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct OtlpSinkConfig {
     /// Hot index and dictionary-cache limits for each physical shard.
     pub stripe: StripeConfig,
@@ -34,6 +54,8 @@ pub struct OtlpSinkConfig {
     pub state_directory: Option<PathBuf>,
     /// Maximum bytes retained in each physical stripe's sink journal.
     pub max_journal_bytes: u64,
+    /// Optional immutable object tier for bounded recovery and cold queries.
+    pub object_tier: Option<SinkObjectTierConfig>,
 }
 
 impl Default for OtlpSinkConfig {
@@ -43,6 +65,7 @@ impl Default for OtlpSinkConfig {
             queue_slots: 256,
             state_directory: None,
             max_journal_bytes: 64 * 1024 * 1024 * 1024,
+            object_tier: None,
         }
     }
 }
@@ -59,8 +82,42 @@ impl OtlpSinkConfig {
                 "log sink max_journal_bytes must fit its header",
             ));
         }
+        if self.object_tier.as_ref().is_some_and(|tier| {
+            tier.partitions.is_empty() || tier.partitions.windows(2).any(|pair| pair[0] >= pair[1])
+        }) {
+            return Err(LogDbError::InvalidConfig(
+                "object-tier partitions must be nonempty, sorted, and unique",
+            ));
+        }
         Ok(())
     }
+}
+
+fn checkpoint_covers(checkpoint: DurableSinkCheckpoint, candidate: DurableSinkCheckpoint) -> bool {
+    checkpoint.topic_partition == candidate.topic_partition
+        && checkpoint.next_placement_sequence >= candidate.next_placement_sequence
+        && checkpoint.next_offset >= candidate.next_offset
+}
+
+fn merge_recovered_checkpoint(
+    checkpoints: &mut HashMap<TopicPartition, DurableSinkCheckpoint>,
+    candidate: DurableSinkCheckpoint,
+) -> LogDbResult<()> {
+    match checkpoints.get(&candidate.topic_partition).copied() {
+        None => {
+            checkpoints.insert(candidate.topic_partition, candidate);
+        }
+        Some(current) if checkpoint_covers(current, candidate) => {}
+        Some(current) if checkpoint_covers(candidate, current) => {
+            checkpoints.insert(candidate.topic_partition, candidate);
+        }
+        Some(_) => {
+            return Err(LogDbError::CorruptTier(
+                "object-tier checkpoints are not monotonically comparable".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Builds one owner-only log index worker for every shard-stream physical shard.
@@ -129,6 +186,11 @@ impl ShardLogSinkFactory {
         let mut recovered_checkpoints = HashMap::new();
         let mut recovered_transactions = Vec::new();
         let mut journals = HashMap::new();
+        let tier_cache = config
+            .object_tier
+            .as_ref()
+            .map(|tier| SsdObjectCache::open(&tier.cache_directory, tier.cache).map(Arc::new))
+            .transpose()?;
         for shard_id in shard_ids {
             let mut stripe = match &dictionary_catalog {
                 Some(dictionary_catalog) => LogStripe::with_dictionary_catalog(
@@ -140,6 +202,17 @@ impl ShardLogSinkFactory {
             };
             if let Some(observer) = &realtime_dictionary {
                 stripe.attach_realtime_dictionary(observer.clone());
+            }
+            if let (Some(tier), Some(cache)) = (&config.object_tier, &tier_cache) {
+                for checkpoint in stripe.attach_object_tier(
+                    tier.store.clone(),
+                    tier.spool_directory.clone(),
+                    Arc::clone(cache),
+                    tier.partitions.iter().copied(),
+                    tier.tier,
+                )? {
+                    merge_recovered_checkpoint(&mut recovered_checkpoints, checkpoint)?;
+                }
             }
             if let Some(directory) = &config.state_directory {
                 let (journal, recovered) =
@@ -174,6 +247,9 @@ impl ShardLogSinkFactory {
                 .unwrap_or_else(|| {
                     DurableSinkCheckpoint::initial(transaction.expected.topic_partition)
                 });
+            if checkpoint_covers(actual, transaction.next) {
+                continue;
+            }
             if !checkpoint_allows_lane_gap(actual, transaction.expected) {
                 return Err(LogDbError::CorruptSinkJournal(
                     "recovered checkpoint chain conflicts across stripes".into(),
@@ -183,10 +259,15 @@ impl ShardLogSinkFactory {
                 .get_mut(&shard_id)
                 .ok_or(LogDbError::UnknownStripe(shard_id))?;
             for append in transaction.appends {
-                stripe.apply_otlp_events(
+                let events = decode_log_events(&append.payload)?;
+                let prepared = prepare_ingest_pack(&events)?;
+                stripe.apply_checkpointed_ingest_pack(
                     append.topic_partition,
                     append.first_offset,
-                    decode_log_events(&append.payload)?,
+                    u32::try_from(events.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+                    Bytes::from(prepared.payload),
+                    Some(&prepared.transient_context),
+                    (transaction.expected, transaction.next),
                 )?;
             }
             recovered_checkpoints.insert(transaction.next.topic_partition, transaction.next);
@@ -302,6 +383,12 @@ enum SinkCommand {
         queries: Vec<LogQuery>,
         response: SyncSender<LogDbResult<Vec<LogMatch>>>,
     },
+    Flush {
+        response: SyncSender<LogDbResult<usize>>,
+    },
+    RetainedPayloadBytes {
+        response: SyncSender<u64>,
+    },
 }
 
 struct SinkState {
@@ -406,6 +493,13 @@ fn run_sink_worker(
                 let result = stripe.query_partitions_checked(&queries);
                 let _ = response.send(result);
             }
+            SinkCommand::Flush { response } => {
+                let result = stripe.offload_indexed_groups(true);
+                let _ = response.send(result);
+            }
+            SinkCommand::RetainedPayloadBytes { response } => {
+                let _ = response.send(stripe.retained_payload_bytes());
+            }
         }
     }
 }
@@ -426,10 +520,59 @@ impl ShardLogService {
         self.query_partitions(std::slice::from_ref(query))
     }
 
-    pub(crate) fn query_partitions(&self, queries: &[LogQuery]) -> LogDbResult<Vec<LogMatch>> {
-        let Some(ordering_query) = queries.first() else {
-            return Ok(Vec::new());
-        };
+    /// Forces every owner stripe to publish complete pending append boundaries.
+    pub fn flush_object_tier(&self) -> LogDbResult<usize> {
+        let workers = self.worker_senders()?;
+        let mut responses = Vec::with_capacity(workers.len());
+        for (shard_id, sender) in workers {
+            let (response, receiver) = sync_channel(1);
+            sender.send(SinkCommand::Flush { response }).map_err(|_| {
+                LogDbError::QueryWorkerUnavailable(format!(
+                    "stripe {shard_id} stopped before accepting a flush"
+                ))
+            })?;
+            responses.push((shard_id, receiver));
+        }
+        responses
+            .into_iter()
+            .try_fold(0usize, |total, (shard_id, receiver)| {
+                let published = receiver.recv().map_err(|_| {
+                    LogDbError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped while flushing"
+                    ))
+                })??;
+                Ok(total.saturating_add(published))
+            })
+    }
+
+    /// Returns compressed bytes still resident while awaiting a complete group.
+    pub fn retained_payload_bytes(&self) -> LogDbResult<u64> {
+        let workers = self.worker_senders()?;
+        let mut responses = Vec::with_capacity(workers.len());
+        for (shard_id, sender) in workers {
+            let (response, receiver) = sync_channel(1);
+            sender
+                .send(SinkCommand::RetainedPayloadBytes { response })
+                .map_err(|_| {
+                    LogDbError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped before reporting resident bytes"
+                    ))
+                })?;
+            responses.push((shard_id, receiver));
+        }
+        responses
+            .into_iter()
+            .try_fold(0u64, |total, (shard_id, receiver)| {
+                let bytes = receiver.recv().map_err(|_| {
+                    LogDbError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped while reporting resident bytes"
+                    ))
+                })?;
+                Ok(total.saturating_add(bytes))
+            })
+    }
+
+    fn worker_senders(&self) -> LogDbResult<Vec<(ShardId, SyncSender<SinkCommand>)>> {
         let mut workers = self
             .workers
             .lock()
@@ -445,6 +588,14 @@ impl ShardLogService {
                 "no stripe workers are active".into(),
             ));
         }
+        Ok(workers)
+    }
+
+    pub(crate) fn query_partitions(&self, queries: &[LogQuery]) -> LogDbResult<Vec<LogMatch>> {
+        let Some(ordering_query) = queries.first() else {
+            return Ok(Vec::new());
+        };
+        let workers = self.worker_senders()?;
 
         let mut responses = Vec::with_capacity(workers.len());
         for (shard_id, sender) in workers {
@@ -520,12 +671,15 @@ fn apply_durable_appends(
         return Ok(DurableSinkApply::CheckpointConflict(actual));
     }
 
-    index_durable_appends(stripe, appends).map_err(log_error_to_engine)?;
     if let Some(journal) = journal {
         journal
             .append(expected, appends, next)
             .map_err(log_error_to_engine)?;
     }
+    index_durable_appends(stripe, appends, expected, next).map_err(log_error_to_engine)?;
+    stripe
+        .offload_indexed_groups(false)
+        .map_err(log_error_to_engine)?;
     checkpoints
         .lock()
         .map_err(|_| {
@@ -535,7 +689,12 @@ fn apply_durable_appends(
     Ok(DurableSinkApply::Applied)
 }
 
-fn index_durable_appends(stripe: &mut LogStripe, appends: &[DurableAppend]) -> LogDbResult<()> {
+fn index_durable_appends(
+    stripe: &mut LogStripe,
+    appends: &[DurableAppend],
+    expected: DurableSinkCheckpoint,
+    next: DurableSinkCheckpoint,
+) -> LogDbResult<()> {
     for append in appends {
         if append.physical_shard_id != stripe.stream_shard_id() {
             return Err(LogDbError::WrongStripe {
@@ -546,12 +705,13 @@ fn index_durable_appends(stripe: &mut LogStripe, appends: &[DurableAppend]) -> L
         let topic_partition =
             TopicPartition::new(append.reservation.topic_id, append.reservation.partition_id);
         if is_ingest_pack(&append.payload) {
-            stripe.apply_indexed_ingest_pack(
+            stripe.apply_checkpointed_ingest_pack(
                 topic_partition,
                 append.reservation.first_offset,
                 append.reservation.record_count.get(),
                 append.payload.clone(),
                 append.transient_context.as_deref(),
+                (expected, next),
             )?;
             continue;
         }
@@ -568,7 +728,15 @@ fn index_durable_appends(stripe: &mut LogStripe, appends: &[DurableAppend]) -> L
                 "durable log append record count disagrees with its decoded batch",
             ));
         }
-        stripe.apply_otlp_events(topic_partition, append.reservation.first_offset, events)?;
+        let prepared = prepare_ingest_pack(&events)?;
+        stripe.apply_checkpointed_ingest_pack(
+            topic_partition,
+            append.reservation.first_offset,
+            decoded_count,
+            Bytes::from(prepared.payload),
+            Some(&prepared.transient_context),
+            (expected, next),
+        )?;
     }
     Ok(())
 }

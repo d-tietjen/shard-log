@@ -284,7 +284,6 @@ about the final normalized shard-log layout.
 | `lz4_flex` | 81,142,348 | 13.23x | 7.56% | 1,897 MiB/s |
 | `lz4_native` | 81,110,632 | 13.24x | 7.55% | 2,261 MiB/s |
 | `lz4_native_hc-9` | 62,630,026 | 17.14x | 5.83% | 133 MiB/s |
-| `lz4_rust` | 81,110,120 | 13.24x | 7.55% | 2,263 MiB/s |
 | `snap` | 119,801,022 | 8.96x | 11.16% | **2,410 MiB/s** |
 | `s2` | 93,329,078 | 11.50x | 8.69% | 2,118 MiB/s |
 | `s2_better` | 91,011,664 | 11.80x | 8.48% | 551 MiB/s |
@@ -293,8 +292,6 @@ about the final normalized shard-log layout.
 | DEFLATE level 6 | 42,822,645 | 25.07x | 3.99% | 128 MiB/s |
 | `libdeflate-6` | 40,665,196 | 26.40x | 3.79% | 333 MiB/s |
 | `zlib_rs-6` | 42,149,520 | 25.47x | 3.93% | 270 MiB/s |
-| `flate3` | 52,393,082 | 20.49x | 4.88% | 76 MiB/s |
-| `zenflate-7` | 40,469,558 | 26.53x | 3.77% | 235 MiB/s |
 | `zopfli-5` | 36,168,767 | 29.69x | 3.37% | 0.50 MiB/s |
 | `brotli-5` | 42,479,572 | 25.28x | 3.96% | 62 MiB/s |
 | `bzip2-9` | **32,413,164** | **33.13x** | **3.02%** | 11.7 MiB/s |
@@ -308,17 +305,18 @@ about the final normalized shard-log layout.
 | `zstd-3` | 46,959,090 | 22.87x | 4.37% | 1,146 MiB/s |
 | `zstd-9` | 38,958,957 | 27.56x | 3.63% | 151 MiB/s |
 
-The practical Pareto choices are Snappy, LZ4, zstd-1, libdeflate-6,
-zenflate-7, zstd-9, and bzip2-9. The small 0.13x ratio difference between
-libdeflate-6 and zenflate-7 is not enough to treat the latter as a default: it
-is 29% slower. Zopfli is dominated by bzip2-9 on this corpus: bzip2 is both
-smaller and more than twenty times faster.
+The practical Pareto choices in the Apache-2.0 distribution are Snappy, native
+LZ4, zstd-1, libdeflate-6, zstd-9, and bzip2-9. GPL- and AGPL-licensed codecs
+used in an early research sweep, along with codecs lacking declared license
+metadata, are not linked into or selectable from the released benchmark
+binary. Zopfli is dominated by bzip2-9 on this corpus:
+bzip2 is both smaller and more than twenty times faster.
 
 ### Selection guide
 
 | Priority | Recommended policy | Why | Cost |
 | --- | --- | --- | --- |
-| Lowest encode latency | LZ4 (`lz4_rust` or native LZ4) | 13.24x at about 2.26 GiB/s; substantially smaller than Snappy for only a small throughput cost. | Stores about twice as many bytes as zstd-1. |
+| Lowest encode latency | Native LZ4 | 13.24x at about 2.26 GiB/s; substantially smaller than Snappy for only a small throughput cost. | Stores about twice as many bytes as zstd-1. |
 | Default hot storage | zstd level 1 | 25.54x at 1.37 GiB/s; it dominates most middle-ground codecs. | Less peak throughput than LZ4. |
 | Background compact storage | libdeflate-6 | 26.40x at 333 MiB/s; modestly smaller than zstd-1. | Requires a separate codec path and is about four times slower than zstd-1. |
 | Cold searchable storage | zstd level 9 | 27.56x at 151 MiB/s; a good compact, queryable block format. | About nine times slower than zstd-1. |

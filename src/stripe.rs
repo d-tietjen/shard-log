@@ -1,27 +1,37 @@
 use std::borrow::Cow;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use shard_stream_core::{LogicalOffset, ShardId, TopicPartition};
+use shard_stream_engine::DurableSinkCheckpoint;
 
 use crate::ingest_pack::{
     IndexedIngestFrame, decode_indexed_ingest_frames, decode_indexed_ingest_records,
+};
+use crate::tier_ingest::{
+    TierIngestAppendSource, TierIngestFrameSource, decode_tier_ingest_group,
+    write_tier_ingest_group,
 };
 use crate::{
     BlockCatalog, BlockDescriptor, BlockId, CompressionBlockCollator, CompressionBlockScore,
     CompressionCodec, CompressionCohortId, CompressionLocalityConfig, CompressionLocalityRecord,
     CompressionLocalityStats, CompressionPlacement, CompressionPlacementId, CompressionTemperature,
     DictionaryCache, DictionaryCatalog, DictionaryCatalogSnapshot, DictionaryId, DictionaryInsert,
-    DurableLogRecord, LogDbError, LogDbResult, LogMatch, LogQuery, MessageFingerprint,
-    OtlpLogDecoder, OtlpLogEvent, QueryOrder, RealtimeDictionaryObserver,
-    RealtimeDictionaryTrainer, RecordRef, fingerprint_message, scan_message_terms,
+    DurableLogRecord, EmbeddedFrameIndex, LogDbError, LogDbResult, LogMatch, LogObjectTier,
+    LogQuery, MessageFingerprint, ObjectMetadata, ObjectTierConfig, OtlpLogDecoder, OtlpLogEvent,
+    QueryOrder, RealtimeDictionaryObserver, RealtimeDictionaryTrainer, RecordRef,
+    SharedLogObjectStore, SsdObjectCache, TierArtifactKind, TierArtifactSource, TierCheckpoint,
+    TierGroupSource, TierQueryRange, fingerprint_message, scan_message_terms,
     structural::{encode_structural_block, row_source_bytes},
 };
 
 const MAX_REBALANCE_PASSES: u8 = 3;
 const MESSAGE_TERM_CACHE_ENTRIES: usize = 1_024;
 const FIELD_CACHE_ENTRIES: usize = 1_024;
+const MAX_TIER_QUERY_INDEX_READ_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 type PartitionTermIds = HashMap<Arc<str>, usize>;
 type PartitionFieldIds = HashMap<Arc<str>, HashMap<Arc<str>, usize>>;
@@ -221,12 +231,21 @@ struct IndexedFrameAppend {
     last_offset: LogicalOffset,
     record_count: u32,
     frames: Vec<IndexedIngestFrame>,
+    next_checkpoint: Option<DurableSinkCheckpoint>,
 }
 
 #[derive(Debug, Default)]
 struct IndexedFramePartition {
     appends: Vec<IndexedFrameAppend>,
     indexed_through: Option<LogicalOffset>,
+}
+
+#[derive(Debug)]
+struct StripeTierState {
+    tiers: HashMap<TopicPartition, LogObjectTier<SharedLogObjectStore>>,
+    spool_directory: PathBuf,
+    cache: Arc<SsdObjectCache>,
+    config: ObjectTierConfig,
 }
 
 #[derive(Clone, Copy)]
@@ -487,6 +506,8 @@ pub struct LogStripe {
     realtime_dictionary: Option<RealtimeDictionaryObserver>,
     block_collator: CompressionBlockCollator,
     compressor: StripeCompressor,
+    tier: Option<StripeTierState>,
+    next_frame_id: u64,
 }
 
 impl LogStripe {
@@ -519,6 +540,8 @@ impl LogStripe {
             realtime_dictionary: None,
             block_collator,
             compressor: StripeCompressor::new(compression_level)?,
+            tier: None,
+            next_frame_id: 0,
         })
     }
 
@@ -579,6 +602,72 @@ impl LogStripe {
     #[must_use]
     pub const fn catalog(&self) -> &BlockCatalog {
         &self.catalog
+    }
+
+    /// Attaches partition-scoped immutable object catalogs and returns their
+    /// durable recovery watermarks.
+    pub(crate) fn attach_object_tier(
+        &mut self,
+        store: SharedLogObjectStore,
+        spool_directory: PathBuf,
+        cache: Arc<SsdObjectCache>,
+        partitions: impl IntoIterator<Item = TopicPartition>,
+        config: ObjectTierConfig,
+    ) -> LogDbResult<Vec<DurableSinkCheckpoint>> {
+        if self.tier.is_some() {
+            return Err(LogDbError::InvalidConfig(
+                "an object tier is already attached to this stripe",
+            ));
+        }
+        let spool_directory = spool_directory.join(format!("shard-{}", self.stream_shard_id.get()));
+        fs::create_dir_all(&spool_directory)
+            .map_err(|error| LogDbError::StorageIo(format!("create tier spool: {error}")))?;
+        let mut tiers = HashMap::new();
+        let mut checkpoints = Vec::new();
+        let mut next_frame_id = self.next_frame_id;
+        for partition in partitions {
+            let object_tier =
+                LogObjectTier::open(store.clone(), self.stream_shard_id, partition, config)?;
+            next_frame_id = next_frame_id.max(object_tier.root().next_block_id);
+            if let Some(checkpoint) = object_tier.root().latest_checkpoint {
+                checkpoints.push(DurableSinkCheckpoint {
+                    topic_partition: partition,
+                    next_placement_sequence: shard_stream_core::PlacementSequence::new(
+                        checkpoint.next_placement_sequence,
+                    ),
+                    next_offset: LogicalOffset::new(checkpoint.next_offset),
+                });
+            }
+            if tiers.insert(partition, object_tier).is_some() {
+                return Err(LogDbError::InvalidConfig(
+                    "object tier contains a duplicate partition",
+                ));
+            }
+        }
+        if tiers.is_empty() {
+            return Err(LogDbError::InvalidConfig(
+                "object tier requires at least one partition",
+            ));
+        }
+        self.next_frame_id = next_frame_id;
+        self.tier = Some(StripeTierState {
+            tiers,
+            spool_directory,
+            cache,
+            config,
+        });
+        Ok(checkpoints)
+    }
+
+    /// Returns compressed payload bytes that have not reached immutable object storage.
+    #[must_use]
+    pub(crate) fn retained_payload_bytes(&self) -> u64 {
+        self.indexed_frame_partitions
+            .values()
+            .flat_map(|partition| &partition.appends)
+            .flat_map(|append| &append.frames)
+            .map(|frame| u64::try_from(frame.compressed.len()).unwrap_or(u64::MAX))
+            .sum()
     }
 
     /// Returns the local catalog of sealed data blocks for offload bookkeeping.
@@ -857,6 +946,7 @@ impl LogStripe {
     /// The authoritative compressed cohort frames remain resident and the
     /// compressor-derived indexes select candidates. Exact bodies and fields
     /// are reconstructed only for candidate records during lookup.
+    #[cfg(test)]
     pub(crate) fn apply_indexed_ingest_pack(
         &mut self,
         topic_partition: TopicPartition,
@@ -864,6 +954,52 @@ impl LogStripe {
         record_count: u32,
         payload: Bytes,
         transient_context: Option<&[u8]>,
+    ) -> LogDbResult<()> {
+        self.apply_indexed_ingest_pack_inner(
+            topic_partition,
+            first_offset,
+            record_count,
+            payload,
+            transient_context,
+            None,
+        )
+    }
+
+    pub(crate) fn apply_checkpointed_ingest_pack(
+        &mut self,
+        topic_partition: TopicPartition,
+        first_offset: LogicalOffset,
+        record_count: u32,
+        payload: Bytes,
+        transient_context: Option<&[u8]>,
+        checkpoints: (DurableSinkCheckpoint, DurableSinkCheckpoint),
+    ) -> LogDbResult<()> {
+        let (expected_checkpoint, next_checkpoint) = checkpoints;
+        if expected_checkpoint.topic_partition != topic_partition
+            || next_checkpoint.topic_partition != topic_partition
+        {
+            return Err(LogDbError::CorruptSinkJournal(
+                "indexed append checkpoints refer to another partition".into(),
+            ));
+        }
+        self.apply_indexed_ingest_pack_inner(
+            topic_partition,
+            first_offset,
+            record_count,
+            payload,
+            transient_context,
+            Some(next_checkpoint),
+        )
+    }
+
+    fn apply_indexed_ingest_pack_inner(
+        &mut self,
+        topic_partition: TopicPartition,
+        first_offset: LogicalOffset,
+        record_count: u32,
+        payload: Bytes,
+        transient_context: Option<&[u8]>,
+        next_checkpoint: Option<DurableSinkCheckpoint>,
     ) -> LogDbResult<()> {
         if record_count == 0 {
             return Err(LogDbError::InvalidConfig(
@@ -879,6 +1015,9 @@ impl LogStripe {
         if let Some(previous) = self.indexed_through(topic_partition)
             && first_offset <= previous
         {
+            if last_offset <= previous {
+                return Ok(());
+            }
             let expected = previous
                 .get()
                 .checked_add(1)
@@ -890,7 +1029,14 @@ impl LogStripe {
                 observed: first_offset,
             });
         }
-        let frames = decode_indexed_ingest_frames(payload, transient_context, record_count)?;
+        let mut frames = decode_indexed_ingest_frames(payload, transient_context, record_count)?;
+        for frame in &mut frames {
+            frame.frame_id = self.next_frame_id;
+            self.next_frame_id = self
+                .next_frame_id
+                .checked_add(1)
+                .ok_or(LogDbError::RecordTooLarge)?;
+        }
         let partition = self
             .indexed_frame_partitions
             .entry(topic_partition)
@@ -900,6 +1046,7 @@ impl LogStripe {
             last_offset,
             record_count,
             frames,
+            next_checkpoint,
         });
         // Publication barrier: readers never observe a watermark before all
         // frame metadata and embedded index views are installed.
@@ -934,6 +1081,167 @@ impl LogStripe {
             sealed.extend(self.rebalance_block(key, active, true)?);
         }
         Ok(sealed)
+    }
+
+    /// Publishes complete indexed append boundaries to immutable object storage.
+    ///
+    /// When `force` is false, only groups at the configured target size are
+    /// published. A forced pass seals every remaining checkpointed append.
+    pub(crate) fn offload_indexed_groups(&mut self, force: bool) -> LogDbResult<usize> {
+        let Some(state) = self.tier.as_ref() else {
+            return Ok(0);
+        };
+        let partitions = state.tiers.keys().copied().collect::<Vec<_>>();
+        let mut published = 0usize;
+        for partition in partitions {
+            loop {
+                if !self.offload_one_indexed_group(partition, force)? {
+                    break;
+                }
+                published = published.saturating_add(1);
+            }
+        }
+        Ok(published)
+    }
+
+    fn offload_one_indexed_group(
+        &mut self,
+        partition: TopicPartition,
+        force: bool,
+    ) -> LogDbResult<bool> {
+        let state = self
+            .tier
+            .as_ref()
+            .ok_or(LogDbError::InvalidConfig("object tier is not attached"))?;
+        let config = state.config;
+        let Some(resident) = self.indexed_frame_partitions.get(&partition) else {
+            return Ok(false);
+        };
+        let mut selected_appends = 0usize;
+        let mut selected_payload_bytes = 0u64;
+        let mut selected_frames = 0usize;
+        for append in &resident.appends {
+            if append.next_checkpoint.is_none() {
+                break;
+            }
+            let append_payload_bytes = append.frames.iter().try_fold(0u64, |total, frame| {
+                total
+                    .checked_add(
+                        u64::try_from(frame.compressed.len())
+                            .map_err(|_| LogDbError::RecordTooLarge)?,
+                    )
+                    .ok_or(LogDbError::RecordTooLarge)
+            })?;
+            let append_frames = append.frames.len();
+            if append_payload_bytes > config.max_group_payload_bytes
+                || append_frames > config.max_blocks_per_group
+            {
+                return Err(LogDbError::ObjectStore(
+                    "one durable append exceeds the object-tier group limit".into(),
+                ));
+            }
+            if selected_appends > 0
+                && (selected_payload_bytes.saturating_add(append_payload_bytes)
+                    > config.max_group_payload_bytes
+                    || selected_frames.saturating_add(append_frames) > config.max_blocks_per_group)
+            {
+                break;
+            }
+            selected_appends += 1;
+            selected_payload_bytes = selected_payload_bytes
+                .checked_add(append_payload_bytes)
+                .ok_or(LogDbError::RecordTooLarge)?;
+            selected_frames = selected_frames
+                .checked_add(append_frames)
+                .ok_or(LogDbError::RecordTooLarge)?;
+            if selected_payload_bytes >= config.target_group_payload_bytes {
+                break;
+            }
+        }
+        if selected_appends == 0
+            || (!force && selected_payload_bytes < config.target_group_payload_bytes)
+        {
+            return Ok(false);
+        }
+
+        let sources = resident.appends[..selected_appends]
+            .iter()
+            .map(|append| TierIngestAppendSource {
+                first_offset: append.first_offset,
+                last_offset: append.last_offset,
+                record_count: append.record_count,
+                frames: append
+                    .frames
+                    .iter()
+                    .map(|frame| TierIngestFrameSource {
+                        frame_id: frame.frame_id,
+                        cohort: frame.cohort,
+                        record_count: frame.record_count,
+                        structural_bytes: frame.structural_bytes,
+                        min_timestamp_unix_nanos: frame.min_timestamp_unix_nanos,
+                        max_timestamp_unix_nanos: frame.max_timestamp_unix_nanos,
+                        compressed: frame.compressed.clone(),
+                        index: frame.index.clone(),
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
+        let checkpoint = resident.appends[selected_appends - 1]
+            .next_checkpoint
+            .expect("selected checkpointed append has a next checkpoint");
+        let state = self
+            .tier
+            .as_mut()
+            .expect("object tier was checked before group selection");
+        let tier = state
+            .tiers
+            .get_mut(&partition)
+            .expect("selected partition has an object tier");
+        let group_sequence = tier
+            .root()
+            .pages
+            .last()
+            .map_or(0, |page| page.last_group_sequence.saturating_add(1));
+        let group_directory = state.spool_directory.join(format!(
+            "topic-{}-partition-{}/group-{group_sequence:020}",
+            partition.topic_id.get(),
+            partition.partition_id.get()
+        ));
+        let payload_path = group_directory.join("payload.pack");
+        let query_index_path = group_directory.join("query-index.sltqix");
+        let blocks = write_tier_ingest_group(&sources, &payload_path, &query_index_path)?;
+        tier.publish_group(TierGroupSource {
+            group_sequence,
+            checkpoint: TierCheckpoint {
+                next_placement_sequence: checkpoint.next_placement_sequence.get(),
+                next_offset: checkpoint.next_offset.get(),
+            },
+            blocks,
+            artifacts: vec![
+                TierArtifactSource {
+                    kind: TierArtifactKind::PayloadPack,
+                    name: "payload.pack".into(),
+                    path: payload_path.clone(),
+                },
+                TierArtifactSource {
+                    kind: TierArtifactKind::QueryIndex,
+                    name: "query-index.sltqix".into(),
+                    path: query_index_path.clone(),
+                },
+            ],
+        })?;
+        self.indexed_frame_partitions
+            .get_mut(&partition)
+            .expect("resident partition remains present")
+            .appends
+            .drain(..selected_appends);
+        remove_published_spool_file(&payload_path);
+        remove_published_spool_file(&query_index_path);
+        let _ = fs::remove_dir(&group_directory);
+        if let Some(parent) = group_directory.parent() {
+            let _ = fs::remove_dir(parent);
+        }
+        Ok(true)
     }
 
     /// Marks a sealed block as durably written to the object tier.
@@ -974,6 +1282,7 @@ impl LogStripe {
         if let Some(partition) = self.indexed_frame_partitions.get(&query.topic_partition) {
             matches.extend(self.query_indexed_frames(query, partition)?);
         }
+        matches.extend(self.query_tiered_groups(query)?);
         matches.sort_unstable_by(|left, right| query.compare(&left.record, &right.record));
         if let Some(limit) = query.limit {
             matches.truncate(limit);
@@ -988,6 +1297,19 @@ impl LogStripe {
         let Some(ordering_query) = queries.first() else {
             return Ok(Vec::new());
         };
+        if self.tier.is_some() {
+            let mut matches = queries.iter().try_fold(Vec::new(), |mut matches, query| {
+                matches.extend(self.query_checked(query)?);
+                Ok::<_, LogDbError>(matches)
+            })?;
+            matches.sort_unstable_by(|left, right| {
+                ordering_query.compare(&left.record, &right.record)
+            });
+            if let Some(limit) = ordering_query.limit {
+                matches.truncate(limit);
+            }
+            return Ok(matches);
+        }
         let Some(limit) = ordering_query.limit else {
             return queries.iter().try_fold(Vec::new(), |mut matches, query| {
                 matches.extend(self.query_checked(query)?);
@@ -1127,35 +1449,130 @@ impl LogStripe {
         Ok(matches)
     }
 
+    fn query_tiered_groups(&self, query: &LogQuery) -> LogDbResult<Vec<LogMatch>> {
+        let Some(state) = &self.tier else {
+            return Ok(Vec::new());
+        };
+        let Some(tier) = state.tiers.get(&query.topic_partition) else {
+            return Ok(Vec::new());
+        };
+        let mut groups = tier.candidate_groups(TierQueryRange {
+            first_offset: query.start_offset.map(LogicalOffset::get),
+            last_offset: query.end_offset.map(LogicalOffset::get),
+            min_timestamp_unix_nanos: query.start_timestamp_unix_nanos,
+            max_timestamp_unix_nanos: query.end_timestamp_unix_nanos,
+        })?;
+        match query.order {
+            QueryOrder::NewestFirst => groups.sort_unstable_by(|left, right| {
+                right
+                    .max_timestamp_unix_nanos
+                    .cmp(&left.max_timestamp_unix_nanos)
+            }),
+            QueryOrder::OldestFirst => groups.sort_unstable_by(|left, right| {
+                left.min_timestamp_unix_nanos
+                    .cmp(&right.min_timestamp_unix_nanos)
+            }),
+        }
+        let mut matches = Vec::new();
+        for group in groups {
+            let manifest = tier.load_group(&group)?;
+            let query_artifact = manifest
+                .artifact(TierArtifactKind::QueryIndex)
+                .ok_or_else(|| LogDbError::CorruptTier("group has no query index".into()))?;
+            let query_index =
+                tier.read_artifact(query_artifact, MAX_TIER_QUERY_INDEX_READ_BYTES)?;
+            let appends = decode_tier_ingest_group(&query_index, &manifest.blocks)?;
+            let payload_artifact = manifest
+                .artifact(TierArtifactKind::PayloadPack)
+                .ok_or_else(|| LogDbError::CorruptTier("group has no payload pack".into()))?;
+            let payload_metadata = ObjectMetadata {
+                bytes: payload_artifact.bytes,
+                version_token: payload_artifact.checksum.clone(),
+                content_digest: payload_artifact.checksum.clone(),
+            };
+            for append in appends {
+                let bounds = IndexedFrameAppend {
+                    first_offset: append.first_offset,
+                    last_offset: append.last_offset,
+                    record_count: append.record_count,
+                    frames: Vec::new(),
+                    next_checkpoint: None,
+                };
+                if !append_matches_query_bounds(query, &bounds) {
+                    continue;
+                }
+                for cold_frame in append.frames {
+                    let candidates =
+                        indexed_frame_candidates(query, &cold_frame.index, cold_frame.record_count);
+                    if candidates.is_empty()
+                        || !timestamp_bounds_overlap(
+                            query,
+                            cold_frame.min_timestamp_unix_nanos,
+                            cold_frame.max_timestamp_unix_nanos,
+                        )
+                    {
+                        continue;
+                    }
+                    let range_end = cold_frame
+                        .payload_offset
+                        .checked_add(cold_frame.payload_bytes)
+                        .ok_or(LogDbError::RecordTooLarge)?;
+                    let compressed = state.cache.read_range_with_metadata(
+                        tier.object_store(),
+                        &payload_artifact.object_key,
+                        &payload_metadata,
+                        cold_frame.payload_offset..range_end,
+                    )?;
+                    if blake3::hash(&compressed).to_hex().as_str() != cold_frame.payload_checksum {
+                        return Err(LogDbError::CorruptTier(format!(
+                            "tiered frame {} payload checksum failed",
+                            cold_frame.frame_id
+                        )));
+                    }
+                    let frame = IndexedIngestFrame {
+                        frame_id: cold_frame.frame_id,
+                        cohort: cold_frame.cohort,
+                        record_count: cold_frame.record_count,
+                        structural_bytes: cold_frame.structural_bytes,
+                        min_timestamp_unix_nanos: cold_frame.min_timestamp_unix_nanos,
+                        max_timestamp_unix_nanos: cold_frame.max_timestamp_unix_nanos,
+                        compressed: Bytes::from(compressed),
+                        index: cold_frame.index,
+                    };
+                    matches.extend(self.decode_indexed_frame_candidates(
+                        query,
+                        &bounds,
+                        &frame,
+                        &candidates,
+                    )?);
+                }
+            }
+        }
+        Ok(matches)
+    }
+
     fn query_indexed_frame(
         &self,
         query: &LogQuery,
         append: &IndexedFrameAppend,
         frame: &IndexedIngestFrame,
     ) -> LogDbResult<Vec<LogMatch>> {
-        let constraints = query.required_index_constraints();
-        if constraints.impossible {
+        let candidates = indexed_frame_candidates(query, &frame.index, frame.record_count);
+        if candidates.is_empty() {
             return Ok(Vec::new());
         }
-        let mut candidates = None::<Vec<u32>>;
-        for term in &constraints.terms {
-            intersect_frame_candidates(&mut candidates, frame.index.term_candidate_ordinals(term));
-            if candidates.as_ref().is_some_and(Vec::is_empty) {
-                return Ok(Vec::new());
-            }
-        }
-        for (key, value) in &constraints.fields {
-            intersect_frame_candidates(
-                &mut candidates,
-                frame.index.field_candidate_ordinals(key, value),
-            );
-            if candidates.as_ref().is_some_and(Vec::is_empty) {
-                return Ok(Vec::new());
-            }
-        }
-        let candidates = candidates.unwrap_or_else(|| (0..frame.record_count).collect::<Vec<_>>());
+        self.decode_indexed_frame_candidates(query, append, frame, &candidates)
+    }
+
+    fn decode_indexed_frame_candidates(
+        &self,
+        query: &LogQuery,
+        append: &IndexedFrameAppend,
+        frame: &IndexedIngestFrame,
+        candidates: &[u32],
+    ) -> LogDbResult<Vec<LogMatch>> {
         let mut matches = Vec::new();
-        for decoded in decode_indexed_ingest_records(frame, &candidates)? {
+        for decoded in decode_indexed_ingest_records(frame, candidates)? {
             let relative_offset = decoded.offset.get();
             if relative_offset >= u64::from(append.record_count) {
                 return Err(LogDbError::InvalidBlockEncoding(
@@ -2083,12 +2500,56 @@ fn append_matches_query_bounds(query: &LogQuery, append: &IndexedFrameAppend) ->
 }
 
 fn frame_matches_query_bounds(query: &LogQuery, frame: &IndexedIngestFrame) -> bool {
+    timestamp_bounds_overlap(
+        query,
+        frame.min_timestamp_unix_nanos,
+        frame.max_timestamp_unix_nanos,
+    )
+}
+
+fn timestamp_bounds_overlap(query: &LogQuery, minimum: u64, maximum: u64) -> bool {
     query
         .end_timestamp_unix_nanos
-        .is_none_or(|end| end > frame.min_timestamp_unix_nanos)
+        .is_none_or(|end| end > minimum)
         && query
             .start_timestamp_unix_nanos
-            .is_none_or(|start| start <= frame.max_timestamp_unix_nanos)
+            .is_none_or(|start| start <= maximum)
+}
+
+fn indexed_frame_candidates(
+    query: &LogQuery,
+    index: &EmbeddedFrameIndex,
+    record_count: u32,
+) -> Vec<u32> {
+    let constraints = query.required_index_constraints();
+    if constraints.impossible {
+        return Vec::new();
+    }
+    let mut candidates = None::<Vec<u32>>;
+    for term in &constraints.terms {
+        intersect_frame_candidates(&mut candidates, index.term_candidate_ordinals(term));
+        if candidates.as_ref().is_some_and(Vec::is_empty) {
+            return Vec::new();
+        }
+    }
+    for (key, value) in &constraints.fields {
+        intersect_frame_candidates(&mut candidates, index.field_candidate_ordinals(key, value));
+        if candidates.as_ref().is_some_and(Vec::is_empty) {
+            return Vec::new();
+        }
+    }
+    candidates.unwrap_or_else(|| (0..record_count).collect())
+}
+
+fn remove_published_spool_file(path: &std::path::Path) {
+    if let Err(error) = fs::remove_file(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!(
+            "shard-log retained published tier spool {} after cleanup failed: {error}",
+            path.display()
+        );
+    }
 }
 
 fn sort_and_limit_matches(matches: &mut Vec<LogMatch>, query: &LogQuery, limit: usize) {

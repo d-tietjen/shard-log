@@ -206,11 +206,11 @@ Regex does not yet extract safe literal fragments, so the next residual-query
 optimizations are body-lane-only decode, regex literal-prefix extraction, and
 allocation-free vectorized evaluation inside surviving blocks.
 
-The monolithic persistent index remains a separate cold-start problem. Loading
-it takes about 23.1 seconds and expands 114,420,962 compressed bytes into
-15.90 GiB of posting arrays plus 80 MiB of trigram filters. Segmenting and
-mmap-querying compressed postings is required before process cold start can be
-considered production-ready.
+The monolithic benchmark index remains a useful cold-start baseline. Loading it
+takes about 23.1 seconds and expands 114,420,962 compressed bytes into 15.90
+GiB of posting arrays plus 80 MiB of trigram filters. The production path now
+uses independent object-tier query-index segments and loads only catalog groups
+selected by coarse bounds, avoiding that mandatory whole-corpus expansion.
 
 The persistent index is derived data. Its durable offset watermark must not
 advance until the corresponding block and index segment are durable. Recovery
@@ -245,16 +245,13 @@ expansion and startup cost is now the primary query-architecture priority.
 See [BENCHMARKS.md](BENCHMARKS.md) for the hot-index and real-pack tables,
 provenance, and evidence locations.
 
-## Remaining work
+## Remaining optimization work
 
-The object-tier catalog now requires one immutable query-index artifact per
-bounded block group and prunes catalog pages and groups before that artifact is
-loaded. The production worker still needs to construct and publish those
-segments when it closes each group. Inside a selected segment, planning should
-intersect compressed run/delta postings without materializing every ordinal
-array. The metadata SSD cache should retain only active roots, pages, and index
-directories. That preserves exact behavior while avoiding the measured 15.90
-GiB global expansion and mandatory whole-corpus index load. The monolithic
+The production worker constructs and publishes one immutable query-index
+artifact per bounded append-aligned group. Catalog pages and groups are pruned
+before that artifact is loaded, and candidate frames are range-read through the
+SSD cache. A future optimization can intersect compressed run/delta postings
+without materializing each selected segment's ordinal arrays. The monolithic
 benchmark file remains useful only for reproducible single-host comparisons.
 
 See [TIERED_STORAGE_ARCHITECTURE.md](TIERED_STORAGE_ARCHITECTURE.md) for the
