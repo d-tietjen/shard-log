@@ -7,8 +7,8 @@ use serde::{Deserialize, Serialize};
 use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicId, TopicPartition};
 
 use crate::{
-    ResourceContext, ScopeContext, SpanId, TelemetryAttribute, TelemetryError, TelemetryRecordRef,
-    TelemetryResult, TelemetrySignal, TraceId,
+    ResourceContext, ScopeContext, SignalTierPayload, SpanId, TelemetryAttribute, TelemetryError,
+    TelemetryRecordRef, TelemetryResult, TelemetrySignal, TraceId,
 };
 
 const TRACE_BLOCK_MAGIC: [u8; 4] = *b"STSP";
@@ -610,9 +610,16 @@ pub struct TraceStripe {
     idle_nanos: u64,
     late_grace_nanos: u64,
     traces: HashMap<(Arc<str>, TraceId), HotTrace>,
-    sealed_blocks: Vec<Arc<[u8]>>,
+    sealed_blocks: Vec<SealedTraceBlock>,
+    pending_blocks: Vec<SignalTierPayload>,
     directory: TraceDirectory,
     next_block_id: u64,
+}
+
+#[derive(Debug)]
+struct SealedTraceBlock {
+    block_id: u64,
+    payload: Arc<[u8]>,
 }
 
 impl TraceStripe {
@@ -630,6 +637,7 @@ impl TraceStripe {
             late_grace_nanos: DEFAULT_LATE_TRACE_NANOS,
             traces: HashMap::new(),
             sealed_blocks: Vec::new(),
+            pending_blocks: Vec::new(),
             directory: TraceDirectory::default(),
             next_block_id: 1,
         })
@@ -710,6 +718,35 @@ impl TraceStripe {
                     .then_some(key.clone())
             })
             .collect::<Vec<_>>();
+        self.seal_keys(ready, now_nanos)
+    }
+
+    /// Seals every hot fragment belonging to one logical trace partition.
+    pub(crate) fn seal_partition(
+        &mut self,
+        partition: TopicPartition,
+        now_nanos: u64,
+    ) -> TelemetryResult<Vec<Vec<u8>>> {
+        let ready = self
+            .traces
+            .iter()
+            .filter_map(|(key, trace)| {
+                trace
+                    .spans
+                    .values()
+                    .next()
+                    .is_some_and(|span| span.record_ref.topic_partition == partition)
+                    .then_some(key.clone())
+            })
+            .collect::<Vec<_>>();
+        self.seal_keys(ready, now_nanos)
+    }
+
+    fn seal_keys(
+        &mut self,
+        ready: Vec<(Arc<str>, TraceId)>,
+        now_nanos: u64,
+    ) -> TelemetryResult<Vec<Vec<u8>>> {
         let mut blocks = Vec::with_capacity(ready.len());
         for key in ready {
             let mut trace = self.traces.remove(&key).expect("selected trace exists");
@@ -720,10 +757,66 @@ impl TraceStripe {
             self.next_block_id = self.next_block_id.saturating_add(1);
             let block = encode_trace_block(&spans)?;
             self.directory.publish(summarize_trace(&spans, block_id)?);
-            self.sealed_blocks.push(Arc::from(block.clone()));
+            let payload = Arc::<[u8]>::from(block.clone());
+            let first_offset = spans
+                .iter()
+                .map(|span| span.record_ref.offset.get())
+                .min()
+                .expect("sealed trace is nonempty");
+            let last_offset = spans
+                .iter()
+                .map(|span| span.record_ref.offset.get())
+                .max()
+                .expect("sealed trace is nonempty");
+            let min_timestamp_unix_nanos = spans
+                .iter()
+                .map(|span| span.start_time_unix_nanos)
+                .min()
+                .expect("sealed trace is nonempty");
+            let max_timestamp_unix_nanos = spans
+                .iter()
+                .map(|span| span.end_time_unix_nanos().unwrap_or(u64::MAX))
+                .max()
+                .expect("sealed trace is nonempty");
+            self.pending_blocks.push(SignalTierPayload {
+                resident_id: block_id,
+                topic_partition: spans[0].record_ref.topic_partition,
+                signal_identity: u128::from_be_bytes(*spans[0].trace_id.as_bytes()),
+                first_offset,
+                last_offset,
+                record_count: u32::try_from(spans.len())
+                    .map_err(|_| TelemetryError::RecordTooLarge)?,
+                min_timestamp_unix_nanos,
+                max_timestamp_unix_nanos,
+                payload: Arc::clone(&payload),
+            });
+            self.sealed_blocks
+                .push(SealedTraceBlock { block_id, payload });
             blocks.push(block);
         }
         Ok(blocks)
+    }
+
+    pub(crate) fn pending_partition(&self, partition: TopicPartition) -> Vec<SignalTierPayload> {
+        self.pending_blocks
+            .iter()
+            .filter(|payload| payload.topic_partition == partition)
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn release_published_blocks(&mut self, resident_ids: &[u64]) {
+        self.pending_blocks
+            .retain(|payload| !resident_ids.contains(&payload.resident_id));
+        self.sealed_blocks
+            .retain(|block| !resident_ids.contains(&block.block_id));
+    }
+
+    pub(crate) fn retained_payload_bytes(&self) -> u64 {
+        self.sealed_blocks
+            .iter()
+            .map(|block| u64::try_from(block.payload.len()).unwrap_or(u64::MAX))
+            .sum()
     }
 
     /// Returns the immutable summary directory.
@@ -737,7 +830,7 @@ impl TraceStripe {
         let limit = query.limit.max(1);
         let mut winners = BTreeMap::<(Arc<str>, TraceId, SpanId), DurableSpan>::new();
         for block in &self.sealed_blocks {
-            for span in decode_trace_block(block)? {
+            for span in decode_trace_block(&block.payload)? {
                 if trace_query_matches(query, &span) {
                     retain_newest_span(&mut winners, span);
                 }
@@ -797,7 +890,7 @@ impl TraceStripe {
     }
 }
 
-fn trace_query_matches(query: &TraceQuery, span: &DurableSpan) -> bool {
+pub(crate) fn trace_query_matches(query: &TraceQuery, span: &DurableSpan) -> bool {
     span.tenant == query.tenant
         && query.trace_id.is_none_or(|value| value == span.trace_id)
         && query

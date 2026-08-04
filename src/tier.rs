@@ -13,6 +13,7 @@ use shard_stream_core::{ShardId, TopicPartition};
 
 use crate::{
     BlockCatalog, BlockDescriptor, BlockId, CompressionCodec, TelemetryError, TelemetryResult,
+    TelemetrySignal,
 };
 
 const TIER_FORMAT_VERSION: u8 = 1;
@@ -386,6 +387,8 @@ pub struct TierBlockEntry {
     pub payload_bytes: u64,
     /// Lowercase BLAKE3 checksum of this block's compressed bytes.
     pub payload_checksum: String,
+    /// Optional trace ID or metric-series fingerprint used for catalog pruning.
+    pub signal_identity: Option<u128>,
 }
 
 /// Durable sink watermark covered by an immutable object-tier group.
@@ -436,7 +439,58 @@ impl TierBlockEntry {
             payload_offset,
             payload_bytes: descriptor.stored_bytes,
             payload_checksum,
+            signal_identity: None,
         }
+    }
+
+    /// Creates catalog metadata for one signal-native trace block or metric chunk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_signal_payload(
+        signal: TelemetrySignal,
+        block_id: u64,
+        signal_identity: u128,
+        first_offset: u64,
+        last_offset: u64,
+        record_count: u32,
+        min_timestamp_unix_nanos: u64,
+        max_timestamp_unix_nanos: u64,
+        payload_offset: u64,
+        payload_bytes: u64,
+        payload_checksum: String,
+    ) -> TelemetryResult<Self> {
+        if !matches!(signal, TelemetrySignal::Traces | TelemetrySignal::Metrics) {
+            return Err(TelemetryError::InvalidConfig(
+                "signal-native tier payload must be a trace block or metric chunk",
+            ));
+        }
+        Ok(Self {
+            block_id,
+            source_compression_cohort: 0,
+            placement_id: 0,
+            dictionary_id: None,
+            compression_codec: match signal {
+                TelemetrySignal::Traces => "trace-native".into(),
+                TelemetrySignal::Metrics => "metric-native".into(),
+                TelemetrySignal::Logs => unreachable!("validated above"),
+            },
+            compression_level: 0,
+            first_offset,
+            last_offset,
+            record_count,
+            source_bytes: payload_bytes,
+            structural_bytes: payload_bytes,
+            stored_bytes: payload_bytes,
+            min_timestamp_unix_nanos,
+            max_timestamp_unix_nanos,
+            compression_temperature: 0,
+            compression_shape_hash: 0,
+            compression_temperature_variance_q8: 0,
+            max_compression_temperature_deviation: 0,
+            payload_offset,
+            payload_bytes,
+            payload_checksum,
+            signal_identity: Some(signal_identity),
+        })
     }
 
     fn validate(&self, payload_bytes: u64) -> TelemetryResult<()> {
@@ -445,7 +499,11 @@ impl TierBlockEntry {
             || self.record_count == 0
             || self.stored_bytes == 0
             || self.payload_bytes != self.stored_bytes
-            || self.compression_codec != "zstd"
+            || !matches!(
+                self.compression_codec.as_str(),
+                "zstd" | "trace-native" | "metric-native"
+            )
+            || (self.compression_codec == "zstd") != self.signal_identity.is_none()
             || !valid_checksum(&self.payload_checksum)
             || self
                 .payload_offset
@@ -475,6 +533,111 @@ pub struct TierGroupSource {
     pub blocks: Vec<TierBlockEntry>,
     /// Sealed local artifacts, including exactly one payload and query index.
     pub artifacts: Vec<TierArtifactSource>,
+}
+
+/// One already encoded trace block or metric chunk awaiting immutable publication.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignalTierPayload {
+    /// Stripe-local resident identifier used only to retire memory after publication.
+    pub resident_id: u64,
+    /// Signal partition whose catalog owns this payload.
+    pub topic_partition: TopicPartition,
+    /// Trace ID or canonical metric-series fingerprint.
+    pub signal_identity: u128,
+    /// First durable offset represented by the payload.
+    pub first_offset: u64,
+    /// Last durable offset represented by the payload.
+    pub last_offset: u64,
+    /// Number of spans or points represented by the payload.
+    pub record_count: u32,
+    /// Lowest signal timestamp represented by the payload.
+    pub min_timestamp_unix_nanos: u64,
+    /// Highest signal timestamp represented by the payload.
+    pub max_timestamp_unix_nanos: u64,
+    /// Complete self-verifying signal-native bytes.
+    pub payload: Arc<[u8]>,
+}
+
+/// Stages one complete trace or metric object-tier group.
+#[allow(clippy::too_many_arguments)]
+pub fn stage_signal_group(
+    spool_directory: impl AsRef<Path>,
+    file_stem: &str,
+    signal: TelemetrySignal,
+    group_sequence: u64,
+    first_block_id: u64,
+    checkpoint: TierCheckpoint,
+    payloads: &[SignalTierPayload],
+) -> TelemetryResult<TierGroupSource> {
+    if payloads.is_empty() || !matches!(signal, TelemetrySignal::Traces | TelemetrySignal::Metrics)
+    {
+        return Err(TelemetryError::ObjectStore(
+            "signal group requires trace or metric payloads".into(),
+        ));
+    }
+    validate_artifact_name(file_stem)?;
+    let directory = spool_directory.as_ref();
+    fs::create_dir_all(directory).map_err(|error| storage_io("create signal tier spool", error))?;
+    let payload_path = directory.join(format!("{file_stem}.payload"));
+    let index_path = directory.join(format!("{file_stem}.index"));
+    let mut payload_pack = Vec::new();
+    let mut blocks = Vec::with_capacity(payloads.len());
+    let topic_partition = payloads[0].topic_partition;
+    for (ordinal, payload) in payloads.iter().enumerate() {
+        if payload.resident_id == 0
+            || payload.topic_partition != topic_partition
+            || payload.topic_partition.topic_id != signal.topic_id()
+            || payload.payload.is_empty()
+            || payload.record_count == 0
+            || payload.first_offset > payload.last_offset
+            || payload.max_timestamp_unix_nanos < payload.min_timestamp_unix_nanos
+            || payload.last_offset >= checkpoint.next_offset
+        {
+            return Err(TelemetryError::ObjectStore(
+                "signal tier payload has invalid bounds".into(),
+            ));
+        }
+        let payload_offset =
+            u64::try_from(payload_pack.len()).map_err(|_| TelemetryError::RecordTooLarge)?;
+        let payload_bytes =
+            u64::try_from(payload.payload.len()).map_err(|_| TelemetryError::RecordTooLarge)?;
+        payload_pack.extend_from_slice(&payload.payload);
+        blocks.push(TierBlockEntry::for_signal_payload(
+            signal,
+            first_block_id
+                .checked_add(u64::try_from(ordinal).map_err(|_| TelemetryError::RecordTooLarge)?)
+                .ok_or(TelemetryError::RecordTooLarge)?,
+            payload.signal_identity,
+            payload.first_offset,
+            payload.last_offset,
+            payload.record_count,
+            payload.min_timestamp_unix_nanos,
+            payload.max_timestamp_unix_nanos,
+            payload_offset,
+            payload_bytes,
+            checksum_bytes(&payload.payload),
+        )?);
+    }
+    let index = encode_json(&blocks, "signal group index")?;
+    write_bytes_atomically(&payload_path, &payload_pack)?;
+    write_bytes_atomically(&index_path, &index)?;
+    Ok(TierGroupSource {
+        group_sequence,
+        checkpoint,
+        blocks,
+        artifacts: vec![
+            TierArtifactSource {
+                kind: TierArtifactKind::PayloadPack,
+                name: "signal.payload".into(),
+                path: payload_path,
+            },
+            TierArtifactSource {
+                kind: TierArtifactKind::QueryIndex,
+                name: "signal.index".into(),
+                path: index_path,
+            },
+        ],
+    })
 }
 
 /// Immutable manifest for one independently queryable block group.
@@ -607,6 +770,10 @@ pub struct CatalogGroupEntry {
     pub block_count: u32,
     /// Total compressed payload bytes represented by the group.
     pub payload_bytes: u64,
+    /// Lowest optional trace ID or series fingerprint represented by the group.
+    pub min_signal_identity: Option<u128>,
+    /// Highest optional trace ID or series fingerprint represented by the group.
+    pub max_signal_identity: Option<u128>,
 }
 
 impl CatalogGroupEntry {
@@ -646,6 +813,16 @@ impl CatalogGroupEntry {
             .iter()
             .try_fold(0u64, |total, block| total.checked_add(block.payload_bytes))
             .ok_or_else(|| TelemetryError::CorruptTier("group payload bytes overflow".into()))?;
+        let min_signal_identity = manifest
+            .blocks
+            .iter()
+            .filter_map(|block| block.signal_identity)
+            .min();
+        let max_signal_identity = manifest
+            .blocks
+            .iter()
+            .filter_map(|block| block.signal_identity)
+            .max();
         Ok(Self {
             group_sequence: manifest.group_sequence,
             checkpoint: manifest.checkpoint,
@@ -658,6 +835,8 @@ impl CatalogGroupEntry {
             max_timestamp_unix_nanos,
             block_count,
             payload_bytes,
+            min_signal_identity,
+            max_signal_identity,
         })
     }
 
@@ -670,6 +849,11 @@ impl CatalogGroupEntry {
             || self.block_count == 0
             || self.payload_bytes == 0
             || self.last_offset >= self.checkpoint.next_offset
+            || self.min_signal_identity.is_some() != self.max_signal_identity.is_some()
+            || self
+                .min_signal_identity
+                .zip(self.max_signal_identity)
+                .is_some_and(|(min, max)| min > max)
         {
             return Err(TelemetryError::CorruptTier(
                 "catalog contains an invalid group entry".into(),
@@ -760,6 +944,10 @@ pub struct CatalogPageRef {
     pub min_timestamp_unix_nanos: u64,
     /// Highest event timestamp covered by the page.
     pub max_timestamp_unix_nanos: u64,
+    /// Lowest optional trace ID or series fingerprint covered by the page.
+    pub min_signal_identity: Option<u128>,
+    /// Highest optional trace ID or series fingerprint covered by the page.
+    pub max_signal_identity: Option<u128>,
 }
 
 impl CatalogPageRef {
@@ -810,6 +998,16 @@ impl CatalogPageRef {
                 .map(|group| group.max_timestamp_unix_nanos)
                 .max()
                 .expect("page is nonempty"),
+            min_signal_identity: page
+                .groups
+                .iter()
+                .filter_map(|group| group.min_signal_identity)
+                .min(),
+            max_signal_identity: page
+                .groups
+                .iter()
+                .filter_map(|group| group.max_signal_identity)
+                .max(),
         })
     }
 
@@ -822,6 +1020,11 @@ impl CatalogPageRef {
             || self.first_offset > self.last_offset
             || self.min_timestamp_unix_nanos > self.max_timestamp_unix_nanos
             || self.last_offset >= self.last_checkpoint.next_offset
+            || self.min_signal_identity.is_some() != self.max_signal_identity.is_some()
+            || self
+                .min_signal_identity
+                .zip(self.max_signal_identity)
+                .is_some_and(|(min, max)| min > max)
         {
             return Err(TelemetryError::CorruptTier(
                 "catalog root contains an invalid page reference".into(),
@@ -945,6 +1148,8 @@ pub struct TierQueryRange {
     pub min_timestamp_unix_nanos: Option<u64>,
     /// Optional highest event timestamp.
     pub max_timestamp_unix_nanos: Option<u64>,
+    /// Optional exact trace ID or metric-series fingerprint.
+    pub signal_identity: Option<u128>,
 }
 
 impl TierQueryRange {
@@ -971,6 +1176,8 @@ impl TierQueryRange {
         last_offset: u64,
         min_timestamp: u64,
         max_timestamp: u64,
+        min_signal_identity: Option<u128>,
+        max_signal_identity: Option<u128>,
     ) -> bool {
         self.first_offset
             .is_none_or(|query_first| last_offset >= query_first)
@@ -983,6 +1190,11 @@ impl TierQueryRange {
             && self
                 .max_timestamp_unix_nanos
                 .is_none_or(|query_max| min_timestamp <= query_max)
+            && self.signal_identity.is_none_or(|identity| {
+                min_signal_identity
+                    .zip(max_signal_identity)
+                    .is_some_and(|(min, max)| identity >= min && identity <= max)
+            })
     }
 }
 
@@ -1371,6 +1583,8 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
                 page_ref.last_offset,
                 page_ref.min_timestamp_unix_nanos,
                 page_ref.max_timestamp_unix_nanos,
+                page_ref.min_signal_identity,
+                page_ref.max_signal_identity,
             ) {
                 continue;
             }
@@ -1381,6 +1595,8 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
                     group.last_offset,
                     group.min_timestamp_unix_nanos,
                     group.max_timestamp_unix_nanos,
+                    group.min_signal_identity,
+                    group.max_signal_identity,
                 ) && !visit(group)?
                 {
                     return Ok(());
@@ -2286,6 +2502,7 @@ mod tests {
                 payload_offset: 0,
                 payload_bytes: 32,
                 payload_checksum: checksum_bytes(&payload),
+                signal_identity: None,
             }],
             artifacts: vec![
                 TierArtifactSource {

@@ -1461,6 +1461,7 @@ impl LogStripe {
             last_offset: query.end_offset.map(LogicalOffset::get),
             min_timestamp_unix_nanos: query.start_timestamp_unix_nanos,
             max_timestamp_unix_nanos: query.end_timestamp_unix_nanos,
+            signal_identity: None,
         })?;
         match query.order {
             QueryOrder::NewestFirst => groups.sort_unstable_by(|left, right| {

@@ -1,5 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::fs;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -14,13 +15,17 @@ use shard_stream_engine::{
 };
 
 use crate::ingest_pack::validate_ingest_pack;
+use crate::metric::metric_query_matches;
 use crate::sink_journal::{SinkJournal, checkpoint_allows_lane_gap};
+use crate::trace::trace_query_matches;
 use crate::{
     DictionaryCatalog, DurableMetricPoint, DurableSpan, LogMatch, LogQuery, LogStripe,
-    MetricIngestProtocol, MetricQuery, MetricStripe, ObjectTierConfig, RealtimeDictionaryObserver,
-    RealtimeDictionaryTrainer, ShardTelemetryConfig, SharedTelemetryObjectStore, SsdCacheConfig,
-    SsdObjectCache, StripeConfig, TelemetryEnvelope, TelemetryError, TelemetryResult,
-    TelemetrySignal, TraceQuery, TraceStripe, decode_metric_chunk, decode_trace_block,
+    MetricIngestProtocol, MetricQuery, MetricStripe, ObjectMetadata, ObjectTierConfig,
+    RealtimeDictionaryObserver, RealtimeDictionaryTrainer, ShardTelemetryConfig,
+    SharedTelemetryObjectStore, SsdCacheConfig, SsdObjectCache, StripeConfig, TelemetryEnvelope,
+    TelemetryError, TelemetryObjectTier, TelemetryResult, TelemetryRouter, TelemetrySignal,
+    TierArtifactKind, TierCheckpoint, TierQueryRange, TraceQuery, TraceStripe, decode_metric_chunk,
+    decode_trace_block, stage_signal_group,
 };
 
 /// Immutable object-tier and bounded SSD-cache settings shared by sink stripes.
@@ -145,6 +150,78 @@ struct TelemetryStripeState {
     logs: LogStripe,
     traces: TraceStripe,
     metrics: MetricStripe,
+    signal_tiers: HashMap<TelemetrySignal, SignalTierState>,
+    router: TelemetryRouter,
+}
+
+#[derive(Debug)]
+struct SignalTierState {
+    signal: TelemetrySignal,
+    tiers: HashMap<TopicPartition, TelemetryObjectTier<SharedTelemetryObjectStore>>,
+    spool_directory: PathBuf,
+    cache: Arc<SsdObjectCache>,
+    config: ObjectTierConfig,
+}
+
+impl SignalTierState {
+    fn open(
+        signal: TelemetrySignal,
+        shard_id: ShardId,
+        store: SharedTelemetryObjectStore,
+        spool_directory: PathBuf,
+        cache: Arc<SsdObjectCache>,
+        partitions: Vec<TopicPartition>,
+        config: ObjectTierConfig,
+    ) -> TelemetryResult<Option<(Self, Vec<DurableSinkCheckpoint>)>> {
+        if partitions.is_empty() {
+            return Ok(None);
+        }
+        let mut tiers = HashMap::with_capacity(partitions.len());
+        let mut checkpoints = Vec::new();
+        for partition in partitions {
+            if partition.topic_id != signal.topic_id() {
+                return Err(TelemetryError::InvalidConfig(
+                    "signal object tier contains a partition from another signal",
+                ));
+            }
+            let tier = TelemetryObjectTier::open(store.clone(), shard_id, partition, config)?;
+            if let Some(checkpoint) = tier.root().latest_checkpoint {
+                checkpoints.push(DurableSinkCheckpoint {
+                    topic_partition: partition,
+                    next_placement_sequence: shard_stream_core::PlacementSequence::new(
+                        checkpoint.next_placement_sequence,
+                    ),
+                    next_offset: shard_stream_core::LogicalOffset::new(checkpoint.next_offset),
+                });
+            }
+            if tiers.insert(partition, tier).is_some() {
+                return Err(TelemetryError::InvalidConfig(
+                    "signal object tier contains a duplicate partition",
+                ));
+            }
+        }
+        let signal_name = match signal {
+            TelemetrySignal::Traces => "traces",
+            TelemetrySignal::Metrics => "metrics",
+            TelemetrySignal::Logs => {
+                return Err(TelemetryError::InvalidConfig(
+                    "logs use the log-native object tier",
+                ));
+            }
+        };
+        Ok(Some((
+            Self {
+                signal,
+                tiers,
+                spool_directory: spool_directory
+                    .join(format!("shard-{}", shard_id.get()))
+                    .join(signal_name),
+                cache,
+                config,
+            },
+            checkpoints,
+        )))
+    }
 }
 
 impl TelemetrySinkFactory {
@@ -215,14 +292,22 @@ impl TelemetrySinkFactory {
                 logs.attach_realtime_dictionary(observer.clone());
             }
             if let (Some(tier), Some(cache)) = (&config.object_tier, &tier_cache) {
-                for checkpoint in logs.attach_object_tier(
-                    tier.store.clone(),
-                    tier.spool_directory.clone(),
-                    Arc::clone(cache),
-                    tier.partitions.iter().copied(),
-                    tier.tier,
-                )? {
-                    merge_recovered_checkpoint(&mut recovered_checkpoints, checkpoint)?;
+                let log_partitions = tier
+                    .partitions
+                    .iter()
+                    .copied()
+                    .filter(|partition| partition.topic_id == TelemetrySignal::Logs.topic_id())
+                    .collect::<Vec<_>>();
+                if !log_partitions.is_empty() {
+                    for checkpoint in logs.attach_object_tier(
+                        tier.store.clone(),
+                        tier.spool_directory.clone(),
+                        Arc::clone(cache),
+                        log_partitions,
+                        tier.tier,
+                    )? {
+                        merge_recovered_checkpoint(&mut recovered_checkpoints, checkpoint)?;
+                    }
                 }
             }
             if let Some(directory) = &config.state_directory {
@@ -235,11 +320,38 @@ impl TelemetrySinkFactory {
                 );
                 journals.insert(shard_id, Arc::new(journal));
             }
+            let mut signal_tiers = HashMap::new();
+            if let (Some(tier), Some(cache)) = (&config.object_tier, &tier_cache) {
+                for signal in [TelemetrySignal::Traces, TelemetrySignal::Metrics] {
+                    let partitions = tier
+                        .partitions
+                        .iter()
+                        .copied()
+                        .filter(|partition| partition.topic_id == signal.topic_id())
+                        .collect::<Vec<_>>();
+                    if let Some((state, checkpoints)) = SignalTierState::open(
+                        signal,
+                        shard_id,
+                        tier.store.clone(),
+                        tier.spool_directory.clone(),
+                        Arc::clone(cache),
+                        partitions,
+                        tier.tier,
+                    )? {
+                        for checkpoint in checkpoints {
+                            merge_recovered_checkpoint(&mut recovered_checkpoints, checkpoint)?;
+                        }
+                        signal_tiers.insert(signal, state);
+                    }
+                }
+            }
             let stripe = TelemetryStripeState {
                 stream_shard_id: shard_id,
                 logs,
                 traces: TraceStripe::new(config.signals.traces.head_memory_bytes_per_stripe)?,
                 metrics: MetricStripe::new(config.signals.metrics.head_memory_bytes_per_stripe)?,
+                signal_tiers,
+                router: TelemetryRouter::from_config(&config.signals),
             };
             if available.insert(shard_id, stripe).is_some() {
                 return Err(TelemetryError::DuplicateStripe(shard_id));
@@ -528,17 +640,22 @@ fn run_sink_worker(
                 let _ = response.send(result);
             }
             SinkCommand::QueryTraces { query, response } => {
-                let _ = response.send(stripe.traces.query(&query));
+                let _ = response.send(query_trace_stripe(&stripe, &query));
             }
             SinkCommand::QueryMetrics { query, response } => {
-                let _ = response.send(stripe.metrics.query(&query));
+                let _ = response.send(query_metric_stripe(&stripe, &query));
             }
             SinkCommand::Flush { response } => {
-                let result = stripe.logs.offload_indexed_groups(true);
+                let result = flush_object_tiers(&mut stripe, &checkpoints);
                 let _ = response.send(result);
             }
             SinkCommand::RetainedPayloadBytes { response } => {
-                let _ = response.send(stripe.logs.retained_payload_bytes());
+                let bytes = stripe
+                    .logs
+                    .retained_payload_bytes()
+                    .saturating_add(stripe.traces.retained_payload_bytes())
+                    .saturating_add(stripe.metrics.retained_payload_bytes());
+                let _ = response.send(bytes);
             }
         }
     }
@@ -789,6 +906,13 @@ fn apply_durable_appends(
         .logs
         .offload_indexed_groups(false)
         .map_err(log_error_to_engine)?;
+    if matches!(
+        next.topic_partition.topic_id,
+        crate::TRACES_TOPIC_ID | crate::METRICS_TOPIC_ID
+    ) {
+        offload_signal_partition(stripe, next.topic_partition, next, false)
+            .map_err(log_error_to_engine)?;
+    }
     checkpoints
         .lock()
         .map_err(|_| {
@@ -916,6 +1040,329 @@ fn index_payload(
     Ok(())
 }
 
+fn offload_signal_partition(
+    stripe: &mut TelemetryStripeState,
+    partition: TopicPartition,
+    checkpoint: DurableSinkCheckpoint,
+    force: bool,
+) -> TelemetryResult<usize> {
+    let signal = if partition.topic_id == crate::TRACES_TOPIC_ID {
+        TelemetrySignal::Traces
+    } else if partition.topic_id == crate::METRICS_TOPIC_ID {
+        TelemetrySignal::Metrics
+    } else {
+        return Ok(0);
+    };
+    let Some(state) = stripe.signal_tiers.get(&signal) else {
+        return Ok(0);
+    };
+    if !state.tiers.contains_key(&partition) {
+        return Ok(0);
+    }
+    let pending = match signal {
+        TelemetrySignal::Traces => stripe.traces.pending_partition(partition),
+        TelemetrySignal::Metrics => stripe.metrics.pending_partition(partition),
+        TelemetrySignal::Logs => unreachable!("signal was selected above"),
+    };
+    let pending_bytes = pending.iter().try_fold(0u64, |total, payload| {
+        total
+            .checked_add(
+                u64::try_from(payload.payload.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
+            )
+            .ok_or(TelemetryError::RecordTooLarge)
+    })?;
+    let block_trigger = state.config.max_blocks_per_group.saturating_div(2).max(1);
+    if !force
+        && pending_bytes < state.config.target_group_payload_bytes
+        && pending.len() < block_trigger
+    {
+        return Ok(0);
+    }
+
+    match signal {
+        TelemetrySignal::Traces => {
+            let now_nanos = pending
+                .iter()
+                .map(|payload| payload.max_timestamp_unix_nanos)
+                .max()
+                .unwrap_or(0);
+            stripe.traces.seal_partition(partition, now_nanos)?;
+        }
+        TelemetrySignal::Metrics => stripe.metrics.seal_partition(partition)?,
+        TelemetrySignal::Logs => unreachable!("signal was selected above"),
+    }
+    let mut payloads = match signal {
+        TelemetrySignal::Traces => stripe.traces.pending_partition(partition),
+        TelemetrySignal::Metrics => stripe.metrics.pending_partition(partition),
+        TelemetrySignal::Logs => unreachable!("signal was selected above"),
+    };
+    if payloads.is_empty() {
+        return Ok(0);
+    }
+    payloads.sort_unstable_by_key(|payload| payload.resident_id);
+    let payload_bytes = payloads.iter().try_fold(0u64, |total, payload| {
+        total
+            .checked_add(
+                u64::try_from(payload.payload.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
+            )
+            .ok_or(TelemetryError::RecordTooLarge)
+    })?;
+    let state = stripe
+        .signal_tiers
+        .get_mut(&signal)
+        .expect("signal tier was checked above");
+    if payloads.len() > state.config.max_blocks_per_group
+        || payload_bytes > state.config.max_group_payload_bytes
+    {
+        return Err(TelemetryError::ObjectStore(format!(
+            "complete {signal:?} partition boundary needs {} blocks and {payload_bytes} bytes, exceeding the configured object group bound",
+            payloads.len()
+        )));
+    }
+    let tier = state
+        .tiers
+        .get_mut(&partition)
+        .expect("signal partition tier was checked above");
+    let group_sequence = tier
+        .root()
+        .pages
+        .last()
+        .map_or(0, |page| page.last_group_sequence.saturating_add(1));
+    let first_block_id = tier.root().next_block_id;
+    let group_directory = state.spool_directory.join(format!(
+        "topic-{:032x}-partition-{}/group-{group_sequence:020}",
+        partition.topic_id.get(),
+        partition.partition_id.get()
+    ));
+    let source = stage_signal_group(
+        &group_directory,
+        "signal",
+        signal,
+        group_sequence,
+        first_block_id,
+        TierCheckpoint {
+            next_placement_sequence: checkpoint.next_placement_sequence.get(),
+            next_offset: checkpoint.next_offset.get(),
+        },
+        &payloads,
+    )?;
+    let staged_paths = source
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.path.clone())
+        .collect::<Vec<_>>();
+    tier.publish_group(source)?;
+    for path in staged_paths {
+        if let Err(error) = fs::remove_file(&path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!(
+                "shard-telemetry retained published signal spool {} after cleanup failed: {error}",
+                path.display()
+            );
+        }
+    }
+    let _ = fs::remove_dir(&group_directory);
+    let resident_ids = payloads
+        .iter()
+        .map(|payload| payload.resident_id)
+        .collect::<Vec<_>>();
+    match signal {
+        TelemetrySignal::Traces => stripe.traces.release_published_blocks(&resident_ids),
+        TelemetrySignal::Metrics => stripe.metrics.release_published_chunks(&resident_ids),
+        TelemetrySignal::Logs => unreachable!("signal was selected above"),
+    }
+    Ok(1)
+}
+
+fn flush_object_tiers(
+    stripe: &mut TelemetryStripeState,
+    checkpoints: &Mutex<HashMap<TopicPartition, DurableSinkCheckpoint>>,
+) -> TelemetryResult<usize> {
+    let mut published = stripe.logs.offload_indexed_groups(true)?;
+    let checkpoints = checkpoints
+        .lock()
+        .map_err(|_| TelemetryError::StorageIo("sink checkpoint lock is poisoned".into()))?
+        .clone();
+    let mut partitions = stripe
+        .signal_tiers
+        .values()
+        .flat_map(|state| state.tiers.keys().copied())
+        .collect::<Vec<_>>();
+    partitions.sort_unstable();
+    for partition in partitions {
+        let Some(checkpoint) = checkpoints.get(&partition).copied() else {
+            continue;
+        };
+        published = published.saturating_add(offload_signal_partition(
+            stripe, partition, checkpoint, true,
+        )?);
+    }
+    Ok(published)
+}
+
+fn read_signal_tier_payloads(
+    state: &SignalTierState,
+    partitions: &[TopicPartition],
+    range: TierQueryRange,
+) -> TelemetryResult<Vec<Vec<u8>>> {
+    let mut payloads = Vec::new();
+    let expected_codec = match state.signal {
+        TelemetrySignal::Traces => "trace-native",
+        TelemetrySignal::Metrics => "metric-native",
+        TelemetrySignal::Logs => return Ok(payloads),
+    };
+    for partition in partitions {
+        let Some(tier) = state.tiers.get(partition) else {
+            continue;
+        };
+        for group in tier.candidate_groups(range)? {
+            let manifest = tier.load_group(&group)?;
+            let artifact = manifest
+                .artifact(TierArtifactKind::PayloadPack)
+                .ok_or_else(|| TelemetryError::CorruptTier("group has no payload pack".into()))?;
+            let metadata = ObjectMetadata {
+                bytes: artifact.bytes,
+                version_token: artifact.checksum.clone(),
+                content_digest: artifact.checksum.clone(),
+            };
+            for block in manifest.blocks.iter().filter(|block| {
+                block.compression_codec == expected_codec
+                    && range
+                        .signal_identity
+                        .is_none_or(|identity| block.signal_identity == Some(identity))
+                    && range
+                        .min_timestamp_unix_nanos
+                        .is_none_or(|minimum| block.max_timestamp_unix_nanos >= minimum)
+                    && range
+                        .max_timestamp_unix_nanos
+                        .is_none_or(|maximum| block.min_timestamp_unix_nanos <= maximum)
+            }) {
+                let end = block
+                    .payload_offset
+                    .checked_add(block.payload_bytes)
+                    .ok_or(TelemetryError::RecordTooLarge)?;
+                let payload = state.cache.read_range_with_metadata(
+                    tier.object_store(),
+                    &artifact.object_key,
+                    &metadata,
+                    block.payload_offset..end,
+                )?;
+                if blake3::hash(&payload).to_hex().as_str() != block.payload_checksum {
+                    return Err(TelemetryError::CorruptTier(format!(
+                        "signal block {} payload checksum failed",
+                        block.block_id
+                    )));
+                }
+                payloads.push(payload);
+            }
+        }
+    }
+    Ok(payloads)
+}
+
+fn query_trace_stripe(
+    stripe: &TelemetryStripeState,
+    query: &TraceQuery,
+) -> TelemetryResult<Vec<DurableSpan>> {
+    let mut winners = BTreeMap::new();
+    for span in stripe.traces.query(query)? {
+        winners.insert(
+            (Arc::clone(&span.tenant), span.trace_id, span.span_id),
+            span,
+        );
+    }
+    if let Some(state) = stripe.signal_tiers.get(&TelemetrySignal::Traces) {
+        let partitions = query.trace_id.map_or_else(
+            || state.tiers.keys().copied().collect::<Vec<_>>(),
+            |trace_id| vec![stripe.router.trace(&query.tenant, trace_id)],
+        );
+        let identity = query
+            .trace_id
+            .map(|trace_id| u128::from_be_bytes(*trace_id.as_bytes()));
+        for payload in read_signal_tier_payloads(
+            state,
+            &partitions,
+            TierQueryRange {
+                min_timestamp_unix_nanos: query.start_time_unix_nanos,
+                max_timestamp_unix_nanos: query.end_time_unix_nanos,
+                signal_identity: identity,
+                ..TierQueryRange::default()
+            },
+        )? {
+            for span in decode_trace_block(&payload)?
+                .into_iter()
+                .filter(|span| trace_query_matches(query, span))
+            {
+                let key = (Arc::clone(&span.tenant), span.trace_id, span.span_id);
+                if winners.get(&key).is_none_or(|existing: &DurableSpan| {
+                    existing.record_ref.offset < span.record_ref.offset
+                }) {
+                    winners.insert(key, span);
+                }
+            }
+        }
+    }
+    let mut spans = winners.into_values().collect::<Vec<_>>();
+    spans.sort_unstable_by_key(|span| {
+        (
+            span.trace_id,
+            span.start_time_unix_nanos,
+            span.record_ref.offset,
+        )
+    });
+    spans.truncate(query.limit.max(1));
+    Ok(spans)
+}
+
+fn query_metric_stripe(
+    stripe: &TelemetryStripeState,
+    query: &MetricQuery,
+) -> TelemetryResult<Vec<DurableMetricPoint>> {
+    let mut winners = BTreeMap::new();
+    for point in stripe.metrics.query(query)? {
+        winners.insert(
+            (point.series_fingerprint(), point.timestamp_unix_nanos),
+            point,
+        );
+    }
+    if let Some(state) = stripe.signal_tiers.get(&TelemetrySignal::Metrics) {
+        let partitions = query.series.map_or_else(
+            || state.tiers.keys().copied().collect::<Vec<_>>(),
+            |series| vec![stripe.router.metric(&query.tenant, series)],
+        );
+        for payload in read_signal_tier_payloads(
+            state,
+            &partitions,
+            TierQueryRange {
+                min_timestamp_unix_nanos: query.start_time_unix_nanos,
+                max_timestamp_unix_nanos: query.end_time_unix_nanos,
+                signal_identity: query.series.map(crate::SeriesFingerprint::get),
+                ..TierQueryRange::default()
+            },
+        )? {
+            for point in decode_metric_chunk(&payload)?
+                .into_iter()
+                .filter(|point| metric_query_matches(query, point))
+            {
+                let key = (point.series_fingerprint(), point.timestamp_unix_nanos);
+                if winners
+                    .get(&key)
+                    .is_none_or(|existing: &DurableMetricPoint| {
+                        existing.record_ref.offset < point.record_ref.offset
+                    })
+                {
+                    winners.insert(key, point);
+                }
+            }
+        }
+    }
+    let mut points = winners.into_values().collect::<Vec<_>>();
+    points.sort_unstable_by_key(|point| (point.timestamp_unix_nanos, point.record_ref.offset));
+    points.truncate(query.limit.max(1));
+    Ok(points)
+}
+
 fn validate_relative_offsets(
     offsets: impl IntoIterator<Item = shard_stream_core::LogicalOffset>,
     count: u32,
@@ -970,8 +1417,10 @@ mod tests {
     use bytes::Bytes;
     use opentelemetry_proto::tonic::{
         collector::logs::v1::ExportLogsServiceRequest,
+        collector::trace::v1::ExportTraceServiceRequest,
         common::v1::{AnyValue, any_value::Value},
         logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
+        trace::v1::{ResourceSpans, ScopeSpans, Span},
     };
     use prost::Message;
     use shard_stream_core::{
@@ -983,6 +1432,12 @@ mod tests {
         EngineConfig, StreamEngine, TopicConfig,
     };
     use shard_stream_protocol::{AppendRequest, Durability};
+
+    use crate::{
+        LocalObjectStore, MetricIdentity, MetricKind, MetricValue, NumberValue, OtlpMetricEvent,
+        OtlpTelemetryDecoder, ResourceContext, ScopeContext, SharedTelemetryObjectStore,
+        TelemetryRecordRef,
+    };
 
     use super::*;
 
@@ -1061,6 +1516,50 @@ mod tests {
             .expect("STEL envelope")
             .encode()
             .expect("STEL encodes")
+    }
+
+    fn durable_append(
+        topic_partition: TopicPartition,
+        payload: Vec<u8>,
+        batch: u128,
+    ) -> (DurableAppend, DurableSinkCheckpoint, DurableSinkCheckpoint) {
+        let expected = DurableSinkCheckpoint::initial(topic_partition);
+        let next = DurableSinkCheckpoint {
+            topic_partition,
+            next_placement_sequence: PlacementSequence::new(2),
+            next_offset: LogicalOffset::new(1),
+        };
+        (
+            DurableAppend {
+                event_id: RecordId::for_batch(
+                    topic_partition.topic_id,
+                    topic_partition.partition_id,
+                    BatchId::new(batch),
+                ),
+                physical_shard_id: ShardId::new(0),
+                reservation: shard_stream_core::Reservation {
+                    topic_id: topic_partition.topic_id,
+                    partition_id: topic_partition.partition_id,
+                    batch_id: BatchId::new(batch),
+                    first_offset: LogicalOffset::new(0),
+                    last_offset: LogicalOffset::new(0),
+                    record_count: NonZeroU32::new(1).expect("one"),
+                    placement: Placement {
+                        virtual_lane_id: VirtualLaneId::new(0),
+                        ring_epoch: RingEpoch::new(1),
+                        leader_epoch: LeaderEpoch::new(0),
+                        sequence: PlacementSequence::new(1),
+                    },
+                },
+                producer_event_id: None,
+                atomic_group: None,
+                delivery: DurableAppendDelivery::Publish,
+                payload: Bytes::from(payload),
+                transient_context: None,
+            },
+            expected,
+            next,
+        )
     }
 
     #[test]
@@ -1255,5 +1754,163 @@ mod tests {
             })
             .expect_err("mismatched OTLP record count rejects before it is durable");
         assert!(matches!(error, EngineError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn trace_and_metric_queries_survive_object_tier_restart() {
+        let directory = TempDir::new("signal-object-tier-restart");
+        let signals = ShardTelemetryConfig::default();
+        let router = TelemetryRouter::from_config(&signals);
+        let trace_id = crate::TraceId::from_bytes([1; 16]).expect("trace ID");
+        let trace_partition = router.trace("tenant-a", trace_id);
+
+        let trace_request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![Span {
+                        trace_id: trace_id.as_bytes().to_vec(),
+                        span_id: vec![2; 8],
+                        name: "cold trace".into(),
+                        start_time_unix_nano: 10,
+                        end_time_unix_nano: 20,
+                        ..Span::default()
+                    }],
+                    ..ScopeSpans::default()
+                }],
+                ..ResourceSpans::default()
+            }],
+        };
+        let trace_events = OtlpTelemetryDecoder
+            .decode_traces("tenant-a", &trace_request.encode_to_vec())
+            .expect("trace request decodes");
+        let trace_payload = crate::prepare_trace_envelope(trace_partition, trace_events)
+            .expect("trace envelope")
+            .encode()
+            .expect("trace STEL");
+
+        let placeholder_metric_partition =
+            TopicPartition::new(crate::METRICS_TOPIC_ID, LogicalPartitionId::new(0));
+        let metric_point = DurableMetricPoint {
+            stream_shard_id: ShardId::new(0),
+            record_ref: TelemetryRecordRef::for_signal(
+                TelemetrySignal::Metrics,
+                placeholder_metric_partition,
+                LogicalOffset::new(0),
+            ),
+            identity: Arc::new(MetricIdentity {
+                tenant: Arc::from("tenant-a"),
+                resource: Arc::new(ResourceContext::default()),
+                scope: Arc::new(ScopeContext::default()),
+                name: Arc::from("cold_metric"),
+                unit: Arc::from("1"),
+                kind: MetricKind::Gauge,
+                point_attributes: Arc::new(Vec::new()),
+            }),
+            description: Arc::from("cold metric"),
+            metadata: Arc::new(Vec::new()),
+            start_time_unix_nanos: 0,
+            timestamp_unix_nanos: 30,
+            flags: 0,
+            value: MetricValue::Gauge(NumberValue::Integer(7)),
+            exemplars: Arc::new(Vec::new()),
+        };
+        let series = metric_point.series_fingerprint();
+        let metric_partition = router.metric("tenant-a", series);
+        let metric_payload = crate::prepare_metric_envelope(
+            metric_partition,
+            vec![OtlpMetricEvent::from_durable(metric_point).expect("metric event")],
+        )
+        .expect("metric envelope")
+        .encode()
+        .expect("metric STEL");
+
+        let object_store =
+            LocalObjectStore::open(directory.0.join("objects")).expect("object store opens");
+        let mut partitions = vec![trace_partition, metric_partition];
+        partitions.sort_unstable();
+        let config = OtlpSinkConfig {
+            signals,
+            object_tier: Some(SinkObjectTierConfig {
+                store: SharedTelemetryObjectStore::from(object_store),
+                spool_directory: directory.0.join("spool"),
+                cache_directory: directory.0.join("cache"),
+                partitions,
+                tier: ObjectTierConfig {
+                    target_group_payload_bytes: 1,
+                    max_group_payload_bytes: 8 * 1024 * 1024,
+                    max_blocks_per_group: 64,
+                    groups_per_page: 8,
+                    max_control_object_bytes: 64 * 1024,
+                },
+                cache: SsdCacheConfig {
+                    max_bytes: 16 * 1024 * 1024,
+                    chunk_bytes: 64 * 1024,
+                    max_read_bytes: 8 * 1024 * 1024,
+                },
+            }),
+            ..OtlpSinkConfig::default()
+        };
+
+        let (trace_append, trace_expected, trace_next) =
+            durable_append(trace_partition, trace_payload, 11);
+        let (metric_append, metric_expected, metric_next) =
+            durable_append(metric_partition, metric_payload, 12);
+        {
+            let factory = TelemetrySinkFactory::new([ShardId::new(0)], config.clone())
+                .expect("factory opens");
+            let service = factory.service();
+            let sink = factory.open_shard(ShardId::new(0)).expect("sink opens");
+            assert_eq!(
+                sink.apply(trace_expected, &[trace_append], trace_next)
+                    .expect("trace applies"),
+                DurableSinkApply::Applied
+            );
+            assert_eq!(
+                sink.apply(metric_expected, &[metric_append], metric_next)
+                    .expect("metric applies"),
+                DurableSinkApply::Applied
+            );
+            assert_eq!(service.flush_object_tier().expect("signals flush"), 2);
+            assert_eq!(service.retained_payload_bytes().expect("resident bytes"), 0);
+        }
+
+        let recovered = TelemetrySinkFactory::new([ShardId::new(0)], config)
+            .expect("factory reopens cold catalogs");
+        assert_eq!(
+            recovered
+                .load_checkpoint(trace_partition)
+                .expect("trace checkpoint"),
+            Some(trace_next)
+        );
+        assert_eq!(
+            recovered
+                .load_checkpoint(metric_partition)
+                .expect("metric checkpoint"),
+            Some(metric_next)
+        );
+        let service = recovered.service();
+        let _sink = recovered
+            .open_shard(ShardId::new(0))
+            .expect("recovered worker opens");
+        let spans = service
+            .query_traces(&TraceQuery {
+                tenant: Arc::from("tenant-a"),
+                trace_id: Some(trace_id),
+                limit: 10,
+                ..TraceQuery::default()
+            })
+            .expect("cold trace query");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name.as_ref(), "cold trace");
+        let points = service
+            .query_metrics(&MetricQuery {
+                tenant: Arc::from("tenant-a"),
+                series: Some(series),
+                limit: 10,
+                ..MetricQuery::default()
+            })
+            .expect("cold metric query");
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0].value, MetricValue::Gauge(NumberValue::Integer(7)));
     }
 }

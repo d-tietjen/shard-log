@@ -7,8 +7,9 @@ use serde::{Deserialize, Serialize};
 use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicId, TopicPartition};
 
 use crate::{
-    ResourceContext, ScopeContext, SeriesFingerprint, SpanId, TelemetryAttribute, TelemetryError,
-    TelemetryRecordRef, TelemetryResult, TelemetrySignal, TraceId,
+    ResourceContext, ScopeContext, SeriesFingerprint, SignalTierPayload, SpanId,
+    TelemetryAttribute, TelemetryError, TelemetryRecordRef, TelemetryResult, TelemetrySignal,
+    TraceId,
 };
 
 const METRIC_CHUNK_MAGIC: [u8; 4] = *b"STMP";
@@ -823,6 +824,7 @@ pub struct SeriesAccumulatorCheckpoint {
 
 #[derive(Debug)]
 struct SeriesHead {
+    topic_partition: TopicPartition,
     identity: Arc<MetricIdentity>,
     points: BTreeMap<(u64, LogicalOffset), DurableMetricPoint>,
     latest_timestamp: u64,
@@ -842,9 +844,17 @@ pub struct MetricStripe {
     chunk_points: usize,
     chunk_nanos: u64,
     series: HashMap<SeriesFingerprint, SeriesHead>,
-    chunks: HashMap<SeriesFingerprint, Vec<Arc<[u8]>>>,
+    chunks: HashMap<SeriesFingerprint, Vec<SealedMetricChunk>>,
+    pending_chunks: Vec<SignalTierPayload>,
+    next_chunk_id: u64,
     name_index: HashMap<Arc<str>, HashSet<SeriesFingerprint>>,
     label_index: HashMap<(Arc<str>, Arc<str>), HashSet<SeriesFingerprint>>,
+}
+
+#[derive(Debug)]
+struct SealedMetricChunk {
+    resident_id: u64,
+    payload: Arc<[u8]>,
 }
 
 impl MetricStripe {
@@ -864,6 +874,8 @@ impl MetricStripe {
             chunk_nanos: DEFAULT_CHUNK_NANOS,
             series: HashMap::new(),
             chunks: HashMap::new(),
+            pending_chunks: Vec::new(),
+            next_chunk_id: 1,
             name_index: HashMap::new(),
             label_index: HashMap::new(),
         })
@@ -881,11 +893,10 @@ impl MetricStripe {
             ));
         }
         let fingerprint = point.series_fingerprint();
-        if self
-            .series
-            .get(&fingerprint)
-            .is_some_and(|head| head.identity.as_ref() != point.identity.as_ref())
-        {
+        if self.series.get(&fingerprint).is_some_and(|head| {
+            head.identity.as_ref() != point.identity.as_ref()
+                || head.topic_partition != point.record_ref.topic_partition
+        }) {
             return Err(TelemetryError::InvalidBlockEncoding(
                 "series fingerprint collision",
             ));
@@ -919,6 +930,7 @@ impl MetricStripe {
                 .series
                 .entry(fingerprint)
                 .or_insert_with(|| SeriesHead {
+                    topic_partition: point.record_ref.topic_partition,
                     identity: Arc::clone(&point.identity),
                     points: BTreeMap::new(),
                     latest_timestamp: point.timestamp_unix_nanos,
@@ -1038,8 +1050,13 @@ impl MetricStripe {
 
     /// Returns immutable raw chunks for one series.
     #[must_use]
-    pub fn chunks(&self, series: SeriesFingerprint) -> &[Arc<[u8]>] {
-        self.chunks.get(&series).map_or(&[], Vec::as_slice)
+    pub fn chunks(&self, series: SeriesFingerprint) -> Vec<Arc<[u8]>> {
+        self.chunks
+            .get(&series)
+            .into_iter()
+            .flatten()
+            .map(|chunk| Arc::clone(&chunk.payload))
+            .collect()
     }
 
     /// Returns current head memory accounting.
@@ -1083,7 +1100,7 @@ impl MetricStripe {
             }
             for chunk in chunks {
                 points.extend(
-                    decode_metric_chunk(chunk)?
+                    decode_metric_chunk(&chunk.payload)?
                         .into_iter()
                         .filter(|point| metric_query_matches(query, point)),
                 );
@@ -1128,6 +1145,19 @@ impl MetricStripe {
         self.seal_series(series)
     }
 
+    /// Seals every mutable series head belonging to one logical metric partition.
+    pub(crate) fn seal_partition(&mut self, partition: TopicPartition) -> TelemetryResult<()> {
+        let series = self
+            .series
+            .iter()
+            .filter_map(|(series, head)| (head.topic_partition == partition).then_some(*series))
+            .collect::<Vec<_>>();
+        for series in series {
+            self.seal_series(series)?;
+        }
+        Ok(())
+    }
+
     fn seal_series(&mut self, series: SeriesFingerprint) -> TelemetryResult<()> {
         let Some(head) = self.series.get_mut(&series) else {
             return Ok(());
@@ -1141,11 +1171,74 @@ impl MetricStripe {
         self.head_bytes = self.head_bytes.saturating_sub(head.bytes);
         head.bytes = 0;
         let encoded = encode_metric_chunk(&points)?;
+        let resident_id = self.next_chunk_id;
+        self.next_chunk_id = self.next_chunk_id.saturating_add(1);
+        let payload = Arc::<[u8]>::from(encoded);
+        let first_offset = points
+            .iter()
+            .map(|point| point.record_ref.offset.get())
+            .min()
+            .expect("sealed metric chunk is nonempty");
+        let last_offset = points
+            .iter()
+            .map(|point| point.record_ref.offset.get())
+            .max()
+            .expect("sealed metric chunk is nonempty");
+        let min_timestamp_unix_nanos = points
+            .iter()
+            .map(|point| point.timestamp_unix_nanos)
+            .min()
+            .expect("sealed metric chunk is nonempty");
+        let max_timestamp_unix_nanos = points
+            .iter()
+            .map(|point| point.timestamp_unix_nanos)
+            .max()
+            .expect("sealed metric chunk is nonempty");
+        self.pending_chunks.push(SignalTierPayload {
+            resident_id,
+            topic_partition: head.topic_partition,
+            signal_identity: series.get(),
+            first_offset,
+            last_offset,
+            record_count: u32::try_from(points.len())
+                .map_err(|_| TelemetryError::RecordTooLarge)?,
+            min_timestamp_unix_nanos,
+            max_timestamp_unix_nanos,
+            payload: Arc::clone(&payload),
+        });
         self.chunks
             .entry(series)
             .or_default()
-            .push(Arc::from(encoded));
+            .push(SealedMetricChunk {
+                resident_id,
+                payload,
+            });
         Ok(())
+    }
+
+    pub(crate) fn pending_partition(&self, partition: TopicPartition) -> Vec<SignalTierPayload> {
+        self.pending_chunks
+            .iter()
+            .filter(|payload| payload.topic_partition == partition)
+            .cloned()
+            .collect()
+    }
+
+    pub(crate) fn release_published_chunks(&mut self, resident_ids: &[u64]) {
+        self.pending_chunks
+            .retain(|payload| !resident_ids.contains(&payload.resident_id));
+        self.chunks.retain(|_, chunks| {
+            chunks.retain(|chunk| !resident_ids.contains(&chunk.resident_id));
+            !chunks.is_empty()
+        });
+    }
+
+    pub(crate) fn retained_payload_bytes(&self) -> u64 {
+        self.chunks
+            .values()
+            .flatten()
+            .map(|chunk| u64::try_from(chunk.payload.len()).unwrap_or(u64::MAX))
+            .sum()
     }
 }
 
@@ -1198,7 +1291,7 @@ pub struct MetricQuery {
     pub limit: usize,
 }
 
-fn metric_query_matches(query: &MetricQuery, point: &DurableMetricPoint) -> bool {
+pub(crate) fn metric_query_matches(query: &MetricQuery, point: &DurableMetricPoint) -> bool {
     point.identity.tenant == query.tenant
         && query
             .name
