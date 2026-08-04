@@ -544,10 +544,32 @@ pub struct TraceDirectory {
 }
 
 impl TraceDirectory {
-    /// Inserts or replaces one summary after immutable block publication.
+    /// Publishes one immutable fragment and merges it into the trace summary.
+    ///
+    /// Late fragments must extend the directory entry rather than replacing
+    /// the earlier block list; otherwise a direct trace lookup can lose the
+    /// only directory reference to spans that were already sealed.
     pub fn publish(&mut self, summary: TraceSummary) {
-        self.entries
-            .insert((Arc::clone(&summary.tenant), summary.trace_id), summary);
+        let key = (Arc::clone(&summary.tenant), summary.trace_id);
+        let Some(current) = self.entries.get_mut(&key) else {
+            self.entries.insert(key, summary);
+            return;
+        };
+        current.start_time_unix_nanos = current
+            .start_time_unix_nanos
+            .min(summary.start_time_unix_nanos);
+        current.end_time_unix_nanos = current.end_time_unix_nanos.max(summary.end_time_unix_nanos);
+        current.max_duration_nanos = current.max_duration_nanos.max(summary.max_duration_nanos);
+        current.span_count = current.span_count.saturating_add(summary.span_count);
+        current.error_count = current.error_count.saturating_add(summary.error_count);
+        if current.root_name.is_none() {
+            current.root_name = summary.root_name;
+        }
+        let mut fragments = current.block_fragments.as_ref().clone();
+        fragments.extend(summary.block_fragments.iter().copied());
+        fragments.sort_unstable();
+        fragments.dedup();
+        current.block_fragments = Arc::new(fragments);
     }
 
     /// Executes direct-ID or bounded summary search without span materialization.
@@ -1038,5 +1060,30 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].span_count, 1);
         assert_eq!(stripe.query(&query).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn late_fragment_extends_the_trace_directory() {
+        let mut stripe = TraceStripe::new(1024 * 1024).unwrap();
+        stripe.apply(span(1, 1, 1), 10).unwrap();
+        stripe.seal_idle(10 + DEFAULT_TRACE_IDLE_NANOS).unwrap();
+
+        let late_append = 10 + DEFAULT_TRACE_IDLE_NANOS + 1;
+        stripe.apply(span(2, 1, 2), late_append).unwrap();
+        stripe
+            .seal_idle(late_append + DEFAULT_TRACE_IDLE_NANOS)
+            .unwrap();
+
+        let query = TraceQuery {
+            tenant: Arc::from("tenant-a"),
+            trace_id: Some(TraceId::from_bytes([1; 16]).unwrap()),
+            limit: 10,
+            ..TraceQuery::default()
+        };
+        let summaries = stripe.directory().query(&query);
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].span_count, 2);
+        assert_eq!(summaries[0].block_fragments.as_ref(), &[1, 2]);
+        assert_eq!(stripe.query(&query).unwrap().len(), 2);
     }
 }
