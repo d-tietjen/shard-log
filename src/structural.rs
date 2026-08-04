@@ -30,7 +30,8 @@ const SEEK_CHECKPOINT_INTERVAL: usize = 256;
 // Candidate filters are fail-open and only avoid obviously absent block reads.
 // A compact filter is deliberately preferred here: false positives cost one
 // selective verification, while every filter byte is retained in every frame.
-const EMBEDDED_MEMBERSHIP_FILTER_WORDS: usize = 8;
+const EMBEDDED_MEMBERSHIP_FILTER_WORDS: usize = 1;
+const INDEX_FINGERPRINT_MASK: u32 = 0x00ff_ffff;
 const PACKED_IDS_BITPACKED: u8 = 0;
 const PACKED_IDS_RUN_LENGTH: u8 = 1;
 
@@ -372,7 +373,7 @@ impl EmbeddedFrameIndex {
             return Vec::new();
         }
         let mut selected = self.residual_layout_ids.clone();
-        let fingerprint = membership_hash(normalized.as_bytes()) as u32;
+        let fingerprint = index_fingerprint(membership_hash(normalized.as_bytes()));
         if let Ok(position) = self
             .terms
             .binary_search_by_key(&fingerprint, |locator| locator.fingerprint)
@@ -399,7 +400,7 @@ impl EmbeddedFrameIndex {
         {
             return Vec::new();
         }
-        let fingerprint = membership_pair_hash(key.as_bytes(), value.as_bytes()) as u32;
+        let fingerprint = index_fingerprint(membership_pair_hash(key.as_bytes(), value.as_bytes()));
         let Ok(position) = self
             .fields
             .binary_search_by_key(&fingerprint, |locator| locator.fingerprint)
@@ -491,7 +492,7 @@ impl EmbeddedFrameIndex {
                 if is_dynamic {
                     continue;
                 }
-                let fingerprint = membership_hash(normalized.as_bytes()) as u32;
+                let fingerprint = index_fingerprint(membership_hash(normalized.as_bytes()));
                 let layouts = term_layouts.entry(fingerprint).or_default();
                 if layouts.last().copied() != Some(template_id) {
                     layouts.push(template_id);
@@ -528,7 +529,7 @@ impl EmbeddedFrameIndex {
                     .ok_or(TelemetryError::InvalidBlockEncoding(
                         "embedded field value ID is out of range",
                     ))?;
-                let fingerprint = membership_pair_hash(key, value) as u32;
+                let fingerprint = index_fingerprint(membership_pair_hash(key, value));
                 let set_ids = field_sets.entry(fingerprint).or_default();
                 if set_ids.last().copied() != Some(field_set_id) {
                     set_ids.push(field_set_id);
@@ -586,7 +587,7 @@ impl EmbeddedFrameIndex {
             &mut encoded,
         );
         for locator in &self.terms {
-            encoded.extend_from_slice(&locator.fingerprint.to_le_bytes());
+            encode_index_fingerprint(locator.fingerprint, &mut encoded);
             encode_sorted_ids(&locator.layout_ids, self.layout_count, &mut encoded)?;
         }
         encode_packed_column(
@@ -601,7 +602,7 @@ impl EmbeddedFrameIndex {
             &mut encoded,
         );
         for locator in &self.fields {
-            encoded.extend_from_slice(&locator.fingerprint.to_le_bytes());
+            encode_index_fingerprint(locator.fingerprint, &mut encoded);
             encode_sorted_ids(&locator.field_set_ids, self.field_set_count, &mut encoded)?;
         }
         Ok(encoded)
@@ -626,7 +627,7 @@ impl EmbeddedFrameIndex {
         )?;
         let mut terms = Vec::with_capacity(term_count);
         for _ in 0..term_count {
-            let fingerprint = read_fixed_u32(encoded, &mut cursor)?;
+            let fingerprint = decode_index_fingerprint(encoded, &mut cursor)?;
             let layout_ids = decode_sorted_ids(encoded, &mut cursor, layout_count)?;
             if terms
                 .last()
@@ -652,7 +653,7 @@ impl EmbeddedFrameIndex {
         )?;
         let mut fields = Vec::with_capacity(field_count);
         for _ in 0..field_count {
-            let fingerprint = read_fixed_u32(encoded, &mut cursor)?;
+            let fingerprint = decode_index_fingerprint(encoded, &mut cursor)?;
             let field_set_ids = decode_sorted_ids(encoded, &mut cursor, field_set_count)?;
             if fields
                 .last()
@@ -2564,6 +2565,15 @@ fn membership_pair_hash(key: &[u8], value: &[u8]) -> u64 {
     hash
 }
 
+fn index_fingerprint(hash: u64) -> u32 {
+    hash as u32 & INDEX_FINGERPRINT_MASK
+}
+
+fn encode_index_fingerprint(fingerprint: u32, encoded: &mut Vec<u8>) {
+    debug_assert_eq!(fingerprint & !INDEX_FINGERPRINT_MASK, 0);
+    encoded.extend_from_slice(&fingerprint.to_le_bytes()[..3]);
+}
+
 fn encode_membership_filter(filter: &MembershipFilter, encoded: &mut Vec<u8>) {
     for word in filter.words.iter() {
         encoded.extend_from_slice(&word.to_le_bytes());
@@ -2937,21 +2947,19 @@ fn read_u32(encoded: &[u8], cursor: &mut usize) -> TelemetryResult<u32> {
         .map_err(|_| TelemetryError::InvalidBlockEncoding("value does not fit u32"))
 }
 
-fn read_fixed_u32(encoded: &[u8], cursor: &mut usize) -> TelemetryResult<u32> {
+fn decode_index_fingerprint(encoded: &[u8], cursor: &mut usize) -> TelemetryResult<u32> {
     let end = cursor
-        .checked_add(size_of::<u32>())
+        .checked_add(3)
         .ok_or(TelemetryError::InvalidBlockEncoding(
-            "fixed integer cursor overflow",
+            "fingerprint cursor overflow",
         ))?;
     let bytes = encoded
         .get(*cursor..end)
         .ok_or(TelemetryError::InvalidBlockEncoding(
-            "fixed integer is truncated",
+            "fingerprint is truncated",
         ))?;
     *cursor = end;
-    Ok(u32::from_le_bytes(
-        bytes.try_into().expect("fixed integer width"),
-    ))
+    Ok(u32::from(bytes[0]) | u32::from(bytes[1]) << 8 | u32::from(bytes[2]) << 16)
 }
 
 #[inline]
@@ -3394,8 +3402,8 @@ mod tests {
             record(3, "beta static message"),
         ];
         let mut indexed = encode_indexed_structural_records(&records).expect("fingerprints encode");
-        let alpha = membership_hash(b"alpha") as u32;
-        let beta = membership_hash(b"beta") as u32;
+        let alpha = index_fingerprint(membership_hash(b"alpha"));
+        let beta = index_fingerprint(membership_hash(b"beta"));
         let beta_layouts = indexed.index.terms[indexed
             .index
             .terms
