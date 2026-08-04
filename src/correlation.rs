@@ -1,14 +1,20 @@
 //! Bounded stripe-local links between logs, traces, and metrics.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AttributeFingerprint, DurableLog, DurableMetricPoint, DurableSpan, ResourceContextId,
-    ScopeContextId, TelemetryAttribute, TelemetryRecordRef, TelemetrySignal, TraceId,
+    AttributeFingerprint, DurableLog, DurableMetricPoint, DurableSpan, ResourceContext,
+    ResourceContextId, ScopeContext, ScopeContextId, TelemetryAttribute, TelemetryRecordRef,
+    TelemetrySignal, TraceId,
 };
+
+const CONTEXT_ID_CACHE_ENTRIES: usize = 64;
+const ATTRIBUTE_ID_CACHE_ENTRIES: usize = 1_024;
 
 /// Hard bounds for one owner stripe's cross-signal postings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -434,9 +440,34 @@ fn visit_attributes<'a>(
 #[derive(Debug)]
 pub struct CorrelationIndex {
     config: CorrelationConfig,
-    postings: HashMap<(Arc<str>, CorrelationKey), Vec<TelemetryRecordRef>>,
+    tenants: HashMap<Arc<str>, u32>,
+    postings: HashMap<(u32, CorrelationKey), Vec<TelemetryRecordRef>>,
+    resource_ids: Vec<Option<CachedResourceId>>,
+    scope_ids: Vec<Option<CachedScopeId>>,
+    attribute_ids: Vec<Option<CachedAttributeIds>>,
     refs: usize,
     dropped_postings: u64,
+}
+
+#[derive(Debug)]
+struct CachedResourceId {
+    hash: u64,
+    context: Arc<ResourceContext>,
+    id: ResourceContextId,
+}
+
+#[derive(Debug)]
+struct CachedScopeId {
+    hash: u64,
+    context: Arc<ScopeContext>,
+    id: ScopeContextId,
+}
+
+#[derive(Debug)]
+struct CachedAttributeIds {
+    hash: u64,
+    attributes: Arc<Vec<TelemetryAttribute>>,
+    ids: Arc<[AttributeFingerprint]>,
 }
 
 impl CorrelationIndex {
@@ -445,7 +476,17 @@ impl CorrelationIndex {
     pub fn new(config: CorrelationConfig) -> Self {
         Self {
             config,
+            tenants: HashMap::new(),
             postings: HashMap::with_capacity(config.max_keys.min(4_096)),
+            resource_ids: std::iter::repeat_with(|| None)
+                .take(CONTEXT_ID_CACHE_ENTRIES)
+                .collect(),
+            scope_ids: std::iter::repeat_with(|| None)
+                .take(CONTEXT_ID_CACHE_ENTRIES)
+                .collect(),
+            attribute_ids: std::iter::repeat_with(|| None)
+                .take(ATTRIBUTE_ID_CACHE_ENTRIES)
+                .collect(),
             refs: 0,
             dropped_postings: 0,
         }
@@ -456,15 +497,8 @@ impl CorrelationIndex {
         if let Some(trace_id) = log.trace_id {
             self.insert(tenant, CorrelationKey::Trace(trace_id), log.record_ref);
         }
-        self.index_contexts(
-            tenant,
-            log.record_ref,
-            log.resource_id(),
-            log.scope_id(),
-            log.resource.attributes.iter(),
-            log.scope.attributes.iter(),
-        );
-        self.index_attributes(tenant, log.record_ref, log.attributes.iter());
+        self.index_contexts(tenant, log.record_ref, &log.resource, &log.scope);
+        self.index_attribute_set(tenant, log.record_ref, &log.attributes);
     }
 
     /// Indexes one durable span, including event and link metadata.
@@ -481,19 +515,12 @@ impl CorrelationIndex {
                 CorrelationKey::Trace(link.trace_id),
                 span.record_ref,
             );
-            self.index_attributes(tenant, span.record_ref, link.attributes.iter());
+            self.index_attribute_set(tenant, span.record_ref, &link.attributes);
         }
-        self.index_contexts(
-            tenant,
-            span.record_ref,
-            span.resource_id(),
-            span.scope_id(),
-            span.resource.attributes.iter(),
-            span.scope.attributes.iter(),
-        );
-        self.index_attributes(tenant, span.record_ref, span.attributes.iter());
+        self.index_contexts(tenant, span.record_ref, &span.resource, &span.scope);
+        self.index_attribute_set(tenant, span.record_ref, &span.attributes);
         for event in span.events.iter() {
-            self.index_attributes(tenant, span.record_ref, event.attributes.iter());
+            self.index_attribute_set(tenant, span.record_ref, &event.attributes);
         }
     }
 
@@ -504,26 +531,16 @@ impl CorrelationIndex {
             if let Some(trace_id) = exemplar.trace_id {
                 self.insert(tenant, CorrelationKey::Trace(trace_id), point.record_ref);
             }
-            self.index_attributes(
-                tenant,
-                point.record_ref,
-                exemplar.filtered_attributes.iter(),
-            );
+            self.index_attribute_set(tenant, point.record_ref, &exemplar.filtered_attributes);
         }
         self.index_contexts(
             tenant,
             point.record_ref,
-            point.identity.resource_id(),
-            point.identity.scope_id(),
-            point.identity.resource.attributes.iter(),
-            point.identity.scope.attributes.iter(),
+            &point.identity.resource,
+            &point.identity.scope,
         );
-        self.index_attributes(
-            tenant,
-            point.record_ref,
-            point.identity.point_attributes.iter(),
-        );
-        self.index_attributes(tenant, point.record_ref, point.metadata.iter());
+        self.index_attribute_set(tenant, point.record_ref, &point.identity.point_attributes);
+        self.index_attribute_set(tenant, point.record_ref, &point.metadata);
     }
 
     /// Returns the deterministic intersection of every requested posting.
@@ -549,11 +566,14 @@ impl CorrelationIndex {
         if keys.is_empty() || query.limit == 0 {
             return Vec::new();
         }
+        let Some(tenant_id) = self.tenants.get(query.tenant.as_ref()).copied() else {
+            return Vec::new();
+        };
         let mut lists = keys
             .into_iter()
             .map(|key| {
                 self.postings
-                    .get(&(Arc::clone(&query.tenant), key))
+                    .get(&(tenant_id, key))
                     .map(Vec::as_slice)
                     .unwrap_or_default()
             })
@@ -610,38 +630,111 @@ impl CorrelationIndex {
         }
     }
 
-    fn index_contexts<'a>(
+    fn index_contexts(
         &mut self,
         tenant: &str,
         record_ref: TelemetryRecordRef,
-        resource_id: ResourceContextId,
-        scope_id: ScopeContextId,
-        resource_attributes: impl Iterator<Item = &'a TelemetryAttribute>,
-        scope_attributes: impl Iterator<Item = &'a TelemetryAttribute>,
+        resource: &Arc<ResourceContext>,
+        scope: &Arc<ScopeContext>,
     ) {
+        let resource_id = self.resource_id(resource);
+        let scope_id = self.scope_id(scope);
         self.insert(tenant, CorrelationKey::Resource(resource_id), record_ref);
         self.insert(tenant, CorrelationKey::Scope(scope_id), record_ref);
-        self.index_attributes(tenant, record_ref, resource_attributes);
-        self.index_attributes(tenant, record_ref, scope_attributes);
+        self.index_attribute_set(tenant, record_ref, &resource.attributes);
+        self.index_attribute_set(tenant, record_ref, &scope.attributes);
     }
 
-    fn index_attributes<'a>(
+    fn index_attribute_set(
         &mut self,
         tenant: &str,
         record_ref: TelemetryRecordRef,
-        attributes: impl Iterator<Item = &'a TelemetryAttribute>,
+        attributes: &Arc<Vec<TelemetryAttribute>>,
     ) {
-        for attribute in attributes {
-            self.insert(
-                tenant,
-                CorrelationKey::Attribute(attribute.fingerprint()),
-                record_ref,
-            );
+        for id in self.attribute_ids(attributes).iter().copied() {
+            self.insert(tenant, CorrelationKey::Attribute(id), record_ref);
         }
     }
 
+    fn resource_id(&mut self, context: &Arc<ResourceContext>) -> ResourceContextId {
+        let hash = identity_hash(context.as_ref());
+        let slot = hash as usize & (CONTEXT_ID_CACHE_ENTRIES - 1);
+        if let Some(cached) = &self.resource_ids[slot]
+            && cached.hash == hash
+            && (Arc::ptr_eq(&cached.context, context)
+                || cached.context.as_ref() == context.as_ref())
+        {
+            return cached.id;
+        }
+        let id = context.id();
+        self.resource_ids[slot] = Some(CachedResourceId {
+            hash,
+            context: Arc::clone(context),
+            id,
+        });
+        id
+    }
+
+    fn scope_id(&mut self, context: &Arc<ScopeContext>) -> ScopeContextId {
+        let hash = identity_hash(context.as_ref());
+        let slot = hash as usize & (CONTEXT_ID_CACHE_ENTRIES - 1);
+        if let Some(cached) = &self.scope_ids[slot]
+            && cached.hash == hash
+            && (Arc::ptr_eq(&cached.context, context)
+                || cached.context.as_ref() == context.as_ref())
+        {
+            return cached.id;
+        }
+        let id = context.id();
+        self.scope_ids[slot] = Some(CachedScopeId {
+            hash,
+            context: Arc::clone(context),
+            id,
+        });
+        id
+    }
+
+    fn attribute_ids(
+        &mut self,
+        attributes: &Arc<Vec<TelemetryAttribute>>,
+    ) -> Arc<[AttributeFingerprint]> {
+        let hash = identity_hash(attributes.as_ref());
+        let slot = hash as usize & (ATTRIBUTE_ID_CACHE_ENTRIES - 1);
+        if let Some(cached) = &self.attribute_ids[slot]
+            && cached.hash == hash
+            && (Arc::ptr_eq(&cached.attributes, attributes)
+                || cached.attributes.as_ref() == attributes.as_ref())
+        {
+            return Arc::clone(&cached.ids);
+        }
+        let ids = attributes
+            .iter()
+            .map(TelemetryAttribute::fingerprint)
+            .collect::<Arc<[_]>>();
+        self.attribute_ids[slot] = Some(CachedAttributeIds {
+            hash,
+            attributes: Arc::clone(attributes),
+            ids: Arc::clone(&ids),
+        });
+        ids
+    }
+
     fn insert(&mut self, tenant: &str, key: CorrelationKey, record_ref: TelemetryRecordRef) {
-        let lookup = (Arc::<str>::from(tenant), key);
+        let tenant_id = if let Some(tenant_id) = self.tenants.get(tenant).copied() {
+            tenant_id
+        } else {
+            if self.postings.len() >= self.config.max_keys {
+                self.dropped_postings = self.dropped_postings.saturating_add(1);
+                return;
+            }
+            let Ok(tenant_id) = u32::try_from(self.tenants.len()) else {
+                self.dropped_postings = self.dropped_postings.saturating_add(1);
+                return;
+            };
+            self.tenants.insert(Arc::from(tenant), tenant_id);
+            tenant_id
+        };
+        let lookup = (tenant_id, key);
         if !self.postings.contains_key(&lookup) && self.postings.len() >= self.config.max_keys {
             self.dropped_postings = self.dropped_postings.saturating_add(1);
             return;
@@ -660,6 +753,12 @@ impl CorrelationIndex {
         }
         self.refs += 1;
     }
+}
+
+fn identity_hash(value: &impl Hash) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
 }
 
 #[cfg(test)]

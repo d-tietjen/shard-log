@@ -1,5 +1,6 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::Hash;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use pco::ChunkConfig;
@@ -21,6 +22,7 @@ const DEFAULT_OUT_OF_ORDER_NANOS: u64 = 10 * 60 * 1_000_000_000;
 const DEFAULT_CHUNK_BYTES: usize = 64 * 1024;
 const DEFAULT_CHUNK_POINTS: usize = 4_096;
 const DEFAULT_CHUNK_NANOS: u64 = 2 * 60 * 60 * 1_000_000_000;
+const SERIES_ID_CACHE_ENTRIES: usize = 1_024;
 
 /// Exact scalar number used by gauges, sums, and exemplars.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -161,7 +163,7 @@ pub enum MetricValue {
 }
 
 /// Metric instrument identity fields that are common to a series.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum MetricKind {
     /// Gauge.
     Gauge,
@@ -187,7 +189,7 @@ pub enum MetricKind {
 }
 
 /// Canonical identity of one metric series.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MetricIdentity {
     /// Authenticated tenant.
     pub tenant: Arc<str>,
@@ -1329,6 +1331,14 @@ pub struct MetricStripe {
     recovered_accumulators: HashMap<SeriesFingerprint, SeriesAccumulatorCheckpoint>,
     name_index: HashMap<Arc<str>, HashSet<SeriesFingerprint>>,
     label_index: HashMap<(Arc<str>, Arc<str>), HashSet<SeriesFingerprint>>,
+    identity_fingerprints: Vec<Option<CachedSeriesIdentity>>,
+}
+
+#[derive(Debug)]
+struct CachedSeriesIdentity {
+    hash: u64,
+    identity: Arc<MetricIdentity>,
+    fingerprint: SeriesFingerprint,
 }
 
 #[derive(Debug)]
@@ -1388,6 +1398,9 @@ impl MetricStripe {
             recovered_accumulators: HashMap::new(),
             name_index: HashMap::new(),
             label_index: HashMap::new(),
+            identity_fingerprints: std::iter::repeat_with(|| None)
+                .take(SERIES_ID_CACHE_ENTRIES)
+                .collect(),
         })
     }
 
@@ -1402,7 +1415,7 @@ impl MetricStripe {
                 "non-metric record applied to metric stripe",
             ));
         }
-        let fingerprint = point.series_fingerprint();
+        let fingerprint = self.series_fingerprint(&point.identity);
         if self.series.get(&fingerprint).is_some_and(|head| {
             head.identity.as_ref() != point.identity.as_ref()
                 || head.topic_partition != point.record_ref.topic_partition
@@ -1547,6 +1560,27 @@ impl MetricStripe {
             self.seal_series(fingerprint)?;
         }
         Ok(outcome)
+    }
+
+    fn series_fingerprint(&mut self, identity: &Arc<MetricIdentity>) -> SeriesFingerprint {
+        let mut hasher = DefaultHasher::new();
+        identity.hash(&mut hasher);
+        let hash = hasher.finish();
+        let slot = hash as usize & (SERIES_ID_CACHE_ENTRIES - 1);
+        if let Some(cached) = &self.identity_fingerprints[slot]
+            && cached.hash == hash
+            && (Arc::ptr_eq(&cached.identity, identity)
+                || cached.identity.as_ref() == identity.as_ref())
+        {
+            return cached.fingerprint;
+        }
+        let fingerprint = identity.fingerprint();
+        self.identity_fingerprints[slot] = Some(CachedSeriesIdentity {
+            hash,
+            identity: Arc::clone(identity),
+            fingerprint,
+        });
+        fingerprint
     }
 
     /// Serializes exact accumulator checkpoints for restart recovery.

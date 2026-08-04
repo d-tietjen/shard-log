@@ -196,10 +196,15 @@ impl DurableTelemetryStore {
                 Ok::<_, crate::TelemetryError>(SinkObjectTierConfig {
                     store: store.into(),
                     spool_directory: config.data_directory.join("tier-spool"),
-                    cache_directory: config.data_directory.join("tier-cache"),
+                    control_cache_directory: config.data_directory.join("tier-control-cache"),
+                    payload_cache_directory: config.data_directory.join("tier-payload-cache"),
                     partitions: object_tier_partitions(config.tenant_partitions),
                     tier: ObjectTierConfig::default(),
-                    cache: SsdCacheConfig::default(),
+                    control_cache: SsdCacheConfig {
+                        max_bytes: 8 * 1024 * 1024 * 1024,
+                        ..SsdCacheConfig::default()
+                    },
+                    payload_cache: SsdCacheConfig::default(),
                 })
             })
             .transpose()

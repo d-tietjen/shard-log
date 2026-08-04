@@ -134,10 +134,10 @@ pub use tempo_api::{TempoApiConfig, TempoService, tempo_router};
 pub use tier::{
     CatalogGroupEntry, CatalogPage, CatalogPageRef, CatalogPointer, CatalogRoot, LocalObjectStore,
     ObjectMetadata, ObjectTierConfig, SharedTelemetryObjectStore, SignalTierPayload,
-    SsdCacheConfig, SsdObjectCache, TelemetryObjectStore, TelemetryObjectTier, TierArtifact,
-    TierArtifactKind, TierArtifactSource, TierBlockEntry, TierCheckpoint, TierGroupManifest,
-    TierGroupSource, TierQueryRange, decode_signal_recovery_state, mark_group_offloaded,
-    stage_signal_group, write_staged_payload_pack,
+    SsdCacheConfig, SsdCacheStats, SsdObjectCache, TelemetryObjectStore, TelemetryObjectTier,
+    TierArtifact, TierArtifactKind, TierArtifactSource, TierBlockEntry, TierCheckpoint,
+    TierGroupManifest, TierGroupSource, TierQueryRange, decode_signal_recovery_state,
+    mark_group_offloaded, stage_signal_group, write_staged_payload_pack,
 };
 pub use trace::{
     DurableSpan, SpanEvent, SpanLink, SpanStatus, TraceApplyOutcome, TraceDirectory, TraceQuery,

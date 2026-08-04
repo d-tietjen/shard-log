@@ -129,6 +129,92 @@ impl HotPostingList {
         }
         ordinals
     }
+
+    fn contains(&self, ordinal: u32) -> bool {
+        self.runs
+            .binary_search_by(|run| {
+                if run.last < ordinal {
+                    std::cmp::Ordering::Less
+                } else if run.first > ordinal {
+                    std::cmp::Ordering::Greater
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
+    }
+
+    fn visit_in(
+        &self,
+        start: u32,
+        end: u32,
+        order: QueryOrder,
+        mut visit: impl FnMut(u32) -> bool,
+    ) {
+        match order {
+            QueryOrder::OldestFirst => {
+                for run in &self.runs {
+                    if run.last < start {
+                        continue;
+                    }
+                    if run.first >= end {
+                        break;
+                    }
+                    let first = run.first.max(start);
+                    let last = run.last.min(end.saturating_sub(1));
+                    for ordinal in first..=last {
+                        if !visit(ordinal) {
+                            return;
+                        }
+                    }
+                }
+            }
+            QueryOrder::NewestFirst => {
+                for run in self.runs.iter().rev() {
+                    if run.first >= end {
+                        continue;
+                    }
+                    if run.last < start {
+                        break;
+                    }
+                    let first = run.first.max(start);
+                    let last = run.last.min(end.saturating_sub(1));
+                    for ordinal in (first..=last).rev() {
+                        if !visit(ordinal) {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn collect_hot_posting_intersection(
+    postings: &[&HotPostingList],
+    start: u32,
+    end: u32,
+    order: QueryOrder,
+    limit: Option<usize>,
+) -> Vec<u32> {
+    let Some(first) = postings.first() else {
+        return Vec::new();
+    };
+    let take = limit.unwrap_or(usize::MAX);
+    if take == 0 {
+        return Vec::new();
+    }
+    let mut ordinals = Vec::with_capacity(take.min(first.cardinality));
+    first.visit_in(start, end, order, |ordinal| {
+        if postings[1..]
+            .iter()
+            .all(|postings| postings.contains(ordinal))
+        {
+            ordinals.push(ordinal);
+        }
+        ordinals.len() < take
+    });
+    ordinals
 }
 
 /// Resource limits for one shard-aligned log stripe.
@@ -244,7 +330,8 @@ struct IndexedFramePartition {
 struct StripeTierState {
     tiers: HashMap<TopicPartition, TelemetryObjectTier<SharedTelemetryObjectStore>>,
     spool_directory: PathBuf,
-    cache: Arc<SsdObjectCache>,
+    control_cache: Arc<SsdObjectCache>,
+    payload_cache: Arc<SsdObjectCache>,
     config: ObjectTierConfig,
 }
 
@@ -610,7 +697,8 @@ impl LogStripe {
         &mut self,
         store: SharedTelemetryObjectStore,
         spool_directory: PathBuf,
-        cache: Arc<SsdObjectCache>,
+        control_cache: Arc<SsdObjectCache>,
+        payload_cache: Arc<SsdObjectCache>,
         partitions: impl IntoIterator<Item = TopicPartition>,
         config: ObjectTierConfig,
     ) -> TelemetryResult<Vec<DurableSinkCheckpoint>> {
@@ -653,7 +741,8 @@ impl LogStripe {
         self.tier = Some(StripeTierState {
             tiers,
             spool_directory,
-            cache,
+            control_cache,
+            payload_cache,
             config,
         });
         Ok(checkpoints)
@@ -1456,13 +1545,16 @@ impl LogStripe {
         let Some(tier) = state.tiers.get(&query.topic_partition) else {
             return Ok(Vec::new());
         };
-        let mut groups = tier.candidate_groups(TierQueryRange {
-            first_offset: query.start_offset.map(LogicalOffset::get),
-            last_offset: query.end_offset.map(LogicalOffset::get),
-            min_timestamp_unix_nanos: query.start_timestamp_unix_nanos,
-            max_timestamp_unix_nanos: query.end_timestamp_unix_nanos,
-            signal_identity: None,
-        })?;
+        let mut groups = tier.candidate_groups_cached(
+            TierQueryRange {
+                first_offset: query.start_offset.map(LogicalOffset::get),
+                last_offset: query.end_offset.map(LogicalOffset::get),
+                min_timestamp_unix_nanos: query.start_timestamp_unix_nanos,
+                max_timestamp_unix_nanos: query.end_timestamp_unix_nanos,
+                signal_identity: None,
+            },
+            &state.control_cache,
+        )?;
         match query.order {
             QueryOrder::NewestFirst => groups.sort_unstable_by(|left, right| {
                 right
@@ -1476,12 +1568,15 @@ impl LogStripe {
         }
         let mut matches = Vec::new();
         for group in groups {
-            let manifest = tier.load_group(&group)?;
+            let manifest = tier.load_group_cached(&group, &state.control_cache)?;
             let query_artifact = manifest
                 .artifact(TierArtifactKind::QueryIndex)
                 .ok_or_else(|| TelemetryError::CorruptTier("group has no query index".into()))?;
-            let query_index =
-                tier.read_artifact(query_artifact, MAX_TIER_QUERY_INDEX_READ_BYTES)?;
+            let query_index = tier.read_artifact_cached(
+                query_artifact,
+                MAX_TIER_QUERY_INDEX_READ_BYTES,
+                &state.control_cache,
+            )?;
             let appends = decode_tier_ingest_group(&query_index, &manifest.blocks)?;
             let payload_artifact = manifest
                 .artifact(TierArtifactKind::PayloadPack)
@@ -1491,6 +1586,8 @@ impl LogStripe {
                 version_token: payload_artifact.checksum.clone(),
                 content_digest: payload_artifact.checksum.clone(),
             };
+            let mut selected = Vec::new();
+            let mut ranges = Vec::new();
             for append in appends {
                 let bounds = IndexedFrameAppend {
                     first_offset: append.first_offset,
@@ -1518,35 +1615,54 @@ impl LogStripe {
                         .payload_offset
                         .checked_add(cold_frame.payload_bytes)
                         .ok_or(TelemetryError::RecordTooLarge)?;
-                    let compressed = state.cache.read_range_with_metadata(
-                        tier.object_store(),
-                        &payload_artifact.object_key,
-                        &payload_metadata,
-                        cold_frame.payload_offset..range_end,
-                    )?;
-                    if blake3::hash(&compressed).to_hex().as_str() != cold_frame.payload_checksum {
-                        return Err(TelemetryError::CorruptTier(format!(
-                            "tiered frame {} payload checksum failed",
-                            cold_frame.frame_id
-                        )));
-                    }
-                    let frame = IndexedIngestFrame {
-                        frame_id: cold_frame.frame_id,
-                        cohort: cold_frame.cohort,
-                        record_count: cold_frame.record_count,
-                        structural_bytes: cold_frame.structural_bytes,
-                        min_timestamp_unix_nanos: cold_frame.min_timestamp_unix_nanos,
-                        max_timestamp_unix_nanos: cold_frame.max_timestamp_unix_nanos,
-                        compressed: Bytes::from(compressed),
-                        index: cold_frame.index,
-                    };
-                    matches.extend(self.decode_indexed_frame_candidates(
-                        query,
-                        &bounds,
-                        &frame,
-                        &candidates,
-                    )?);
+                    ranges.push(cold_frame.payload_offset..range_end);
+                    selected.push((
+                        bounds.first_offset,
+                        bounds.last_offset,
+                        bounds.record_count,
+                        cold_frame,
+                        candidates,
+                    ));
                 }
+            }
+            let payloads = state.payload_cache.read_ranges_with_metadata(
+                tier.object_store(),
+                &payload_artifact.object_key,
+                &payload_metadata,
+                &ranges,
+            )?;
+            for ((first_offset, last_offset, record_count, cold_frame, candidates), compressed) in
+                selected.into_iter().zip(payloads)
+            {
+                if blake3::hash(&compressed).to_hex().as_str() != cold_frame.payload_checksum {
+                    return Err(TelemetryError::CorruptTier(format!(
+                        "tiered frame {} payload checksum failed",
+                        cold_frame.frame_id
+                    )));
+                }
+                let frame = IndexedIngestFrame {
+                    frame_id: cold_frame.frame_id,
+                    cohort: cold_frame.cohort,
+                    record_count: cold_frame.record_count,
+                    structural_bytes: cold_frame.structural_bytes,
+                    min_timestamp_unix_nanos: cold_frame.min_timestamp_unix_nanos,
+                    max_timestamp_unix_nanos: cold_frame.max_timestamp_unix_nanos,
+                    compressed: Bytes::from(compressed),
+                    index: cold_frame.index,
+                };
+                let bounds = IndexedFrameAppend {
+                    first_offset,
+                    last_offset,
+                    record_count,
+                    frames: Vec::new(),
+                    next_checkpoint: None,
+                };
+                matches.extend(self.decode_indexed_frame_candidates(
+                    query,
+                    &bounds,
+                    &frame,
+                    &candidates,
+                )?);
             }
         }
         Ok(matches)
@@ -1681,19 +1797,19 @@ impl LogStripe {
                     query.limit,
                 );
             }
-            let mut ordinals = posting_lists[0].collect_in(
+            let can_limit_intersection =
+                !needs_record_filter && query.sort == crate::QuerySort::Offset;
+            collect_hot_posting_intersection(
+                &posting_lists,
                 posting_start,
                 posting_end,
-                QueryOrder::OldestFirst,
-                None,
-            );
-            for postings in &posting_lists[1..] {
-                intersect_ordinal_runs(&mut ordinals, &postings.runs, posting_start, posting_end);
-                if ordinals.is_empty() {
-                    break;
-                }
-            }
-            ordinals
+                if can_limit_intersection {
+                    query.order
+                } else {
+                    QueryOrder::OldestFirst
+                },
+                can_limit_intersection.then_some(query.limit).flatten(),
+            )
         };
         if needs_record_filter {
             ordinals.retain(|ordinal| {
@@ -1715,7 +1831,9 @@ impl LogStripe {
                     .expect("indexed reference has a visible record");
                 query.compare(&left.record, &right.record)
             });
-        } else if query.order == QueryOrder::NewestFirst {
+        } else if query.order == QueryOrder::NewestFirst
+            && (needs_record_filter || posting_lists.len() <= 1)
+        {
             ordinals.reverse();
         }
         if let Some(limit) = query.limit {
@@ -2602,6 +2720,7 @@ fn intersect_frame_candidates(current: &mut Option<Vec<u32>>, mut incoming: Vec<
     existing.truncate(write_index);
 }
 
+#[cfg(test)]
 fn intersect_ordinal_runs(candidates: &mut Vec<u32>, runs: &[OrdinalRun], start: u32, end: u32) {
     let mut candidate_index = 0usize;
     let mut run_index = runs.partition_point(|run| run.last < start);
@@ -3158,6 +3277,37 @@ mod tests {
             .collect::<Vec<_>>();
         intersect_ordinal_runs(&mut candidates, &runs, 0, 100_000);
         assert_eq!(candidates, [0, 50_000]);
+    }
+
+    #[test]
+    fn bounded_hot_posting_intersection_stops_in_requested_order() {
+        let mut dense = HotPostingList::default();
+        dense.push_range(0, 999_999);
+        let mut every_thousand = HotPostingList::default();
+        for ordinal in (0..1_000_000).step_by(1_000) {
+            every_thousand.push(ordinal);
+        }
+        let postings = [&dense, &every_thousand];
+        assert_eq!(
+            collect_hot_posting_intersection(
+                &postings,
+                0,
+                1_000_000,
+                QueryOrder::OldestFirst,
+                Some(3),
+            ),
+            [0, 1_000, 2_000]
+        );
+        assert_eq!(
+            collect_hot_posting_intersection(
+                &postings,
+                0,
+                1_000_000,
+                QueryOrder::NewestFirst,
+                Some(3),
+            ),
+            [999_000, 998_000, 997_000]
+        );
     }
 
     #[test]

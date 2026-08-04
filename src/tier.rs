@@ -1649,12 +1649,46 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
         Ok(groups)
     }
 
+    /// Returns overlapping groups while serving immutable catalog pages from
+    /// the integrity-checked SSD cache when they fit its read bound.
+    pub fn candidate_groups_cached(
+        &self,
+        range: TierQueryRange,
+        cache: &SsdObjectCache,
+    ) -> TelemetryResult<Vec<CatalogGroupEntry>> {
+        let mut groups = Vec::new();
+        self.for_each_candidate_group_with(
+            range,
+            |reference| self.load_page_cached(reference, cache),
+            |group| {
+                groups.push(group.clone());
+                Ok(true)
+            },
+        )?;
+        Ok(groups)
+    }
+
     /// Loads only the final catalog page and returns its newest group entry.
     pub fn latest_group(&self) -> TelemetryResult<Option<CatalogGroupEntry>> {
         let Some(reference) = self.root.pages.last() else {
             return Ok(None);
         };
         Ok(self.load_page(reference)?.groups.last().cloned())
+    }
+
+    /// Loads the newest group through the bounded catalog-page cache.
+    pub fn latest_group_cached(
+        &self,
+        cache: &SsdObjectCache,
+    ) -> TelemetryResult<Option<CatalogGroupEntry>> {
+        let Some(reference) = self.root.pages.last() else {
+            return Ok(None);
+        };
+        Ok(self
+            .load_page_cached(reference, cache)?
+            .groups
+            .last()
+            .cloned())
     }
 
     /// Visits overlapping groups one at a time without materializing a
@@ -1666,6 +1700,15 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
     pub fn for_each_candidate_group(
         &self,
         range: TierQueryRange,
+        visit: impl FnMut(&CatalogGroupEntry) -> TelemetryResult<bool>,
+    ) -> TelemetryResult<()> {
+        self.for_each_candidate_group_with(range, |reference| self.load_page(reference), visit)
+    }
+
+    fn for_each_candidate_group_with(
+        &self,
+        range: TierQueryRange,
+        mut load_page: impl FnMut(&CatalogPageRef) -> TelemetryResult<CatalogPage>,
         mut visit: impl FnMut(&CatalogGroupEntry) -> TelemetryResult<bool>,
     ) -> TelemetryResult<()> {
         range.validate()?;
@@ -1680,7 +1723,7 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
             ) {
                 continue;
             }
-            let page = self.load_page(page_ref)?;
+            let page = load_page(page_ref)?;
             for group in &page.groups {
                 if range.overlaps(
                     group.first_offset,
@@ -1704,25 +1747,31 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
         let bytes = self
             .store
             .get(&entry.manifest_key, self.config.max_control_object_bytes)?;
-        verify_expected_object(
-            &bytes,
-            entry.manifest_bytes,
-            &entry.manifest_checksum,
-            "group manifest",
-        )?;
-        let manifest: TierGroupManifest = decode_json(&bytes, "group manifest")?;
-        manifest.validate(
-            self.shard_id,
-            self.partition,
-            self.config.max_blocks_per_group,
-            self.config.max_group_payload_bytes,
-        )?;
-        if manifest.group_sequence != entry.group_sequence {
-            return Err(TelemetryError::CorruptTier(
-                "catalog group and manifest sequences disagree".into(),
-            ));
+        self.decode_group(entry, &bytes)
+    }
+
+    /// Loads and validates a group manifest through the immutable SSD cache.
+    pub fn load_group_cached(
+        &self,
+        entry: &CatalogGroupEntry,
+        cache: &SsdObjectCache,
+    ) -> TelemetryResult<TierGroupManifest> {
+        entry.validate()?;
+        if entry.manifest_bytes > cache.max_read_bytes() {
+            return self.load_group(entry);
         }
-        Ok(manifest)
+        let metadata = ObjectMetadata {
+            bytes: entry.manifest_bytes,
+            version_token: entry.manifest_checksum.clone(),
+            content_digest: entry.manifest_checksum.clone(),
+        };
+        let bytes = cache.read_range_with_metadata(
+            &self.store,
+            &entry.manifest_key,
+            &metadata,
+            0..entry.manifest_bytes,
+        )?;
+        self.decode_group(entry, &bytes)
     }
 
     /// Reads and verifies a complete immutable artifact on demand.
@@ -1743,18 +1792,81 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
         Ok(bytes)
     }
 
+    /// Reads a complete immutable artifact through the bounded SSD cache.
+    pub fn read_artifact_cached(
+        &self,
+        artifact: &TierArtifact,
+        max_bytes: u64,
+        cache: &SsdObjectCache,
+    ) -> TelemetryResult<Vec<u8>> {
+        validate_artifact(artifact)?;
+        if artifact.bytes > max_bytes {
+            return Err(TelemetryError::ObjectStore(format!(
+                "artifact {} exceeds read limit {max_bytes}",
+                artifact.name
+            )));
+        }
+        if artifact.bytes > cache.max_read_bytes() {
+            return self.read_artifact(artifact, max_bytes);
+        }
+        let metadata = ObjectMetadata {
+            bytes: artifact.bytes,
+            version_token: artifact.checksum.clone(),
+            content_digest: artifact.checksum.clone(),
+        };
+        let bytes = cache.read_range_with_metadata(
+            &self.store,
+            &artifact.object_key,
+            &metadata,
+            0..artifact.bytes,
+        )?;
+        verify_expected_object(&bytes, artifact.bytes, &artifact.checksum, "group artifact")?;
+        Ok(bytes)
+    }
+
     fn load_page(&self, reference: &CatalogPageRef) -> TelemetryResult<CatalogPage> {
         reference.validate()?;
         let bytes = self
             .store
             .get(&reference.page_key, self.config.max_control_object_bytes)?;
+        self.decode_page(reference, &bytes)
+    }
+
+    fn load_page_cached(
+        &self,
+        reference: &CatalogPageRef,
+        cache: &SsdObjectCache,
+    ) -> TelemetryResult<CatalogPage> {
+        reference.validate()?;
+        if reference.page_bytes > cache.max_read_bytes() {
+            return self.load_page(reference);
+        }
+        let metadata = ObjectMetadata {
+            bytes: reference.page_bytes,
+            version_token: reference.page_checksum.clone(),
+            content_digest: reference.page_checksum.clone(),
+        };
+        let bytes = cache.read_range_with_metadata(
+            &self.store,
+            &reference.page_key,
+            &metadata,
+            0..reference.page_bytes,
+        )?;
+        self.decode_page(reference, &bytes)
+    }
+
+    fn decode_page(
+        &self,
+        reference: &CatalogPageRef,
+        bytes: &[u8],
+    ) -> TelemetryResult<CatalogPage> {
         verify_expected_object(
-            &bytes,
+            bytes,
             reference.page_bytes,
             &reference.page_checksum,
             "catalog page",
         )?;
-        let page: CatalogPage = decode_json(&bytes, "catalog page")?;
+        let page: CatalogPage = decode_json(bytes, "catalog page")?;
         page.validate(self.shard_id, self.partition, self.config.groups_per_page)?;
         if page.page_sequence != reference.page_sequence {
             return Err(TelemetryError::CorruptTier(
@@ -1762,6 +1874,32 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
             ));
         }
         Ok(page)
+    }
+
+    fn decode_group(
+        &self,
+        entry: &CatalogGroupEntry,
+        bytes: &[u8],
+    ) -> TelemetryResult<TierGroupManifest> {
+        verify_expected_object(
+            bytes,
+            entry.manifest_bytes,
+            &entry.manifest_checksum,
+            "group manifest",
+        )?;
+        let manifest: TierGroupManifest = decode_json(bytes, "group manifest")?;
+        manifest.validate(
+            self.shard_id,
+            self.partition,
+            self.config.max_blocks_per_group,
+            self.config.max_group_payload_bytes,
+        )?;
+        if manifest.group_sequence != entry.group_sequence {
+            return Err(TelemetryError::CorruptTier(
+                "catalog group and manifest sequences disagree".into(),
+            ));
+        }
+        Ok(manifest)
     }
 }
 
@@ -1814,6 +1952,24 @@ struct CacheState {
     entries: HashMap<String, CacheEntry>,
     used_bytes: u64,
     clock: u64,
+    hits: u64,
+    misses: u64,
+    source_bytes: u64,
+}
+
+/// Runtime diagnostics for one recoverable SSD object cache.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SsdCacheStats {
+    /// Immutable chunks currently retained on SSD.
+    pub entries: usize,
+    /// Framed bytes currently retained on SSD.
+    pub used_bytes: u64,
+    /// Successful integrity-checked SSD chunk reads since open.
+    pub hits: u64,
+    /// Chunks fetched from object storage since open.
+    pub misses: u64,
+    /// Object-store payload bytes fetched by cache misses since open.
+    pub source_bytes: u64,
 }
 
 /// Recoverable, integrity-checked SSD cache for immutable object ranges.
@@ -1875,6 +2031,27 @@ impl SsdObjectCache {
     #[must_use]
     pub fn used_bytes(&self) -> u64 {
         self.state.lock().map(|state| state.used_bytes).unwrap_or(0)
+    }
+
+    /// Returns bounded cache occupancy and read-amplification counters.
+    #[must_use]
+    pub fn stats(&self) -> SsdCacheStats {
+        self.state.lock().map_or_else(
+            |_| SsdCacheStats::default(),
+            |state| SsdCacheStats {
+                entries: state.entries.len(),
+                used_bytes: state.used_bytes,
+                hits: state.hits,
+                misses: state.misses,
+                source_bytes: state.source_bytes,
+            },
+        )
+    }
+
+    /// Returns the largest object extent accepted by one cache operation.
+    #[must_use]
+    pub const fn max_read_bytes(&self) -> u64 {
+        self.config.max_read_bytes
     }
 
     /// Reads an object range, filling and reusing fixed immutable SSD chunks.
@@ -1948,6 +2125,85 @@ impl SsdObjectCache {
         Ok(output)
     }
 
+    /// Reads sorted, non-overlapping immutable ranges while retaining the
+    /// most recently loaded cache chunk for the complete batch.
+    ///
+    /// Payload packs place block and frame extents in ascending order. A
+    /// batched query therefore reads or fetches each shared SSD chunk once
+    /// instead of reopening that chunk for every selected extent.
+    pub fn read_ranges_with_metadata<S: TelemetryObjectStore>(
+        &self,
+        store: &S,
+        object_key: &str,
+        metadata: &ObjectMetadata,
+        ranges: &[Range<u64>],
+    ) -> TelemetryResult<Vec<Vec<u8>>> {
+        if ranges.windows(2).any(|pair| pair[0].end > pair[1].start) {
+            return Err(TelemetryError::ObjectStore(
+                "batched SSD cache ranges must be sorted and non-overlapping".into(),
+            ));
+        }
+        let mut outputs = Vec::with_capacity(ranges.len());
+        let mut loaded = None::<(u64, u64, Vec<u8>)>;
+        for range in ranges {
+            if range.start > range.end
+                || range.end > metadata.bytes
+                || range.end - range.start > self.config.max_read_bytes
+            {
+                return Err(TelemetryError::ObjectStore(
+                    "batched SSD cache range is invalid or exceeds its limit".into(),
+                ));
+            }
+            let output_bytes = usize::try_from(range.end - range.start).map_err(|_| {
+                TelemetryError::ObjectStore("SSD cache read cannot fit in memory".into())
+            })?;
+            let mut output = Vec::with_capacity(output_bytes);
+            if !range.is_empty() {
+                let first_chunk = range.start / self.config.chunk_bytes;
+                let last_chunk = (range.end - 1) / self.config.chunk_bytes;
+                for chunk_index in first_chunk..=last_chunk {
+                    let chunk_start = chunk_index
+                        .checked_mul(self.config.chunk_bytes)
+                        .ok_or_else(|| {
+                            TelemetryError::ObjectStore("cache chunk offset overflow".into())
+                        })?;
+                    let chunk_end = chunk_start
+                        .saturating_add(self.config.chunk_bytes)
+                        .min(metadata.bytes);
+                    if loaded
+                        .as_ref()
+                        .is_none_or(|(index, _, _)| *index != chunk_index)
+                    {
+                        loaded = Some((
+                            chunk_index,
+                            chunk_start,
+                            self.load_or_fetch_chunk(
+                                store,
+                                object_key,
+                                metadata,
+                                chunk_index,
+                                chunk_start..chunk_end,
+                            )?,
+                        ));
+                    }
+                    let (_, loaded_start, chunk) =
+                        loaded.as_ref().expect("requested cache chunk was loaded");
+                    let copy_start = usize::try_from(range.start.max(chunk_start) - *loaded_start)
+                        .map_err(|_| {
+                            TelemetryError::ObjectStore("cache slice offset overflow".into())
+                        })?;
+                    let copy_end = usize::try_from(range.end.min(chunk_end) - *loaded_start)
+                        .map_err(|_| {
+                            TelemetryError::ObjectStore("cache slice offset overflow".into())
+                        })?;
+                    output.extend_from_slice(&chunk[copy_start..copy_end]);
+                }
+            }
+            outputs.push(output);
+        }
+        Ok(outputs)
+    }
+
     fn load_or_fetch_chunk<S: TelemetryObjectStore>(
         &self,
         store: &S,
@@ -1965,14 +2221,35 @@ impl SsdObjectCache {
                     if u64::try_from(bytes.len()).unwrap_or(u64::MAX)
                         == range.end - range.start =>
                 {
+                    self.record_cache_hit()?;
                     return Ok(bytes);
                 }
                 Ok(_) | Err(_) => self.remove_entry(&cache_key)?,
             }
         }
         let bytes = store.get_range(object_key, range)?;
+        self.record_cache_miss(u64::try_from(bytes.len()).unwrap_or(u64::MAX))?;
         self.install_chunk(&cache_key, &bytes)?;
         Ok(bytes)
+    }
+
+    fn record_cache_hit(&self) -> TelemetryResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| TelemetryError::StorageIo("SSD cache state is poisoned".into()))?;
+        state.hits = state.hits.saturating_add(1);
+        Ok(())
+    }
+
+    fn record_cache_miss(&self, bytes: u64) -> TelemetryResult<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| TelemetryError::StorageIo("SSD cache state is poisoned".into()))?;
+        state.misses = state.misses.saturating_add(1);
+        state.source_bytes = state.source_bytes.saturating_add(bytes);
+        Ok(())
     }
 
     fn cache_hit(&self, cache_key: &str) -> TelemetryResult<Option<PathBuf>> {
@@ -2992,5 +3269,104 @@ mod tests {
             .read_range(&store, "payload/object", 4..8)
             .expect("evicted chunk can be fetched again");
         assert_eq!(store.range_reads.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn batched_ssd_ranges_load_a_shared_chunk_once() {
+        let directory = TestDirectory::new("ssd-cache-batch");
+        let local =
+            LocalObjectStore::open(directory.path.join("objects")).expect("object store opens");
+        let store = CountingStore::new(local);
+        let metadata = store
+            .put_bytes_if_absent("payload/object", b"abcdefghijklmnop")
+            .expect("payload object is written");
+        let cache = SsdObjectCache::open(
+            directory.path.join("cache"),
+            SsdCacheConfig {
+                max_bytes: 4 * (CACHE_HEADER_BYTES as u64 + 4),
+                chunk_bytes: 4,
+                max_read_bytes: 16,
+            },
+        )
+        .expect("cache opens");
+        let ranges = [4..6, 6..8];
+
+        assert_eq!(
+            cache
+                .read_ranges_with_metadata(&store, "payload/object", &metadata, &ranges)
+                .expect("batched ranges read"),
+            [b"ef".to_vec(), b"gh".to_vec()]
+        );
+        assert_eq!(store.range_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.stats().misses, 1);
+        assert_eq!(cache.stats().source_bytes, 4);
+        cache
+            .read_ranges_with_metadata(&store, "payload/object", &metadata, &ranges)
+            .expect("batched ranges are served from SSD");
+        assert_eq!(store.range_reads.load(Ordering::Relaxed), 1);
+        assert_eq!(cache.stats().hits, 1);
+    }
+
+    #[test]
+    fn cached_catalog_reads_do_not_revisit_object_storage() {
+        let directory = TestDirectory::new("catalog-cache");
+        let artifacts = directory.path.join("sources");
+        fs::create_dir_all(&artifacts).expect("artifact directory is created");
+        let local =
+            LocalObjectStore::open(directory.path.join("objects")).expect("object store opens");
+        let mut tier = TelemetryObjectTier::open(
+            CountingStore::new(local),
+            ShardId::new(5),
+            partition(),
+            tier_config(16),
+        )
+        .expect("tier opens");
+        tier.publish_group(group_source(&artifacts, 0, 0, 1_000))
+            .expect("group publishes");
+        let cache = SsdObjectCache::open(
+            directory.path.join("cache"),
+            SsdCacheConfig {
+                max_bytes: 32 * (CACHE_HEADER_BYTES as u64 + 1_024),
+                chunk_bytes: 1_024,
+                max_read_bytes: 64 * 1_024,
+            },
+        )
+        .expect("cache opens");
+
+        let groups = tier
+            .candidate_groups_cached(TierQueryRange::default(), &cache)
+            .expect("catalog page loads through cache");
+        let manifest = tier
+            .load_group_cached(&groups[0], &cache)
+            .expect("manifest loads through cache");
+        let artifact = manifest
+            .artifact(TierArtifactKind::QueryIndex)
+            .expect("query index exists");
+        assert_eq!(
+            tier.read_artifact_cached(artifact, 1_024, &cache)
+                .expect("artifact loads through cache"),
+            b"query-index-0"
+        );
+        let reads_after_first_query = tier.object_store().range_reads.load(Ordering::Relaxed);
+        assert!(reads_after_first_query >= 3);
+
+        let groups = tier
+            .candidate_groups_cached(TierQueryRange::default(), &cache)
+            .expect("catalog page is cached");
+        let manifest = tier
+            .load_group_cached(&groups[0], &cache)
+            .expect("manifest is cached");
+        tier.read_artifact_cached(
+            manifest
+                .artifact(TierArtifactKind::QueryIndex)
+                .expect("query index exists"),
+            1_024,
+            &cache,
+        )
+        .expect("artifact is cached");
+        assert_eq!(
+            tier.object_store().range_reads.load(Ordering::Relaxed),
+            reads_after_first_query
+        );
     }
 }

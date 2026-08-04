@@ -24,11 +24,11 @@ use crate::{
     DurableSpan, LogMatch, LogPredicate, LogQuery, LogStripe, MetricApplyOutcome,
     MetricIngestProtocol, MetricQuery, MetricStripe, ObjectMetadata, ObjectTierConfig,
     RealtimeDictionaryObserver, RealtimeDictionaryTrainer, ShardTelemetryConfig,
-    SharedTelemetryObjectStore, SsdCacheConfig, SsdObjectCache, StripeConfig, TelemetryEnvelope,
-    TelemetryError, TelemetryObjectTier, TelemetryRecordRef, TelemetryResult, TelemetryRouter,
-    TelemetrySignal, TierArtifactKind, TierCheckpoint, TierQueryRange, TraceApplyOutcome,
-    TraceQuery, TraceStripe, decode_metric_chunk, decode_signal_recovery_state, decode_trace_block,
-    stage_signal_group,
+    SharedTelemetryObjectStore, SsdCacheConfig, SsdCacheStats, SsdObjectCache, StripeConfig,
+    TelemetryEnvelope, TelemetryError, TelemetryObjectTier, TelemetryRecordRef, TelemetryResult,
+    TelemetryRouter, TelemetrySignal, TierArtifactKind, TierCheckpoint, TierQueryRange,
+    TraceApplyOutcome, TraceQuery, TraceStripe, decode_metric_chunk, decode_signal_recovery_state,
+    decode_trace_block, stage_signal_group,
 };
 
 /// Immutable object-tier and bounded SSD-cache settings shared by sink stripes.
@@ -38,14 +38,27 @@ pub struct SinkObjectTierConfig {
     pub store: SharedTelemetryObjectStore,
     /// Local crash-safe staging directory for artifacts being published.
     pub spool_directory: PathBuf,
-    /// Local SSD range-cache directory.
-    pub cache_directory: PathBuf,
+    /// Local SSD directory reserved for catalog, manifest, and index objects.
+    pub control_cache_directory: PathBuf,
+    /// Local SSD directory reserved for compressed payload ranges.
+    pub payload_cache_directory: PathBuf,
     /// Logical partitions whose catalogs must be opened without object listing.
     pub partitions: Vec<TopicPartition>,
     /// Immutable group and catalog bounds.
     pub tier: ObjectTierConfig,
-    /// Recoverable SSD range-cache bounds.
-    pub cache: SsdCacheConfig,
+    /// Recoverable control/index cache bounds.
+    pub control_cache: SsdCacheConfig,
+    /// Recoverable payload cache bounds.
+    pub payload_cache: SsdCacheConfig,
+}
+
+/// Cache occupancy and object-read counters for the isolated cold tiers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ObjectTierCacheStats {
+    /// Catalog, manifest, recovery, and query-index cache.
+    pub control: SsdCacheStats,
+    /// Compressed log, trace, and metric payload cache.
+    pub payload: SsdCacheStats,
 }
 
 /// Configuration for shard-telemetry's per-shard native and OTLP index sinks.
@@ -111,6 +124,15 @@ impl OtlpSinkConfig {
                 "object-tier partitions must be nonempty, sorted, and unique",
             ));
         }
+        if self
+            .object_tier
+            .as_ref()
+            .is_some_and(|tier| tier.control_cache_directory == tier.payload_cache_directory)
+        {
+            return Err(TelemetryError::InvalidConfig(
+                "control and payload caches require separate directories",
+            ));
+        }
         Ok(())
     }
 }
@@ -156,6 +178,13 @@ pub struct TelemetrySinkFactory {
     checkpoints: Arc<Mutex<HashMap<TopicPartition, DurableSinkCheckpoint>>>,
     journals: Mutex<HashMap<ShardId, Arc<SinkJournal>>>,
     query_workers: Arc<Mutex<HashMap<ShardId, SyncSender<SinkCommand>>>>,
+    tier_caches: Option<TierCaches>,
+}
+
+#[derive(Debug, Clone)]
+struct TierCaches {
+    control: Arc<SsdObjectCache>,
+    payload: Arc<SsdObjectCache>,
 }
 
 #[derive(Debug)]
@@ -175,7 +204,8 @@ struct SignalTierState {
     signal: TelemetrySignal,
     tiers: HashMap<TopicPartition, TelemetryObjectTier<SharedTelemetryObjectStore>>,
     spool_directory: PathBuf,
-    cache: Arc<SsdObjectCache>,
+    control_cache: Arc<SsdObjectCache>,
+    payload_cache: Arc<SsdObjectCache>,
     config: ObjectTierConfig,
 }
 
@@ -191,7 +221,7 @@ impl SignalTierState {
         shard_id: ShardId,
         store: SharedTelemetryObjectStore,
         spool_directory: PathBuf,
-        cache: Arc<SsdObjectCache>,
+        caches: &TierCaches,
         partitions: Vec<TopicPartition>,
         config: ObjectTierConfig,
     ) -> TelemetryResult<Option<OpenedSignalTier>> {
@@ -218,16 +248,20 @@ impl SignalTierState {
                 });
             }
             if signal == TelemetrySignal::Metrics
-                && let Some(entry) = tier.latest_group()?
+                && let Some(entry) = tier.latest_group_cached(&caches.control)?
             {
-                let manifest = tier.load_group(&entry)?;
+                let manifest = tier.load_group_cached(&entry, &caches.control)?;
                 let artifact =
                     manifest
                         .artifact(TierArtifactKind::QueryIndex)
                         .ok_or_else(|| {
                             TelemetryError::CorruptTier("metric group has no recovery index".into())
                         })?;
-                let encoded = tier.read_artifact(artifact, config.max_group_payload_bytes)?;
+                let encoded = tier.read_artifact_cached(
+                    artifact,
+                    config.max_group_payload_bytes,
+                    &caches.control,
+                )?;
                 recovery_states.push(decode_signal_recovery_state(
                     &encoded,
                     TelemetrySignal::Metrics,
@@ -255,7 +289,8 @@ impl SignalTierState {
                 spool_directory: spool_directory
                     .join(format!("shard-{}", shard_id.get()))
                     .join(signal_name),
-                cache,
+                control_cache: Arc::clone(&caches.control),
+                payload_cache: Arc::clone(&caches.payload),
                 config,
             },
             checkpoints,
@@ -314,10 +349,21 @@ impl TelemetrySinkFactory {
         let mut recovered_checkpoints = HashMap::new();
         let mut recovered_transactions = Vec::new();
         let mut journals = HashMap::new();
-        let tier_cache = config
+        let tier_caches = config
             .object_tier
             .as_ref()
-            .map(|tier| SsdObjectCache::open(&tier.cache_directory, tier.cache).map(Arc::new))
+            .map(|tier| {
+                Ok::<_, TelemetryError>(TierCaches {
+                    control: Arc::new(SsdObjectCache::open(
+                        &tier.control_cache_directory,
+                        tier.control_cache,
+                    )?),
+                    payload: Arc::new(SsdObjectCache::open(
+                        &tier.payload_cache_directory,
+                        tier.payload_cache,
+                    )?),
+                })
+            })
             .transpose()?;
         for shard_id in shard_ids {
             let mut logs = match &dictionary_catalog {
@@ -331,7 +377,7 @@ impl TelemetrySinkFactory {
             if let Some(observer) = &realtime_dictionary {
                 logs.attach_realtime_dictionary(observer.clone());
             }
-            if let (Some(tier), Some(cache)) = (&config.object_tier, &tier_cache) {
+            if let (Some(tier), Some(caches)) = (&config.object_tier, &tier_caches) {
                 let log_partitions = tier
                     .partitions
                     .iter()
@@ -342,7 +388,8 @@ impl TelemetrySinkFactory {
                     for checkpoint in logs.attach_object_tier(
                         tier.store.clone(),
                         tier.spool_directory.clone(),
-                        Arc::clone(cache),
+                        Arc::clone(&caches.control),
+                        Arc::clone(&caches.payload),
                         log_partitions,
                         tier.tier,
                     )? {
@@ -362,7 +409,7 @@ impl TelemetrySinkFactory {
             }
             let mut signal_tiers = HashMap::new();
             let mut metric_recovery_states = Vec::new();
-            if let (Some(tier), Some(cache)) = (&config.object_tier, &tier_cache) {
+            if let (Some(tier), Some(caches)) = (&config.object_tier, &tier_caches) {
                 for signal in [TelemetrySignal::Traces, TelemetrySignal::Metrics] {
                     let partitions = tier
                         .partitions
@@ -375,7 +422,7 @@ impl TelemetrySinkFactory {
                         shard_id,
                         tier.store.clone(),
                         tier.spool_directory.clone(),
-                        Arc::clone(cache),
+                        caches,
                         partitions,
                         tier.tier,
                     )? {
@@ -455,6 +502,7 @@ impl TelemetrySinkFactory {
             checkpoints: Arc::new(Mutex::new(recovered_checkpoints)),
             journals: Mutex::new(journals),
             query_workers: Arc::new(Mutex::new(HashMap::new())),
+            tier_caches,
         })
     }
 
@@ -464,6 +512,7 @@ impl TelemetrySinkFactory {
     pub fn service(&self) -> TelemetryService {
         TelemetryService {
             workers: Arc::clone(&self.query_workers),
+            tier_caches: self.tier_caches.clone(),
         }
     }
 }
@@ -725,9 +774,21 @@ fn run_sink_worker(
 #[derive(Debug, Clone)]
 pub struct TelemetryService {
     workers: Arc<Mutex<HashMap<ShardId, SyncSender<SinkCommand>>>>,
+    tier_caches: Option<TierCaches>,
 }
 
 impl TelemetryService {
+    /// Returns shared cold-tier cache occupancy and object-read counters.
+    #[must_use]
+    pub fn object_tier_cache_stats(&self) -> Option<ObjectTierCacheStats> {
+        self.tier_caches
+            .as_ref()
+            .map(|caches| ObjectTierCacheStats {
+                control: caches.control.stats(),
+                payload: caches.payload.stats(),
+            })
+    }
+
     /// Fans a partition-local query across all active physical stripes.
     pub fn query_all(&self, query: &LogQuery) -> TelemetryResult<Vec<LogMatch>> {
         self.query_partitions(std::slice::from_ref(query))
@@ -1337,8 +1398,8 @@ fn read_signal_tier_payloads(
         let Some(tier) = state.tiers.get(partition) else {
             continue;
         };
-        for group in tier.candidate_groups(range)? {
-            let manifest = tier.load_group(&group)?;
+        for group in tier.candidate_groups_cached(range, &state.control_cache)? {
+            let manifest = tier.load_group_cached(&group, &state.control_cache)?;
             let artifact = manifest
                 .artifact(TierArtifactKind::PayloadPack)
                 .ok_or_else(|| TelemetryError::CorruptTier("group has no payload pack".into()))?;
@@ -1347,47 +1408,58 @@ fn read_signal_tier_payloads(
                 version_token: artifact.checksum.clone(),
                 content_digest: artifact.checksum.clone(),
             };
-            for block in manifest.blocks.iter().filter(|block| {
-                block.compression_codec == expected_codec
-                    && range.signal_identity.is_none_or(|identity| {
-                        block
-                            .min_signal_identity
-                            .zip(block.max_signal_identity)
-                            .is_some_and(|(minimum, maximum)| {
-                                identity >= minimum && identity <= maximum
-                            })
-                    })
-                    && range
-                        .min_timestamp_unix_nanos
-                        .is_none_or(|minimum| block.max_timestamp_unix_nanos >= minimum)
-                    && range
-                        .max_timestamp_unix_nanos
-                        .is_none_or(|maximum| block.min_timestamp_unix_nanos <= maximum)
-                    && correlation.is_none_or(|query| {
-                        block.correlation_filter.as_ref().is_some_and(|filter| {
-                            if state.signal == TelemetrySignal::Traces {
-                                block
-                                    .min_signal_identity
-                                    .zip(block.max_signal_identity)
-                                    .is_some_and(|(minimum, maximum)| {
-                                        filter.may_match_trace_block(query, minimum, maximum)
-                                    })
-                            } else {
-                                filter.may_match(query)
-                            }
+            let blocks = manifest
+                .blocks
+                .iter()
+                .filter(|block| {
+                    block.compression_codec == expected_codec
+                        && range.signal_identity.is_none_or(|identity| {
+                            block
+                                .min_signal_identity
+                                .zip(block.max_signal_identity)
+                                .is_some_and(|(minimum, maximum)| {
+                                    identity >= minimum && identity <= maximum
+                                })
                         })
-                    })
-            }) {
-                let end = block
-                    .payload_offset
-                    .checked_add(block.payload_bytes)
-                    .ok_or(TelemetryError::RecordTooLarge)?;
-                let payload = state.cache.read_range_with_metadata(
-                    tier.object_store(),
-                    &artifact.object_key,
-                    &metadata,
-                    block.payload_offset..end,
-                )?;
+                        && range
+                            .min_timestamp_unix_nanos
+                            .is_none_or(|minimum| block.max_timestamp_unix_nanos >= minimum)
+                        && range
+                            .max_timestamp_unix_nanos
+                            .is_none_or(|maximum| block.min_timestamp_unix_nanos <= maximum)
+                        && correlation.is_none_or(|query| {
+                            block.correlation_filter.as_ref().is_some_and(|filter| {
+                                if state.signal == TelemetrySignal::Traces {
+                                    block
+                                        .min_signal_identity
+                                        .zip(block.max_signal_identity)
+                                        .is_some_and(|(minimum, maximum)| {
+                                            filter.may_match_trace_block(query, minimum, maximum)
+                                        })
+                                } else {
+                                    filter.may_match(query)
+                                }
+                            })
+                        })
+                })
+                .collect::<Vec<_>>();
+            let ranges = blocks
+                .iter()
+                .map(|block| {
+                    let end = block
+                        .payload_offset
+                        .checked_add(block.payload_bytes)
+                        .ok_or(TelemetryError::RecordTooLarge)?;
+                    Ok(block.payload_offset..end)
+                })
+                .collect::<TelemetryResult<Vec<_>>>()?;
+            let encoded = state.payload_cache.read_ranges_with_metadata(
+                tier.object_store(),
+                &artifact.object_key,
+                &metadata,
+                &ranges,
+            )?;
+            for (block, payload) in blocks.into_iter().zip(encoded) {
                 if blake3::hash(&payload).to_hex().as_str() != block.payload_checksum {
                     return Err(TelemetryError::CorruptTier(format!(
                         "signal block {} payload checksum failed",
@@ -2118,7 +2190,8 @@ mod tests {
             object_tier: Some(SinkObjectTierConfig {
                 store: SharedTelemetryObjectStore::from(object_store),
                 spool_directory: directory.0.join("spool"),
-                cache_directory: directory.0.join("cache"),
+                control_cache_directory: directory.0.join("control-cache"),
+                payload_cache_directory: directory.0.join("payload-cache"),
                 partitions,
                 tier: ObjectTierConfig {
                     target_group_payload_bytes: 1,
@@ -2127,7 +2200,12 @@ mod tests {
                     groups_per_page: 8,
                     max_control_object_bytes: 64 * 1024,
                 },
-                cache: SsdCacheConfig {
+                control_cache: SsdCacheConfig {
+                    max_bytes: 16 * 1024 * 1024,
+                    chunk_bytes: 64 * 1024,
+                    max_read_bytes: 8 * 1024 * 1024,
+                },
+                payload_cache: SsdCacheConfig {
                     max_bytes: 16 * 1024 * 1024,
                     chunk_bytes: 64 * 1024,
                     max_read_bytes: 8 * 1024 * 1024,
@@ -2197,6 +2275,40 @@ mod tests {
             .expect("cold metric query");
         assert_eq!(points.len(), 1);
         assert_eq!(points[0].value, MetricValue::Gauge(NumberValue::Integer(7)));
+        let first_cache_stats = service
+            .object_tier_cache_stats()
+            .expect("object-tier cache diagnostics exist");
+        assert!(first_cache_stats.control.misses > 0);
+        assert!(first_cache_stats.payload.misses > 0);
+        service
+            .query_traces(&TraceQuery {
+                tenant: Arc::from("tenant-a"),
+                trace_id: Some(trace_id),
+                limit: 10,
+                ..TraceQuery::default()
+            })
+            .expect("warm trace query");
+        service
+            .query_metrics(&MetricQuery {
+                tenant: Arc::from("tenant-a"),
+                series: Some(series),
+                limit: 10,
+                ..MetricQuery::default()
+            })
+            .expect("warm metric query");
+        let warm_cache_stats = service
+            .object_tier_cache_stats()
+            .expect("object-tier cache diagnostics exist");
+        assert_eq!(
+            warm_cache_stats.control.misses,
+            first_cache_stats.control.misses
+        );
+        assert_eq!(
+            warm_cache_stats.payload.misses,
+            first_cache_stats.payload.misses
+        );
+        assert!(warm_cache_stats.control.hits > first_cache_stats.control.hits);
+        assert!(warm_cache_stats.payload.hits > first_cache_stats.payload.hits);
         let correlated = service
             .query_correlations(
                 &CorrelationQuery::new("tenant-a")
