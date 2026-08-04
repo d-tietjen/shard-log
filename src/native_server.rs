@@ -20,6 +20,15 @@ use crate::{
 pub trait NativeRequestGate: Send + Sync + std::fmt::Debug + 'static {
     /// Returns `Ok` only when this process may execute the request.
     fn check(&self) -> Result<(), String>;
+
+    /// Returns `Ok` only when this process may append every routed partition.
+    ///
+    /// The default preserves coordinator-only gates. HA products override this
+    /// method to fence each signal partition after the complete STB2 request is
+    /// decoded and before any partition append starts.
+    fn check_partitions(&self, _partitions: &[crate::NativePartitionAppend]) -> Result<(), String> {
+        self.check()
+    }
 }
 
 /// Runtime limits for the native TCP listener.
@@ -281,7 +290,7 @@ async fn dispatch(
     store: Arc<DurableLokiStore>,
     config: &NativeServerConfig,
 ) -> NativeFrame {
-    if matches!(header.opcode, NativeOpcode::Append | NativeOpcode::Query)
+    if matches!(header.opcode, NativeOpcode::Query)
         && let Some(gate) = &config.request_gate
         && let Err(error) = gate.check()
     {
@@ -330,6 +339,11 @@ async fn dispatch(
                     return error_frame(header, NativeStatus::BadRequest, &error.to_string());
                 }
             };
+            if let Some(gate) = &config.request_gate
+                && let Err(error) = gate.check_partitions(&telemetry_batch.partitions)
+            {
+                return error_frame(header, NativeStatus::Unavailable, &error);
+            }
             if let Some(runtime) = &runtime
                 && telemetry_batch
                     .partitions

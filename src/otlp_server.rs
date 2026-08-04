@@ -2,7 +2,6 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::io::Read;
 use std::net::SocketAddr;
-use std::num::NonZeroU16;
 use std::sync::Arc;
 
 use axum::Router;
@@ -34,8 +33,9 @@ use tonic::{Request, Response as GrpcResponse, Status};
 
 use crate::{
     DurableLokiStore, NativePartitionAppend, NativeTelemetryBatch, OtlpLogDecoder,
-    OtlpTelemetryDecoder, ProductionRuntime, ServiceState, TelemetryError, TelemetryResult,
-    TelemetryRouter, prepare_log_envelope, prepare_metric_envelope, prepare_trace_envelope,
+    OtlpTelemetryDecoder, ProductionRuntime, ServiceState, ShardTelemetryConfig, TelemetryError,
+    TelemetryResult, TelemetryRouter, prepare_log_envelope, prepare_metric_envelope,
+    prepare_trace_envelope,
 };
 
 /// Production OTLP receiver limits and single-tenant identity.
@@ -45,8 +45,8 @@ pub struct OtlpReceiverConfig {
     pub tenant: Arc<str>,
     /// Maximum decompressed request body. Defaults to 64 MiB.
     pub max_request_bytes: usize,
-    /// Logical partitions per signal. Defaults to 256.
-    pub logical_partitions: NonZeroU16,
+    /// Per-signal partition and bounded storage configuration.
+    pub signals: ShardTelemetryConfig,
     /// Wait for owner-stripe query visibility before acknowledging.
     pub wait_for_index: bool,
 }
@@ -56,7 +56,7 @@ impl Default for OtlpReceiverConfig {
         Self {
             tenant: Arc::from("default"),
             max_request_bytes: 64 * 1024 * 1024,
-            logical_partitions: NonZeroU16::new(256).expect("constant is nonzero"),
+            signals: ShardTelemetryConfig::default(),
             wait_for_index: true,
         }
     }
@@ -64,6 +64,7 @@ impl Default for OtlpReceiverConfig {
 
 impl OtlpReceiverConfig {
     fn validate(&self) -> TelemetryResult<()> {
+        self.signals.validate()?;
         if self.tenant.is_empty() {
             return Err(TelemetryError::InvalidConfiguration(
                 "OTLP tenant must not be empty".into(),
@@ -100,9 +101,10 @@ impl OtlpIngestService {
     /// Creates a transport-independent OTLP ingestion service.
     pub fn new(store: Arc<DurableLokiStore>, config: OtlpReceiverConfig) -> TelemetryResult<Self> {
         config.validate()?;
+        let router = TelemetryRouter::from_config(&config.signals);
         Ok(Self {
             store,
-            router: TelemetryRouter::new(config.logical_partitions),
+            router,
             config,
             production: None,
         })

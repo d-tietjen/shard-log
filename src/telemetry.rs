@@ -471,7 +471,7 @@ impl ShardTelemetryConfig {
 /// Deterministic signal-aware logical partition router.
 #[derive(Debug, Clone, Copy)]
 pub struct TelemetryRouter {
-    logical_partitions: u16,
+    logical_partitions: [u16; 3],
 }
 
 impl TelemetryRouter {
@@ -479,7 +479,19 @@ impl TelemetryRouter {
     #[must_use]
     pub const fn new(logical_partitions: NonZeroU16) -> Self {
         Self {
-            logical_partitions: logical_partitions.get(),
+            logical_partitions: [logical_partitions.get(); 3],
+        }
+    }
+
+    /// Creates a router using each signal's independently configured partition count.
+    #[must_use]
+    pub const fn from_config(config: &ShardTelemetryConfig) -> Self {
+        Self {
+            logical_partitions: [
+                config.logs.logical_partitions.get(),
+                config.traces.logical_partitions.get(),
+                config.metrics.logical_partitions.get(),
+            ],
         }
     }
 
@@ -518,6 +530,11 @@ impl TelemetryRouter {
     }
 
     fn route(&self, signal: TelemetrySignal, tenant: &str, identity: &[u8]) -> TopicPartition {
+        let signal_index = match signal {
+            TelemetrySignal::Logs => 0,
+            TelemetrySignal::Traces => 1,
+            TelemetrySignal::Metrics => 2,
+        };
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"shard-telemetry-route-v1\0");
         hasher.update(&[signal as u8]);
@@ -528,7 +545,9 @@ impl TelemetryRouter {
         let hash = u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("fixed digest"));
         TopicPartition::new(
             signal.topic_id(),
-            LogicalPartitionId::new((hash % u64::from(self.logical_partitions)) as u32),
+            LogicalPartitionId::new(
+                (hash % u64::from(self.logical_partitions[signal_index])) as u32,
+            ),
         )
     }
 }
@@ -577,6 +596,23 @@ mod tests {
             router.trace("tenant", trace_id).partition_id
         );
         assert_ne!(trace.topic_id, metric.topic_id);
+    }
+
+    #[test]
+    fn signal_router_honors_independent_partition_counts() {
+        let mut config = ShardTelemetryConfig::default();
+        config.logs.logical_partitions = NonZeroU16::new(3).unwrap();
+        config.traces.logical_partitions = NonZeroU16::new(1).unwrap();
+        config.metrics.logical_partitions = NonZeroU16::new(2).unwrap();
+        config.logs.physical_stripes = NonZeroU16::new(1).unwrap();
+        config.traces.physical_stripes = NonZeroU16::new(1).unwrap();
+        config.metrics.physical_stripes = NonZeroU16::new(1).unwrap();
+        let router = TelemetryRouter::from_config(&config);
+        let trace_id = TraceId::from_bytes([9; 16]).unwrap();
+        let series = SeriesFingerprint::from_canonical(b"independent-series");
+        assert!(router.log("tenant", None, b"stream").partition_id.get() < 3);
+        assert_eq!(router.trace("tenant", trace_id).partition_id.get(), 0);
+        assert!(router.metric("tenant", series).partition_id.get() < 2);
     }
 
     #[test]

@@ -6,9 +6,9 @@ use clap::Parser;
 use shard_telemetry::{
     DurableLokiConfig, DurableLokiStore, LokiApiConfig, NativeServerConfig, OtlpIngestService,
     OtlpReceiverConfig, ProductionRuntime, PrometheusApiConfig, PrometheusService,
-    ServiceLifecycle, SingleTenantConfig, StripeConfig, TempoApiConfig, TempoService, loki_router,
-    loki_router_with_clickhouse, otlp_http_router, prometheus_router, serve_native,
-    serve_otlp_grpc, single_tenant_loki_router, tempo_router,
+    ServiceLifecycle, ShardTelemetryConfig, SignalConfig, SingleTenantConfig, StripeConfig,
+    TempoApiConfig, TempoService, loki_router, loki_router_with_clickhouse, otlp_http_router,
+    prometheus_router, serve_native, serve_otlp_grpc, single_tenant_loki_router, tempo_router,
 };
 
 #[derive(Debug, Parser)]
@@ -196,7 +196,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&store),
         OtlpReceiverConfig {
             tenant: Arc::from(arguments.default_tenant.as_str()),
-            logical_partitions,
+            signals: ShardTelemetryConfig {
+                logs: SignalConfig {
+                    logical_partitions,
+                    ..ShardTelemetryConfig::default().logs
+                },
+                traces: SignalConfig {
+                    logical_partitions,
+                    ..ShardTelemetryConfig::default().traces
+                },
+                metrics: SignalConfig {
+                    logical_partitions,
+                    ..ShardTelemetryConfig::default().metrics
+                },
+                ..ShardTelemetryConfig::default()
+            },
             wait_for_index: true,
             ..OtlpReceiverConfig::default()
         },
