@@ -182,6 +182,83 @@ cargo run --release --bin shard-telemetry-signal-bench -- \
   --records 32768 --iterations 2000
 ```
 
+### Profile-guided hot lookup and cold-tier reads — 2026-08-04
+
+Revision `ed9f0971dc19f3e719641f723d1294b603b08088` was prewarmed once and
+measured three times sequentially on Adam physical CPU 0. The hot comparison
+uses the retained `b05123a60104eb54c463f9f63d52a76f8e0109e0` runs above with
+the same 262,144 records per signal and 2,000 lookup iterations.
+
+| Lookup | `b05123a` median | `ed9f097` median | Change | Current p50 / p99 |
+| --- | ---: | ---: | ---: | ---: |
+| Log term + exact metadata, limit 100 | 3,702.64/s | **81,787.94/s** | **22.09x** | **12.12 / 16.05 us** |
+| Trace ID | 700,272.02/s | 699,046.74/s | -0.18% | 1.38 / 1.40 us |
+| Exact metric series | 12,297.18/s | 12,227.66/s | -0.57% | 79.01 / 133.04 us |
+| Cross-signal correlation | 98,596.33/s | 98,533.71/s | -0.06% | 10.06 / 13.47 us |
+
+The log query now streams the shortest resident posting, checks the remaining
+postings by run membership, and stops after the requested offset-ordered page.
+It no longer materializes every match before truncating. Stored bytes and the
+25.02x log ratio are byte-identical to the baseline. The other lookup paths
+remain within normal run-to-run variance.
+
+The comparable 10,000-iteration `perf` workload fell from approximately
+72.36 billion to 49.84 billion sampled cycles, a **31.13% reduction**, with
+zero lost samples. `HotPostingList::collect_in` (formerly 9.25% self cost) and
+hot log matching (formerly 3.78%) no longer appear above the 0.5% reporting
+threshold. BLAKE3 fell from 6.58% to 2.56% after bounded exact-identity caches;
+correlation posting insertion is now the largest flat target at 9.56%.
+
+Cold object-tier reads were measured separately with 64 adjacent 64 KiB block
+ranges inside one 4 MiB immutable payload chunk. Each run used a new object and
+new caches; one cold query was followed by ten warm queries.
+
+| Path | Independent range reads | Batched range read | Ratio of medians |
+| --- | ---: | ---: | ---: |
+| Cold latency | 416,955.97 us | **25,756.76 us** | **16.19x** |
+| Warm latency/query | 374,601.71 us | **5,813.08 us** | **64.44x** |
+
+Both implementations fetched exactly one 4 MiB chunk from object storage. The
+independent path loaded that chunk 704 times across the cold and warm phases;
+the batched path loaded it 11 times. Production queries now use the batched
+path for selected log frames, trace blocks, and metric chunks. Catalog pages,
+group manifests, query/recovery indexes, and payload ranges are all cached and
+checksum-verified. Control/index data has a separate 8 GiB default cache, so a
+payload scan cannot evict it from the 512 GiB payload cache.
+
+The standalone cold benchmark is reproducible with:
+
+```bash
+taskset -c 0 target/release/shard-telemetry-tier-cache-bench --iterations 10
+```
+
+Retained native pinned evidence:
+
+```text
+/home/dtietjen/shard-telemetry-evidence-ed9f097
+```
+
+The three signal output hashes are:
+
+```text
+3ee42d41314136c298d0f801ae5514b62da51167fd71a1906bc7ba7b68288cd9
+dff1486e13d976f4ed40f27afd2ecb1e7da9c8da526afd65e50b7ba8f0ef82e3
+1dd041bc7f0cad62de6cf01333176f430c353e698ab092805ee0430a66ef48de
+```
+
+The three cold-tier output hashes are:
+
+```text
+2dcfabd804c0144016f1ed1b9db0d1b20ee3b3c7365f58cb8858ebe62818f158
+de41d482146f04dece67c495b6ddca5f01901a4f28760f61364f761bcd66415c
+764dda8bd5929536c917e8be313a8ccc5d45e1dacfc3301977754ebff0e0d3f1
+```
+
+The final `perf.data` SHA-256 is
+`033d73c8a439ab89cc5abf2c2266236ef1a3cc5c42bbefbe9d065eebae7e2b0d`.
+These are native revision-pinned measurements, not deterministic-simulation
+campaign evidence.
+
 ## Current single-format 80 GiB acceptance — 2026-08-04
 
 This is the current pre-release result for commit

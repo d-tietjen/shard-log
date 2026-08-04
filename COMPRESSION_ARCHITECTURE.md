@@ -46,6 +46,20 @@ the exact sorted block range, leaving the trace Bloom bits for cross-trace span
 links. Filters are computed while source records are still owned by the stripe
 and survive object-tier restart without retaining record bodies in RAM.
 
+Cold queries keep immutable control and payload data in separate recoverable
+SSD caches. Catalog pages, group manifests, query indexes, and metric recovery
+indexes use the bounded control cache; compressed log frames, trace blocks,
+and metric chunks use the payload cache. The standalone defaults reserve 8 GiB
+and 512 GiB respectively. Both caches verify object checksums and per-chunk
+integrity before returning bytes, and expose hit, miss, occupancy, and source
+byte counters through `TelemetryService`.
+
+Selected payload extents are sorted and read as one batch. The cache retains
+the current 4 MiB chunk in memory while copying adjacent block ranges, so one
+query neither reopens the same SSD chunk for every block nor repeats an object
+range request. This is an execution optimization only: every block retains its
+own checksum and is verified independently before decode.
+
 The Adam error-loop corpus reached 33.13x with bzip2 and 27.56x with zstd-9 as
 raw 8 MiB blocks. A trained dictionary and the current line-template prototype
 did not improve that corpus materially. That is evidence to optimize data
@@ -598,9 +612,9 @@ Current limitations are explicit:
 - Arbitrary LogQL substring and regex predicates remain residual filters.
   The older sealed-block query directory has trigram rejection, but those
   trigrams have not yet been folded into the compressor-derived frame index.
-- Compressed frames are resident in the stripe after recovery. The next storage
-  step is publishing the same frame descriptors through the SSD/object-tier
-  catalog and retaining only directory/index state for cold frames.
+- Cold queries still decode each selected signal-native block. The next
+  storage step is adding bounded asynchronous prefetch and more selective
+  trace/metric lane decoding without weakening exact reconstruction.
 - The native decoder still materializes owned strings before structural
   encoding. A borrowed native-record view would remove the UTF-8 validation,
   allocation, and free costs visible in the current production profile.
