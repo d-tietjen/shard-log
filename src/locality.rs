@@ -12,7 +12,7 @@ use std::ops::Range;
 use bytes::{BufMut, Bytes, BytesMut};
 use bytes_handoff::{HandoffBuffer, HandoffBufferConfig, HandoffBufferPolicy};
 
-use crate::{CompressionCohortId, LogDbError, LogDbResult, MetadataField};
+use crate::{CompressionCohortId, MetadataField, TelemetryError, TelemetryResult};
 
 const MAX_ROUTER_STATE_BYTES: usize = 512 * 1024;
 const MAX_COMPRESSION_SHARDS: usize = 16;
@@ -409,10 +409,13 @@ pub struct CompressionBlockCollator {
 
 impl CompressionBlockCollator {
     /// Creates preallocated collation state for one stripe.
-    pub fn new(config: CompressionLocalityConfig, target_block_bytes: u64) -> LogDbResult<Self> {
-        config.validate().map_err(LogDbError::InvalidConfig)?;
+    pub fn new(
+        config: CompressionLocalityConfig,
+        target_block_bytes: u64,
+    ) -> TelemetryResult<Self> {
+        config.validate().map_err(TelemetryError::InvalidConfig)?;
         if target_block_bytes == 0 {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "locality target_block_bytes must be nonzero",
             ));
         }
@@ -1592,7 +1595,9 @@ mod tests {
         .expect_err("zero compression shards is invalid");
         assert_eq!(
             error,
-            LogDbError::InvalidConfig("locality max_compression_shards must be between 1 and 16")
+            TelemetryError::InvalidConfig(
+                "locality max_compression_shards must be between 1 and 16"
+            )
         );
     }
 }

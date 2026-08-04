@@ -13,22 +13,21 @@ use shard_stream_engine::{
     DurableSinkCheckpoint, EngineError, EngineResult,
 };
 
-use crate::ingest_pack::{
-    decode_ingest_pack, is_ingest_pack, prepare_ingest_pack, validate_ingest_pack,
-};
+use crate::ingest_pack::validate_ingest_pack;
 use crate::sink_journal::{SinkJournal, checkpoint_allows_lane_gap};
 use crate::{
-    DictionaryCatalog, LogDbError, LogDbResult, LogMatch, LogQuery, LogStripe, ObjectTierConfig,
-    OtlpLogDecoder, OtlpLogEvent, RealtimeDictionaryObserver, RealtimeDictionaryTrainer,
-    SharedLogObjectStore, SsdCacheConfig, SsdObjectCache, StripeConfig, decode_native_log_events,
-    inspect_native_log_batch, is_native_log_batch, validate_native_log_batch,
+    DictionaryCatalog, DurableMetricPoint, DurableSpan, LogMatch, LogQuery, LogStripe,
+    MetricIngestProtocol, MetricQuery, MetricStripe, ObjectTierConfig, RealtimeDictionaryObserver,
+    RealtimeDictionaryTrainer, ShardTelemetryConfig, SharedTelemetryObjectStore, SsdCacheConfig,
+    SsdObjectCache, StripeConfig, TelemetryEnvelope, TelemetryError, TelemetryResult,
+    TelemetrySignal, TraceQuery, TraceStripe, decode_metric_chunk, decode_trace_block,
 };
 
 /// Immutable object-tier and bounded SSD-cache settings shared by sink stripes.
 #[derive(Debug, Clone)]
 pub struct SinkObjectTierConfig {
     /// Object-store adapter used for immutable data and catalog publication.
-    pub store: SharedLogObjectStore,
+    pub store: SharedTelemetryObjectStore,
     /// Local crash-safe staging directory for artifacts being published.
     pub spool_directory: PathBuf,
     /// Local SSD range-cache directory.
@@ -41,11 +40,13 @@ pub struct SinkObjectTierConfig {
     pub cache: SsdCacheConfig,
 }
 
-/// Configuration for shard-log's per-shard native and OTLP index sinks.
+/// Configuration for shard-telemetry's per-shard native and OTLP index sinks.
 #[derive(Debug, Clone)]
 pub struct OtlpSinkConfig {
     /// Hot index and dictionary-cache limits for each physical shard.
     pub stripe: StripeConfig,
+    /// Per-signal partition, retention, head-memory, and query limits.
+    pub signals: ShardTelemetryConfig,
     /// Number of durable append batches waiting to be indexed per shard.
     pub queue_slots: usize,
     /// Directory containing crash-safe stripe-local sink journals.
@@ -62,6 +63,7 @@ impl Default for OtlpSinkConfig {
     fn default() -> Self {
         Self {
             stripe: StripeConfig::default(),
+            signals: ShardTelemetryConfig::default(),
             queue_slots: 256,
             state_directory: None,
             max_journal_bytes: 64 * 1024 * 1024 * 1024,
@@ -71,21 +73,22 @@ impl Default for OtlpSinkConfig {
 }
 
 impl OtlpSinkConfig {
-    fn validate(&self) -> LogDbResult<()> {
+    fn validate(&self) -> TelemetryResult<()> {
+        self.signals.validate()?;
         if self.queue_slots == 0 {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "log sink queue_slots must be nonzero",
             ));
         }
         if self.max_journal_bytes < 8 {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "log sink max_journal_bytes must fit its header",
             ));
         }
         if self.object_tier.as_ref().is_some_and(|tier| {
             tier.partitions.is_empty() || tier.partitions.windows(2).any(|pair| pair[0] >= pair[1])
         }) {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "object-tier partitions must be nonempty, sorted, and unique",
             ));
         }
@@ -102,7 +105,7 @@ fn checkpoint_covers(checkpoint: DurableSinkCheckpoint, candidate: DurableSinkCh
 fn merge_recovered_checkpoint(
     checkpoints: &mut HashMap<TopicPartition, DurableSinkCheckpoint>,
     candidate: DurableSinkCheckpoint,
-) -> LogDbResult<()> {
+) -> TelemetryResult<()> {
     match checkpoints.get(&candidate.topic_partition).copied() {
         None => {
             checkpoints.insert(candidate.topic_partition, candidate);
@@ -112,7 +115,7 @@ fn merge_recovered_checkpoint(
             checkpoints.insert(candidate.topic_partition, candidate);
         }
         Some(_) => {
-            return Err(LogDbError::CorruptTier(
+            return Err(TelemetryError::CorruptTier(
                 "object-tier checkpoints are not monotonically comparable".into(),
             ));
         }
@@ -128,20 +131,28 @@ fn merge_recovered_checkpoint(
 /// worker owns the mutable [`LogStripe`] without a shared-map lock on the
 /// indexing path.
 #[derive(Debug)]
-pub struct ShardLogSinkFactory {
+pub struct TelemetrySinkFactory {
     config: OtlpSinkConfig,
-    available: Mutex<HashMap<ShardId, LogStripe>>,
+    available: Mutex<HashMap<ShardId, TelemetryStripeState>>,
     checkpoints: Arc<Mutex<HashMap<TopicPartition, DurableSinkCheckpoint>>>,
     journals: Mutex<HashMap<ShardId, Arc<SinkJournal>>>,
     query_workers: Arc<Mutex<HashMap<ShardId, SyncSender<SinkCommand>>>>,
 }
 
-impl ShardLogSinkFactory {
+#[derive(Debug)]
+struct TelemetryStripeState {
+    stream_shard_id: ShardId,
+    logs: LogStripe,
+    traces: TraceStripe,
+    metrics: MetricStripe,
+}
+
+impl TelemetrySinkFactory {
     /// Creates a factory with one stripe available for each physical shard.
     pub fn new(
         shard_ids: impl IntoIterator<Item = ShardId>,
         config: OtlpSinkConfig,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         Self::new_with_optional_dictionary_catalog(shard_ids, config, None, None)
     }
 
@@ -151,7 +162,7 @@ impl ShardLogSinkFactory {
         shard_ids: impl IntoIterator<Item = ShardId>,
         config: OtlpSinkConfig,
         dictionary_catalog: Arc<DictionaryCatalog>,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         Self::new_with_optional_dictionary_catalog(
             shard_ids,
             config,
@@ -166,7 +177,7 @@ impl ShardLogSinkFactory {
         shard_ids: impl IntoIterator<Item = ShardId>,
         config: OtlpSinkConfig,
         trainer: &RealtimeDictionaryTrainer,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         Self::new_with_optional_dictionary_catalog(
             shard_ids,
             config,
@@ -180,7 +191,7 @@ impl ShardLogSinkFactory {
         config: OtlpSinkConfig,
         dictionary_catalog: Option<Arc<DictionaryCatalog>>,
         realtime_dictionary: Option<RealtimeDictionaryObserver>,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         config.validate()?;
         let mut available = HashMap::new();
         let mut recovered_checkpoints = HashMap::new();
@@ -192,7 +203,7 @@ impl ShardLogSinkFactory {
             .map(|tier| SsdObjectCache::open(&tier.cache_directory, tier.cache).map(Arc::new))
             .transpose()?;
         for shard_id in shard_ids {
-            let mut stripe = match &dictionary_catalog {
+            let mut logs = match &dictionary_catalog {
                 Some(dictionary_catalog) => LogStripe::with_dictionary_catalog(
                     shard_id,
                     config.stripe.clone(),
@@ -201,10 +212,10 @@ impl ShardLogSinkFactory {
                 None => LogStripe::new(shard_id, config.stripe.clone())?,
             };
             if let Some(observer) = &realtime_dictionary {
-                stripe.attach_realtime_dictionary(observer.clone());
+                logs.attach_realtime_dictionary(observer.clone());
             }
             if let (Some(tier), Some(cache)) = (&config.object_tier, &tier_cache) {
-                for checkpoint in stripe.attach_object_tier(
+                for checkpoint in logs.attach_object_tier(
                     tier.store.clone(),
                     tier.spool_directory.clone(),
                     Arc::clone(cache),
@@ -224,12 +235,18 @@ impl ShardLogSinkFactory {
                 );
                 journals.insert(shard_id, Arc::new(journal));
             }
+            let stripe = TelemetryStripeState {
+                stream_shard_id: shard_id,
+                logs,
+                traces: TraceStripe::new(config.signals.traces.head_memory_bytes_per_stripe)?,
+                metrics: MetricStripe::new(config.signals.metrics.head_memory_bytes_per_stripe)?,
+            };
             if available.insert(shard_id, stripe).is_some() {
-                return Err(LogDbError::DuplicateStripe(shard_id));
+                return Err(TelemetryError::DuplicateStripe(shard_id));
             }
         }
         if available.is_empty() {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "log sink requires at least one shard",
             ));
         }
@@ -251,22 +268,21 @@ impl ShardLogSinkFactory {
                 continue;
             }
             if !checkpoint_allows_lane_gap(actual, transaction.expected) {
-                return Err(LogDbError::CorruptSinkJournal(
+                return Err(TelemetryError::CorruptSinkJournal(
                     "recovered checkpoint chain conflicts across stripes".into(),
                 ));
             }
             let stripe = available
                 .get_mut(&shard_id)
-                .ok_or(LogDbError::UnknownStripe(shard_id))?;
-            for append in transaction.appends {
-                let events = decode_log_events(&append.payload)?;
-                let prepared = prepare_ingest_pack(&events)?;
-                stripe.apply_checkpointed_ingest_pack(
+                .ok_or(TelemetryError::UnknownStripe(shard_id))?;
+            for append in &transaction.appends {
+                index_payload(
+                    stripe,
                     append.topic_partition,
                     append.first_offset,
-                    u32::try_from(events.len()).map_err(|_| LogDbError::RecordTooLarge)?,
-                    Bytes::from(prepared.payload),
-                    Some(&prepared.transient_context),
+                    None,
+                    &append.payload,
+                    None,
                     (transaction.expected, transaction.next),
                 )?;
             }
@@ -284,41 +300,45 @@ impl ShardLogSinkFactory {
     /// Returns a cloneable coordinator for querying the owner-only stripe
     /// workers after they have been opened by shard-stream.
     #[must_use]
-    pub fn service(&self) -> ShardLogService {
-        ShardLogService {
+    pub fn service(&self) -> TelemetryService {
+        TelemetryService {
             workers: Arc::clone(&self.query_workers),
         }
     }
 }
 
-impl DurableAppendSinkFactory for ShardLogSinkFactory {
+impl DurableAppendSinkFactory for TelemetrySinkFactory {
     fn validate_append(&self, payload: &[u8], record_count: NonZeroU32) -> EngineResult<()> {
-        if is_ingest_pack(payload) {
-            return validate_ingest_pack(payload, record_count.get()).map_err(log_error_to_engine);
+        if !TelemetryEnvelope::is_encoded(payload) {
+            return Err(EngineError::InvalidConfig(
+                "durable telemetry appends require the STEL envelope".into(),
+            ));
         }
-        if is_native_log_batch(payload) {
-            validate_native_log_batch(payload)
-                .map_err(|error| EngineError::InvalidConfig(error.to_string()))?;
-            let decoded_count = inspect_native_log_batch(payload)
-                .map_err(|error| EngineError::InvalidConfig(error.to_string()))?
-                .record_count;
-            if decoded_count != record_count.get() {
-                return Err(EngineError::InvalidConfig(format!(
-                    "log batch contains {decoded_count} records, request reserved {}",
-                    record_count.get()
-                )));
-            }
-            return Ok(());
-        }
-        let decoded = decode_log_events(payload).map_err(log_error_to_engine)?;
-        let decoded_count = u32::try_from(decoded.len()).map_err(|_| {
-            EngineError::InvalidConfig("log batch contains more than u32 records".into())
-        })?;
-        if decoded_count != record_count.get() {
+        let envelope = TelemetryEnvelope::decode(payload).map_err(log_error_to_engine)?;
+        if envelope.item_count != record_count.get() {
             return Err(EngineError::InvalidConfig(format!(
-                "log batch contains {decoded_count} records, request reserved {}",
+                "STEL envelope contains {} items, request reserved {}",
+                envelope.item_count,
                 record_count.get()
             )));
+        }
+        let decoded_count = match envelope.signal {
+            TelemetrySignal::Logs => {
+                validate_ingest_pack(&envelope.payload, envelope.item_count)
+                    .map_err(log_error_to_engine)?;
+                envelope.item_count as usize
+            }
+            TelemetrySignal::Traces => decode_trace_block(&envelope.payload)
+                .map_err(log_error_to_engine)?
+                .len(),
+            TelemetrySignal::Metrics => decode_metric_chunk(&envelope.payload)
+                .map_err(log_error_to_engine)?
+                .len(),
+        };
+        if decoded_count != envelope.item_count as usize {
+            return Err(EngineError::InvalidConfig(
+                "STEL signal payload item count mismatch".into(),
+            ));
         }
         Ok(())
     }
@@ -331,7 +351,9 @@ impl DurableAppendSinkFactory for ShardLogSinkFactory {
             .lock()
             .map(|checkpoints| checkpoints.get(&topic_partition).copied())
             .map_err(|_| {
-                EngineError::DurableSinkUnavailable("shard-log checkpoint lock poisoned".into())
+                EngineError::DurableSinkUnavailable(
+                    "shard-telemetry checkpoint lock poisoned".into(),
+                )
             })
     }
 
@@ -339,7 +361,9 @@ impl DurableAppendSinkFactory for ShardLogSinkFactory {
         let stripe = self
             .available
             .lock()
-            .map_err(|_| EngineError::CorruptState("shard-log sink factory lock poisoned".into()))?
+            .map_err(|_| {
+                EngineError::CorruptState("shard-telemetry sink factory lock poisoned".into())
+            })?
             .remove(&shard_id)
             .ok_or(EngineError::UnknownShard(shard_id))?;
         let (sender, receiver) = sync_channel(self.config.queue_slots);
@@ -347,19 +371,21 @@ impl DurableAppendSinkFactory for ShardLogSinkFactory {
         let journal = self
             .journals
             .lock()
-            .map_err(|_| EngineError::CorruptState("shard-log journal lock poisoned".into()))?
+            .map_err(|_| EngineError::CorruptState("shard-telemetry journal lock poisoned".into()))?
             .remove(&shard_id);
         let worker = thread::Builder::new()
-            .name(format!("shard-log-index-{shard_id}"))
+            .name(format!("shard-telemetry-index-{shard_id}"))
             .spawn(move || run_sink_worker(stripe, checkpoints, journal, receiver))
             .map_err(|error| {
-                EngineError::InvalidConfig(format!("failed to spawn shard-log sink: {error}"))
+                EngineError::InvalidConfig(format!("failed to spawn shard-telemetry sink: {error}"))
             })?;
         self.query_workers
             .lock()
-            .map_err(|_| EngineError::CorruptState("shard-log query registry poisoned".into()))?
+            .map_err(|_| {
+                EngineError::CorruptState("shard-telemetry query registry poisoned".into())
+            })?
             .insert(shard_id, sender.clone());
-        Ok(Arc::new(ShardLogStripeSink {
+        Ok(Arc::new(ShardTelemetryStripeSink {
             state: Arc::new(SinkState {
                 shard_id,
                 sender: Mutex::new(Some(sender)),
@@ -381,10 +407,18 @@ enum SinkCommand {
     Apply(SinkApplyCommand),
     Query {
         queries: Vec<LogQuery>,
-        response: SyncSender<LogDbResult<Vec<LogMatch>>>,
+        response: SyncSender<TelemetryResult<Vec<LogMatch>>>,
+    },
+    QueryTraces {
+        query: TraceQuery,
+        response: SyncSender<TelemetryResult<Vec<DurableSpan>>>,
+    },
+    QueryMetrics {
+        query: MetricQuery,
+        response: SyncSender<TelemetryResult<Vec<DurableMetricPoint>>>,
     },
     Flush {
-        response: SyncSender<LogDbResult<usize>>,
+        response: SyncSender<TelemetryResult<usize>>,
     },
     RetainedPayloadBytes {
         response: SyncSender<u64>,
@@ -415,20 +449,20 @@ impl Drop for SinkState {
 }
 
 #[derive(Clone)]
-struct ShardLogStripeSink {
+struct ShardTelemetryStripeSink {
     state: Arc<SinkState>,
 }
 
-impl fmt::Debug for ShardLogStripeSink {
+impl fmt::Debug for ShardTelemetryStripeSink {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ShardLogStripeSink")
+            .debug_struct("ShardTelemetryStripeSink")
             .field("shard_id", &self.state.shard_id)
             .finish_non_exhaustive()
     }
 }
 
-impl DurableAppendSink for ShardLogStripeSink {
+impl DurableAppendSink for ShardTelemetryStripeSink {
     fn apply(
         &self,
         expected: DurableSinkCheckpoint,
@@ -440,7 +474,7 @@ impl DurableAppendSink for ShardLogStripeSink {
             .state
             .sender
             .lock()
-            .map_err(|_| EngineError::CorruptState("shard-log sink lock poisoned".into()))?
+            .map_err(|_| EngineError::CorruptState("shard-telemetry sink lock poisoned".into()))?
             .as_ref()
             .cloned()
             .ok_or(EngineError::WorkerStopped(self.state.shard_id))?;
@@ -459,7 +493,7 @@ impl DurableAppendSink for ShardLogStripeSink {
 }
 
 fn run_sink_worker(
-    mut stripe: LogStripe,
+    mut stripe: TelemetryStripeState,
     checkpoints: Arc<Mutex<HashMap<TopicPartition, DurableSinkCheckpoint>>>,
     journal: Option<Arc<SinkJournal>>,
     receiver: Receiver<SinkCommand>,
@@ -479,8 +513,8 @@ fn run_sink_worker(
                 if let Err(error) = &result {
                     if !apply_failure_reported {
                         eprintln!(
-                            "shard-log stripe {} durable apply failed and will be retried: {error}",
-                            stripe.stream_shard_id()
+                            "shard-telemetry stripe {} durable apply failed and will be retried: {error}",
+                            stripe.stream_shard_id
                         );
                     }
                     apply_failure_reported = true;
@@ -490,15 +524,21 @@ fn run_sink_worker(
                 let _ = command.response.send(result);
             }
             SinkCommand::Query { queries, response } => {
-                let result = stripe.query_partitions_checked(&queries);
+                let result = stripe.logs.query_partitions_checked(&queries);
                 let _ = response.send(result);
             }
+            SinkCommand::QueryTraces { query, response } => {
+                let _ = response.send(Ok(stripe.traces.query(&query)));
+            }
+            SinkCommand::QueryMetrics { query, response } => {
+                let _ = response.send(stripe.metrics.query(&query));
+            }
             SinkCommand::Flush { response } => {
-                let result = stripe.offload_indexed_groups(true);
+                let result = stripe.logs.offload_indexed_groups(true);
                 let _ = response.send(result);
             }
             SinkCommand::RetainedPayloadBytes { response } => {
-                let _ = response.send(stripe.retained_payload_bytes());
+                let _ = response.send(stripe.logs.retained_payload_bytes());
             }
         }
     }
@@ -508,26 +548,94 @@ fn run_sink_worker(
 ///
 /// Queries are sent to every active owner thread first, allowing the bounded
 /// stripe lookups to execute in parallel, and are then merged in the same
-/// deterministic order used by [`crate::ShardLogDb`].
+/// deterministic order used by [`crate::ShardTelemetry`].
 #[derive(Debug, Clone)]
-pub struct ShardLogService {
+pub struct TelemetryService {
     workers: Arc<Mutex<HashMap<ShardId, SyncSender<SinkCommand>>>>,
 }
 
-impl ShardLogService {
+impl TelemetryService {
     /// Fans a partition-local query across all active physical stripes.
-    pub fn query_all(&self, query: &LogQuery) -> LogDbResult<Vec<LogMatch>> {
+    pub fn query_all(&self, query: &LogQuery) -> TelemetryResult<Vec<LogMatch>> {
         self.query_partitions(std::slice::from_ref(query))
     }
 
+    /// Fans a native trace query across all owner stripes and merges by trace/start/offset.
+    pub fn query_traces(&self, query: &TraceQuery) -> TelemetryResult<Vec<DurableSpan>> {
+        let workers = self.worker_senders()?;
+        let mut responses = Vec::with_capacity(workers.len());
+        for (shard_id, sender) in workers {
+            let (response, receiver) = sync_channel(1);
+            sender
+                .send(SinkCommand::QueryTraces {
+                    query: query.clone(),
+                    response,
+                })
+                .map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped before accepting a trace query"
+                    ))
+                })?;
+            responses.push((shard_id, receiver));
+        }
+        let mut spans = Vec::new();
+        for (shard_id, receiver) in responses {
+            spans.extend(receiver.recv().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(format!(
+                    "stripe {shard_id} stopped while querying traces"
+                ))
+            })??);
+        }
+        spans.sort_unstable_by_key(|span| {
+            (
+                span.trace_id,
+                span.start_time_unix_nanos,
+                span.record_ref.offset,
+            )
+        });
+        spans.truncate(query.limit.max(1));
+        Ok(spans)
+    }
+
+    /// Fans a native raw metric query across all owner stripes and merges by time/offset.
+    pub fn query_metrics(&self, query: &MetricQuery) -> TelemetryResult<Vec<DurableMetricPoint>> {
+        let workers = self.worker_senders()?;
+        let mut responses = Vec::with_capacity(workers.len());
+        for (shard_id, sender) in workers {
+            let (response, receiver) = sync_channel(1);
+            sender
+                .send(SinkCommand::QueryMetrics {
+                    query: query.clone(),
+                    response,
+                })
+                .map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped before accepting a metric query"
+                    ))
+                })?;
+            responses.push((shard_id, receiver));
+        }
+        let mut points = Vec::new();
+        for (shard_id, receiver) in responses {
+            points.extend(receiver.recv().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(format!(
+                    "stripe {shard_id} stopped while querying metrics"
+                ))
+            })??);
+        }
+        points.sort_unstable_by_key(|point| (point.timestamp_unix_nanos, point.record_ref.offset));
+        points.truncate(query.limit.max(1));
+        Ok(points)
+    }
+
     /// Forces every owner stripe to publish complete pending append boundaries.
-    pub fn flush_object_tier(&self) -> LogDbResult<usize> {
+    pub fn flush_object_tier(&self) -> TelemetryResult<usize> {
         let workers = self.worker_senders()?;
         let mut responses = Vec::with_capacity(workers.len());
         for (shard_id, sender) in workers {
             let (response, receiver) = sync_channel(1);
             sender.send(SinkCommand::Flush { response }).map_err(|_| {
-                LogDbError::QueryWorkerUnavailable(format!(
+                TelemetryError::QueryWorkerUnavailable(format!(
                     "stripe {shard_id} stopped before accepting a flush"
                 ))
             })?;
@@ -537,7 +645,7 @@ impl ShardLogService {
             .into_iter()
             .try_fold(0usize, |total, (shard_id, receiver)| {
                 let published = receiver.recv().map_err(|_| {
-                    LogDbError::QueryWorkerUnavailable(format!(
+                    TelemetryError::QueryWorkerUnavailable(format!(
                         "stripe {shard_id} stopped while flushing"
                     ))
                 })??;
@@ -546,7 +654,7 @@ impl ShardLogService {
     }
 
     /// Returns compressed bytes still resident while awaiting a complete group.
-    pub fn retained_payload_bytes(&self) -> LogDbResult<u64> {
+    pub fn retained_payload_bytes(&self) -> TelemetryResult<u64> {
         let workers = self.worker_senders()?;
         let mut responses = Vec::with_capacity(workers.len());
         for (shard_id, sender) in workers {
@@ -554,7 +662,7 @@ impl ShardLogService {
             sender
                 .send(SinkCommand::RetainedPayloadBytes { response })
                 .map_err(|_| {
-                    LogDbError::QueryWorkerUnavailable(format!(
+                    TelemetryError::QueryWorkerUnavailable(format!(
                         "stripe {shard_id} stopped before reporting resident bytes"
                     ))
                 })?;
@@ -564,7 +672,7 @@ impl ShardLogService {
             .into_iter()
             .try_fold(0u64, |total, (shard_id, receiver)| {
                 let bytes = receiver.recv().map_err(|_| {
-                    LogDbError::QueryWorkerUnavailable(format!(
+                    TelemetryError::QueryWorkerUnavailable(format!(
                         "stripe {shard_id} stopped while reporting resident bytes"
                     ))
                 })?;
@@ -572,26 +680,26 @@ impl ShardLogService {
             })
     }
 
-    fn worker_senders(&self) -> LogDbResult<Vec<(ShardId, SyncSender<SinkCommand>)>> {
+    fn worker_senders(&self) -> TelemetryResult<Vec<(ShardId, SyncSender<SinkCommand>)>> {
         let mut workers = self
             .workers
             .lock()
             .map_err(|_| {
-                LogDbError::QueryWorkerUnavailable("query registry lock is poisoned".into())
+                TelemetryError::QueryWorkerUnavailable("query registry lock is poisoned".into())
             })?
             .iter()
             .map(|(shard_id, sender)| (*shard_id, sender.clone()))
             .collect::<Vec<_>>();
         workers.sort_unstable_by_key(|(shard_id, _)| *shard_id);
         if workers.is_empty() {
-            return Err(LogDbError::QueryWorkerUnavailable(
+            return Err(TelemetryError::QueryWorkerUnavailable(
                 "no stripe workers are active".into(),
             ));
         }
         Ok(workers)
     }
 
-    pub(crate) fn query_partitions(&self, queries: &[LogQuery]) -> LogDbResult<Vec<LogMatch>> {
+    pub(crate) fn query_partitions(&self, queries: &[LogQuery]) -> TelemetryResult<Vec<LogMatch>> {
         let Some(ordering_query) = queries.first() else {
             return Ok(Vec::new());
         };
@@ -606,7 +714,7 @@ impl ShardLogService {
                     response,
                 })
                 .map_err(|_| {
-                    LogDbError::QueryWorkerUnavailable(format!(
+                    TelemetryError::QueryWorkerUnavailable(format!(
                         "stripe {shard_id} stopped before accepting a query"
                     ))
                 })?;
@@ -616,7 +724,7 @@ impl ShardLogService {
         let mut matches = Vec::new();
         for (shard_id, receiver) in responses {
             matches.extend(receiver.recv().map_err(|_| {
-                LogDbError::QueryWorkerUnavailable(format!(
+                TelemetryError::QueryWorkerUnavailable(format!(
                     "stripe {shard_id} stopped while executing a query"
                 ))
             })??);
@@ -638,7 +746,7 @@ impl ShardLogService {
 }
 
 fn apply_durable_appends(
-    stripe: &mut LogStripe,
+    stripe: &mut TelemetryStripeState,
     checkpoints: &Mutex<HashMap<TopicPartition, DurableSinkCheckpoint>>,
     journal: Option<&SinkJournal>,
     expected: DurableSinkCheckpoint,
@@ -662,7 +770,7 @@ fn apply_durable_appends(
     let actual = checkpoints
         .lock()
         .map_err(|_| {
-            EngineError::DurableSinkUnavailable("shard-log checkpoint lock poisoned".into())
+            EngineError::DurableSinkUnavailable("shard-telemetry checkpoint lock poisoned".into())
         })?
         .get(&expected.topic_partition)
         .copied()
@@ -678,82 +786,176 @@ fn apply_durable_appends(
     }
     index_durable_appends(stripe, appends, expected, next).map_err(log_error_to_engine)?;
     stripe
+        .logs
         .offload_indexed_groups(false)
         .map_err(log_error_to_engine)?;
     checkpoints
         .lock()
         .map_err(|_| {
-            EngineError::DurableSinkUnavailable("shard-log checkpoint lock poisoned".into())
+            EngineError::DurableSinkUnavailable("shard-telemetry checkpoint lock poisoned".into())
         })?
         .insert(next.topic_partition, next);
     Ok(DurableSinkApply::Applied)
 }
 
 fn index_durable_appends(
-    stripe: &mut LogStripe,
+    stripe: &mut TelemetryStripeState,
     appends: &[DurableAppend],
     expected: DurableSinkCheckpoint,
     next: DurableSinkCheckpoint,
-) -> LogDbResult<()> {
+) -> TelemetryResult<()> {
     for append in appends {
-        if append.physical_shard_id != stripe.stream_shard_id() {
-            return Err(LogDbError::WrongStripe {
-                expected: stripe.stream_shard_id(),
+        if append.physical_shard_id != stripe.stream_shard_id {
+            return Err(TelemetryError::WrongStripe {
+                expected: stripe.stream_shard_id,
                 observed: append.physical_shard_id,
             });
         }
         let topic_partition =
             TopicPartition::new(append.reservation.topic_id, append.reservation.partition_id);
-        if is_ingest_pack(&append.payload) {
-            stripe.apply_checkpointed_ingest_pack(
-                topic_partition,
-                append.reservation.first_offset,
-                append.reservation.record_count.get(),
-                append.payload.clone(),
-                append.transient_context.as_deref(),
-                (expected, next),
-            )?;
-            continue;
-        }
-        let events = match append.transient_context.as_deref() {
-            Some(context) if is_native_log_batch(context) => decode_native_log_events(context)
-                .map(|(_, events)| events)
-                .map_err(|error| LogDbError::InvalidNativePayload(error.to_string()))?,
-            _ => decode_log_events(&append.payload)?,
-        };
-        let decoded_count = u32::try_from(events.len())
-            .map_err(|_| LogDbError::InvalidConfig("log batch contains more than u32 records"))?;
-        if decoded_count != append.reservation.record_count.get() {
-            return Err(LogDbError::InvalidConfig(
-                "durable log append record count disagrees with its decoded batch",
-            ));
-        }
-        let prepared = prepare_ingest_pack(&events)?;
-        stripe.apply_checkpointed_ingest_pack(
+        index_payload(
+            stripe,
             topic_partition,
             append.reservation.first_offset,
-            decoded_count,
-            Bytes::from(prepared.payload),
-            Some(&prepared.transient_context),
+            Some(append.reservation.record_count.get()),
+            &append.payload,
+            append.transient_context.as_deref(),
             (expected, next),
         )?;
     }
     Ok(())
 }
 
-fn decode_log_events(payload: &[u8]) -> LogDbResult<Vec<OtlpLogEvent>> {
-    if is_ingest_pack(payload) {
-        decode_ingest_pack(payload)
-    } else if is_native_log_batch(payload) {
-        decode_native_log_events(payload)
-            .map(|(_, events)| events)
-            .map_err(|error| LogDbError::InvalidNativePayload(error.to_string()))
-    } else {
-        OtlpLogDecoder.decode(payload)
+fn index_payload(
+    stripe: &mut TelemetryStripeState,
+    topic_partition: TopicPartition,
+    first_offset: shard_stream_core::LogicalOffset,
+    expected_count: Option<u32>,
+    payload: &[u8],
+    _transient_context: Option<&[u8]>,
+    checkpoints: (DurableSinkCheckpoint, DurableSinkCheckpoint),
+) -> TelemetryResult<()> {
+    if !TelemetryEnvelope::is_encoded(payload) {
+        return Err(TelemetryError::InvalidTelemetryEnvelope(
+            "durable telemetry append is not a STEL envelope",
+        ));
     }
+    let envelope = TelemetryEnvelope::decode(payload)?;
+    if envelope.signal.topic_id() != topic_partition.topic_id {
+        return Err(TelemetryError::InvalidTelemetryEnvelope(
+            "signal does not match its shard-stream topic",
+        ));
+    }
+    if expected_count.is_some_and(|count| count != envelope.item_count) {
+        return Err(TelemetryError::InvalidTelemetryEnvelope(
+            "durable reservation count disagrees with envelope",
+        ));
+    }
+    match envelope.signal {
+        TelemetrySignal::Logs => {
+            validate_ingest_pack(&envelope.payload, envelope.item_count)?;
+            stripe.logs.apply_checkpointed_ingest_pack(
+                topic_partition,
+                first_offset,
+                envelope.item_count,
+                Bytes::copy_from_slice(&envelope.payload),
+                None,
+                checkpoints,
+            )?;
+        }
+        TelemetrySignal::Traces => {
+            let records = decode_trace_block(&envelope.payload)?;
+            validate_relative_offsets(
+                records.iter().map(|record| record.record_ref.offset),
+                envelope.item_count,
+            )?;
+            for mut record in records {
+                record.stream_shard_id = stripe.stream_shard_id;
+                record.record_ref = crate::TelemetryRecordRef::for_signal(
+                    TelemetrySignal::Traces,
+                    topic_partition,
+                    absolute_offset(topic_partition, first_offset, record.record_ref.offset)?,
+                );
+                let append_time = record.end_time_unix_nanos().unwrap_or(u64::MAX);
+                stripe.traces.apply(record, append_time)?;
+            }
+        }
+        TelemetrySignal::Metrics => {
+            if envelope.routing_metadata.len() != 5 {
+                return Err(TelemetryError::InvalidTelemetryEnvelope(
+                    "metric routing metadata must contain partition and protocol",
+                ));
+            }
+            let routed_partition = u32::from_le_bytes(
+                envelope.routing_metadata[..4]
+                    .try_into()
+                    .expect("fixed metric partition bytes"),
+            );
+            if routed_partition != topic_partition.partition_id.get() {
+                return Err(TelemetryError::InvalidTelemetryEnvelope(
+                    "metric routing metadata partition mismatch",
+                ));
+            }
+            let protocol = MetricIngestProtocol::from_wire(envelope.routing_metadata[4])?;
+            let records = decode_metric_chunk(&envelope.payload)?;
+            validate_relative_offsets(
+                records.iter().map(|record| record.record_ref.offset),
+                envelope.item_count,
+            )?;
+            for mut record in records {
+                record.stream_shard_id = stripe.stream_shard_id;
+                record.record_ref = crate::TelemetryRecordRef::for_signal(
+                    TelemetrySignal::Metrics,
+                    topic_partition,
+                    absolute_offset(topic_partition, first_offset, record.record_ref.offset)?,
+                );
+                stripe.metrics.apply(record, protocol)?;
+            }
+        }
+    }
+    Ok(())
 }
 
-fn log_error_to_engine(error: LogDbError) -> EngineError {
+fn validate_relative_offsets(
+    offsets: impl IntoIterator<Item = shard_stream_core::LogicalOffset>,
+    count: u32,
+) -> TelemetryResult<()> {
+    let mut seen = vec![false; count as usize];
+    for offset in offsets {
+        let ordinal = usize::try_from(offset.get()).map_err(|_| TelemetryError::RecordTooLarge)?;
+        let slot = seen
+            .get_mut(ordinal)
+            .ok_or(TelemetryError::InvalidBlockEncoding(
+                "signal payload offset is outside its reservation",
+            ))?;
+        if *slot {
+            return Err(TelemetryError::InvalidBlockEncoding(
+                "signal payload contains a duplicate relative offset",
+            ));
+        }
+        *slot = true;
+    }
+    if seen.iter().any(|value| !*value) {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "signal payload offsets are not contiguous",
+        ));
+    }
+    Ok(())
+}
+
+fn absolute_offset(
+    topic_partition: TopicPartition,
+    first_offset: shard_stream_core::LogicalOffset,
+    relative_offset: shard_stream_core::LogicalOffset,
+) -> TelemetryResult<shard_stream_core::LogicalOffset> {
+    first_offset
+        .get()
+        .checked_add(relative_offset.get())
+        .map(shard_stream_core::LogicalOffset::new)
+        .ok_or(TelemetryError::OffsetExhausted(topic_partition))
+}
+
+fn log_error_to_engine(error: TelemetryError) -> EngineError {
     EngineError::InvalidConfig(error.to_string())
 }
 
@@ -774,7 +976,7 @@ mod tests {
     use prost::Message;
     use shard_stream_core::{
         BatchId, LeaderEpoch, LogicalOffset, LogicalPartitionId, Placement, PlacementSequence,
-        RecordId, RingEpoch, TopicId, TopicPartition, VirtualLaneId,
+        RecordId, RingEpoch, TopicPartition, VirtualLaneId,
     };
     use shard_stream_engine::{
         DurableAppendDelivery, DurableSinkApply, DurableSinkCheckpoint, DurableSinkConfig,
@@ -792,8 +994,10 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("clock")
                 .as_nanos();
-            let path = std::env::temp_dir()
-                .join(format!("shard-log-{name}-{}-{nonce}", std::process::id()));
+            let path = std::env::temp_dir().join(format!(
+                "shard-telemetry-{name}-{}-{nonce}",
+                std::process::id()
+            ));
             fs::create_dir_all(&path).expect("temp dir");
             Self(path)
         }
@@ -824,7 +1028,7 @@ mod tests {
     }
 
     fn payload() -> Vec<u8> {
-        ExportLogsServiceRequest {
+        let protobuf = ExportLogsServiceRequest {
             resource_logs: vec![ResourceLogs {
                 resource: None,
                 scope_logs: vec![ScopeLogs {
@@ -849,12 +1053,19 @@ mod tests {
                 schema_url: String::new(),
             }],
         }
-        .encode_to_vec()
+        .encode_to_vec();
+        let events = crate::OtlpLogDecoder
+            .decode(&protobuf)
+            .expect("OTLP decodes");
+        crate::prepare_log_envelope("tenant-a", &events)
+            .expect("STEL envelope")
+            .encode()
+            .expect("STEL encodes")
     }
 
     #[test]
     fn durable_otlp_sink_commits_its_checkpoint_with_the_index_update() {
-        let factory = ShardLogSinkFactory::new([ShardId::new(0)], OtlpSinkConfig::default())
+        let factory = TelemetrySinkFactory::new([ShardId::new(0)], OtlpSinkConfig::default())
             .expect("factory opens");
         let service = factory.service();
         let payload = payload();
@@ -862,16 +1073,16 @@ mod tests {
             .validate_append(&payload, NonZeroU32::new(1).expect("one"))
             .expect("payload validates");
         let sink = factory.open_shard(ShardId::new(0)).expect("sink opens");
-        let topic_partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        let topic_partition = TopicPartition::new(crate::LOGS_TOPIC_ID, LogicalPartitionId::new(0));
         let append = DurableAppend {
             event_id: RecordId::for_batch(
-                TopicId::new(1),
+                crate::LOGS_TOPIC_ID,
                 LogicalPartitionId::new(0),
                 BatchId::new(1),
             ),
             physical_shard_id: ShardId::new(0),
             reservation: shard_stream_core::Reservation {
-                topic_id: TopicId::new(1),
+                topic_id: crate::LOGS_TOPIC_ID,
                 partition_id: LogicalPartitionId::new(0),
                 batch_id: BatchId::new(1),
                 first_offset: LogicalOffset::new(0),
@@ -921,7 +1132,7 @@ mod tests {
             state_directory: Some(directory.0.join("sink")),
             ..OtlpSinkConfig::default()
         };
-        let topic_partition = TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(0));
+        let topic_partition = TopicPartition::new(crate::LOGS_TOPIC_ID, LogicalPartitionId::new(0));
         let expected = DurableSinkCheckpoint::initial(topic_partition);
         let next = DurableSinkCheckpoint {
             topic_partition,
@@ -930,13 +1141,13 @@ mod tests {
         };
         let append = DurableAppend {
             event_id: RecordId::for_batch(
-                TopicId::new(1),
+                crate::LOGS_TOPIC_ID,
                 LogicalPartitionId::new(0),
                 BatchId::new(1),
             ),
             physical_shard_id: ShardId::new(0),
             reservation: shard_stream_core::Reservation {
-                topic_id: TopicId::new(1),
+                topic_id: crate::LOGS_TOPIC_ID,
                 partition_id: LogicalPartitionId::new(0),
                 batch_id: BatchId::new(1),
                 first_offset: LogicalOffset::new(0),
@@ -957,7 +1168,7 @@ mod tests {
         };
 
         let factory =
-            ShardLogSinkFactory::new([ShardId::new(0)], config.clone()).expect("factory opens");
+            TelemetrySinkFactory::new([ShardId::new(0)], config.clone()).expect("factory opens");
         let sink = factory.open_shard(ShardId::new(0)).expect("sink opens");
         assert_eq!(
             sink.apply(expected, &[append], next)
@@ -982,7 +1193,7 @@ mod tests {
             .expect("partial tail is written");
 
         let recovered =
-            ShardLogSinkFactory::new([ShardId::new(0)], config).expect("factory recovers");
+            TelemetrySinkFactory::new([ShardId::new(0)], config).expect("factory recovers");
         assert_eq!(
             recovered
                 .load_checkpoint(topic_partition)
@@ -1000,14 +1211,14 @@ mod tests {
         let directory = TempDir::new("engine-otlp-sink");
         let config = engine_config(&directory.0);
         let factory = Arc::new(
-            ShardLogSinkFactory::new(config.shard_ids(), OtlpSinkConfig::default())
+            TelemetrySinkFactory::new(config.shard_ids(), OtlpSinkConfig::default())
                 .expect("sink factory opens"),
         );
         let engine = StreamEngine::open_with_durable_sink(config, DurableSinkConfig::new(factory))
             .expect("engine with sink opens");
         engine
             .create_topic(TopicConfig {
-                topic_id: TopicId::new(1),
+                topic_id: crate::LOGS_TOPIC_ID,
                 partitions: 1,
                 shards: None,
             })
@@ -1016,7 +1227,7 @@ mod tests {
         let response = engine
             .append(AppendRequest {
                 request_id: 1,
-                topic_id: TopicId::new(1),
+                topic_id: crate::LOGS_TOPIC_ID,
                 partition_id: LogicalPartitionId::new(0),
                 record_count: 1,
                 payload: Bytes::from(payload()),
@@ -1032,7 +1243,7 @@ mod tests {
         let error = engine
             .append(AppendRequest {
                 request_id: 2,
-                topic_id: TopicId::new(1),
+                topic_id: crate::LOGS_TOPIC_ID,
                 partition_id: LogicalPartitionId::new(0),
                 record_count: 2,
                 payload: Bytes::from(payload()),

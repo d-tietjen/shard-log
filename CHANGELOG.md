@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to ShardLog will be documented here. The project follows
+All notable changes to ShardTelemetry will be documented here. The project follows
 Semantic Versioning after `1.0.0`; pre-1.0 releases may change unstable storage
 and protocol interfaces when called out in release notes.
 
@@ -25,4 +25,4 @@ No changes yet.
 
 - GPL/AGPL codec dependencies from the public build and codec benchmark.
 
-- Initial public release of the single-tenant ShardLog storage engine.
+- Initial public release of the single-tenant ShardTelemetry storage engine.

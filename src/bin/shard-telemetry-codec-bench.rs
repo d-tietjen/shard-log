@@ -190,7 +190,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn parse_settings() -> Result<Settings, Box<dyn Error>> {
     let mut arguments = env::args_os().skip(1);
     let input = arguments.next().map(PathBuf::from).ok_or(
-        "usage: shard-log-codec-bench <raw-log-file> [--codecs NAMES|screen|archive|all] [--limit-bytes N] [--block-bytes N] [--report PATH]",
+        "usage: shard-telemetry-codec-bench <raw-log-file> [--codecs NAMES|screen|archive|all] [--limit-bytes N] [--block-bytes N] [--report PATH]",
     )?;
     let mut limit_bytes = DEFAULT_LIMIT_BYTES;
     let mut block_bytes = DEFAULT_BLOCK_BYTES;
@@ -528,7 +528,7 @@ fn decompress(
 }
 
 fn format_report(settings: &Settings, results: &[CodecResult]) -> String {
-    let mut report = String::from("shard-log codec compression benchmark\n");
+    let mut report = String::from("shard-telemetry codec compression benchmark\n");
     report.push_str(&format!("input: {}\n", settings.input.display()));
     report.push_str(&format!("block target: {}\n", settings.block_bytes));
     report.push_str(&format!(

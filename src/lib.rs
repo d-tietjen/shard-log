@@ -1,7 +1,7 @@
-//! Stripe-aligned native and OTLP log indexes for shard-stream.
+//! Signal-native logs, traces, and metrics storage for shard-stream.
 //!
-//! A [`ShardLogDb`] owns one single-writer [`LogStripe`] per shard-stream
-//! physical shard. Call [`ShardLogDb::apply_durable`] from the owning
+//! A [`ShardTelemetry`] owns one single-writer [`LogStripe`] per shard-stream
+//! physical shard. Call [`ShardTelemetry::apply_durable`] from the owning
 //! shard-stream worker only after the associated append is durable. This keeps
 //! the append log authoritative while allowing term and metadata indexes to be
 //! queried through a per-partition indexed watermark.
@@ -12,25 +12,36 @@ mod analytics;
 mod block;
 mod deletion;
 mod dictionary;
+mod envelope;
 mod error;
 mod ingest_pack;
 mod locality;
 mod loki_api;
 mod loki_store;
+mod metric;
 mod native_protocol;
 mod native_server;
 mod otlp;
+mod otlp_server;
+mod otlp_signal;
 mod production;
+mod prometheus_api;
+mod prometheus_protocol;
+mod promql;
 mod query;
 mod query_index;
 mod realtime_dictionary;
+mod remote_write;
+mod signal_ingest;
 mod sink;
 mod sink_journal;
 mod storage_format;
 mod stripe;
 mod structural;
+mod telemetry;
 mod tier;
 mod tier_ingest;
+mod trace;
 mod types;
 
 pub use analytics::{
@@ -43,7 +54,8 @@ pub use dictionary::{
     CompressionCohortId, DictionaryCache, DictionaryCatalog, DictionaryCatalogSnapshot,
     DictionaryId, DictionaryInsert, DictionaryPublication,
 };
-pub use error::{LogDbError, LogDbResult};
+pub use envelope::{MAX_TELEMETRY_ENVELOPE_BYTES, TelemetryEnvelope};
+pub use error::{TelemetryError, TelemetryResult};
 pub use locality::{
     CompressionBlockAssignment, CompressionBlockCollator, CompressionBlockScore,
     CompressionLocalityConfig, CompressionLocalityRecord, CompressionLocalityStats,
@@ -57,40 +69,71 @@ pub use loki_api::{
     single_tenant_loki_router,
 };
 pub use loki_store::{DurableLokiConfig, DurableLokiStore, RetentionReport};
+pub use metric::{
+    DurableMetricPoint, ExplicitHistogramValue, ExponentialHistogramBuckets,
+    ExponentialHistogramValue, HistogramBucketSpan, HistogramCount, MetricApplyOutcome,
+    MetricExemplar, MetricIdentity, MetricIngestProtocol, MetricKind, MetricQuery, MetricStripe,
+    MetricValue, NumberValue, SeriesAccumulatorCheckpoint, SummaryQuantileValue, SummaryValue,
+    decode_metric_chunk, encode_metric_chunk, prometheus_string_labels,
+};
 pub use native_protocol::{
-    MAX_NATIVE_FRAME_BYTES, NATIVE_FRAME_HEADER_BYTES, NativeAppendAck, NativeBatchInfo,
-    NativeFrame, NativeFrameHeader, NativeLogBatch, NativeOpcode, NativeProtocolError, NativeQuery,
-    NativeQueryDirection, NativeStatus, decode_native_log_batch, decode_native_log_events,
-    decode_native_query, encode_native_log_batch, encode_native_query, inspect_native_log_batch,
-    is_native_log_batch, validate_native_log_batch,
+    MAX_NATIVE_FRAME_BYTES, NATIVE_FRAME_HEADER_BYTES, NativeFrame, NativeFrameHeader,
+    NativeLogQueryResult, NativeOpcode, NativePartitionAck, NativePartitionAppend,
+    NativeProtocolError, NativeQuery, NativeQueryDirection, NativeStatus, NativeTelemetryAppendAck,
+    NativeTelemetryBatch, decode_native_log_query_result, decode_native_query,
+    encode_native_log_query_result, encode_native_query, is_native_telemetry_batch,
 };
 pub use native_server::{NativeRequestGate, NativeServerConfig, serve_native};
 pub use otlp::{OtlpLogDecoder, OtlpLogEvent};
+pub use otlp_server::{OtlpIngestService, OtlpReceiverConfig, otlp_http_router, serve_otlp_grpc};
+pub use otlp_signal::{OtlpMetricEvent, OtlpSpanEvent, OtlpTelemetryDecoder};
 pub use production::{
     ProductionMetricsSnapshot, ProductionRuntime, ServiceLifecycle, ServiceState,
     SingleTenantConfig,
+};
+pub use prometheus_api::{PrometheusApiConfig, PrometheusService, prometheus_router};
+pub use promql::{
+    PromqlEngine, PromqlError, PromqlLimits, PromqlSample, PromqlSeries, PromqlValue,
 };
 pub use query_index::{BlockQueryIndex, PersistentQueryIndex, QueryBlockMetadata, QueryHit};
 pub use realtime_dictionary::{
     RealtimeDictionaryConfig, RealtimeDictionaryObserver, RealtimeDictionaryStats,
     RealtimeDictionaryTrainer,
 };
-pub use sink::{OtlpSinkConfig, ShardLogService, ShardLogSinkFactory, SinkObjectTierConfig};
-pub use stripe::{IndexReceipt, LogStripe, ShardLogDb, ShardStreamDurableSink, StripeConfig};
+pub use remote_write::{
+    DecodedRemoteWrite, METRIC_FLAG_STALE, PROMETHEUS_STALE_NAN_BITS, RemoteWriteDecoder,
+    RemoteWriteStats, RemoteWriteVersion,
+};
+pub use signal_ingest::{
+    prepare_log_envelope, prepare_loki_log_envelope, prepare_metric_envelope,
+    prepare_metric_envelope_with_protocol, prepare_trace_envelope,
+};
+pub use sink::{OtlpSinkConfig, SinkObjectTierConfig, TelemetryService, TelemetrySinkFactory};
+pub use stripe::{IndexReceipt, LogStripe, ShardStreamDurableSink, ShardTelemetry, StripeConfig};
 pub use structural::{
-    DecodedStructuralRecord, EmbeddedFrameIndex, IndexedStructuralBlock, StructuralRecordView,
-    decode_embedded_frame_index, decode_structural_block, decode_structural_records,
-    encode_indexed_structural_records, encode_structural_block, encode_structural_records,
-    message_pattern,
+    DecodedStructuralRecord, EmbeddedFrameIndex, IndexedStructuralBlock, StructuralLogMetadataRef,
+    StructuralRecordView, decode_embedded_frame_index, decode_structural_block,
+    decode_structural_records, encode_indexed_structural_records, encode_structural_block,
+    encode_structural_records, message_pattern,
+};
+pub use telemetry::{
+    LOGS_TOPIC_ID, METRICS_TOPIC_ID, ResourceContext, ScopeContext, SeriesFingerprint,
+    ShardTelemetryConfig, SignalConfig, SpanId, TRACES_TOPIC_ID, TelemetryAttribute,
+    TelemetryEntityRef, TelemetryRouter, TelemetrySignal, TelemetryValue, TraceId,
 };
 pub use tier::{
     CatalogGroupEntry, CatalogPage, CatalogPageRef, CatalogPointer, CatalogRoot, LocalObjectStore,
-    LogObjectStore, LogObjectTier, ObjectMetadata, ObjectTierConfig, SharedLogObjectStore,
-    SsdCacheConfig, SsdObjectCache, TierArtifact, TierArtifactKind, TierArtifactSource,
+    ObjectMetadata, ObjectTierConfig, SharedTelemetryObjectStore, SsdCacheConfig, SsdObjectCache,
+    TelemetryObjectStore, TelemetryObjectTier, TierArtifact, TierArtifactKind, TierArtifactSource,
     TierBlockEntry, TierCheckpoint, TierGroupManifest, TierGroupSource, TierQueryRange,
     mark_group_offloaded, write_staged_payload_pack,
 };
+pub use trace::{
+    DurableSpan, SpanEvent, SpanLink, SpanStatus, TraceApplyOutcome, TraceDirectory, TraceQuery,
+    TraceStripe, TraceSummary, decode_trace_block, encode_trace_block,
+};
 pub use types::{
-    CaseSensitivity, DurableLogRecord, LogMatch, LogPredicate, LogQuery, LogRegex, MetadataField,
-    NumericComparison, QueryCursor, QueryOrder, QuerySort, RecordRef, TextMatchKind, TextMatcher,
+    CaseSensitivity, DurableLog, LogMatch, LogPredicate, LogQuery, LogRegex, MetadataField,
+    NumericComparison, QueryCursor, QueryOrder, QuerySort, TelemetryRecordRef, TextMatchKind,
+    TextMatcher,
 };

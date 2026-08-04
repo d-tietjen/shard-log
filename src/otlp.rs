@@ -9,19 +9,70 @@ use opentelemetry_proto::tonic::{
 use prost::Message;
 use shard_stream_core::{LogicalOffset, ShardId, TopicPartition};
 
-use crate::{CompressionCohortId, DurableLogRecord, LogDbError, LogDbResult, MetadataField};
+use crate::{
+    CompressionCohortId, DurableLog, MetadataField, ResourceContext, ScopeContext, SpanId,
+    TelemetryAttribute, TelemetryEntityRef, TelemetryError, TelemetryRecordRef, TelemetryResult,
+    TelemetrySignal, TelemetryValue, TraceId,
+};
 
 /// One normalized OpenTelemetry log event before shard-stream assigns its offset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OtlpLogEvent {
-    /// Event timestamp in Unix nanoseconds. Uses observed time when event time is absent.
+    /// Original event timestamp in Unix nanoseconds.
     pub timestamp_unix_nanos: u64,
+    /// Original observed timestamp in Unix nanoseconds.
+    pub observed_timestamp_unix_nanos: u64,
+    /// Exact typed body.
+    pub body: Option<TelemetryValue>,
     /// Preserved human-readable or structured log body.
     pub message: Arc<str>,
     /// Resource, instrumentation scope, record, and promoted OTLP metadata.
     pub fields: Arc<Vec<MetadataField>>,
+    /// Exact typed record attributes.
+    pub attributes: Arc<Vec<TelemetryAttribute>>,
+    /// Exact resource context.
+    pub resource: Arc<ResourceContext>,
+    /// Exact scope context.
+    pub scope: Arc<ScopeContext>,
+    /// OTLP severity enum value.
+    pub severity_number: i32,
+    /// Exact severity text.
+    pub severity_text: Arc<str>,
+    /// Dropped record-attribute count.
+    pub dropped_attributes_count: u32,
+    /// OTLP flags.
+    pub flags: u32,
+    /// Binary trace ID when present.
+    pub trace_id: Option<TraceId>,
+    /// Binary span ID when present.
+    pub span_id: Option<SpanId>,
+    /// Exact event name.
+    pub event_name: Arc<str>,
     /// Stable compression cohort derived from service and instrumentation scope identity.
     pub compression_cohort: CompressionCohortId,
+}
+
+impl Default for OtlpLogEvent {
+    fn default() -> Self {
+        Self {
+            timestamp_unix_nanos: 0,
+            observed_timestamp_unix_nanos: 0,
+            body: None,
+            message: Arc::from(""),
+            fields: Arc::new(Vec::new()),
+            attributes: Arc::new(Vec::new()),
+            resource: Arc::new(ResourceContext::default()),
+            scope: Arc::new(ScopeContext::default()),
+            severity_number: 0,
+            severity_text: Arc::from(""),
+            dropped_attributes_count: 0,
+            flags: 0,
+            trace_id: None,
+            span_id: None,
+            event_name: Arc::from(""),
+            compression_cohort: CompressionCohortId::new(0),
+        }
+    }
 }
 
 impl OtlpLogEvent {
@@ -32,13 +83,29 @@ impl OtlpLogEvent {
         stream_shard_id: ShardId,
         topic_partition: TopicPartition,
         offset: LogicalOffset,
-    ) -> DurableLogRecord {
-        DurableLogRecord {
+    ) -> DurableLog {
+        DurableLog {
             stream_shard_id,
-            record_ref: crate::RecordRef::new(topic_partition, offset),
+            record_ref: TelemetryRecordRef::for_signal(
+                TelemetrySignal::Logs,
+                topic_partition,
+                offset,
+            ),
             timestamp_unix_nanos: self.timestamp_unix_nanos,
+            observed_timestamp_unix_nanos: self.observed_timestamp_unix_nanos,
+            body: self.body,
             message: self.message,
             fields: self.fields,
+            attributes: self.attributes,
+            resource: self.resource,
+            scope: self.scope,
+            severity_number: self.severity_number,
+            severity_text: self.severity_text,
+            dropped_attributes_count: self.dropped_attributes_count,
+            flags: self.flags,
+            trace_id: self.trace_id,
+            span_id: self.span_id,
+            event_name: self.event_name,
             compression_cohort: self.compression_cohort,
         }
     }
@@ -54,14 +121,14 @@ pub struct OtlpLogDecoder;
 
 impl OtlpLogDecoder {
     /// Decodes one binary OTLP Logs export request into normalized log events.
-    pub fn decode(&self, payload: &[u8]) -> LogDbResult<Vec<OtlpLogEvent>> {
+    pub fn decode(&self, payload: &[u8]) -> TelemetryResult<Vec<OtlpLogEvent>> {
         let request = ExportLogsServiceRequest::decode(payload)
-            .map_err(|error| LogDbError::InvalidOtlpPayload(error.to_string()))?;
-        Ok(request
-            .resource_logs
-            .iter()
-            .flat_map(decode_resource_logs)
-            .collect())
+            .map_err(|error| TelemetryError::InvalidOtlpPayload(error.to_string()))?;
+        let mut events = Vec::new();
+        for resource_logs in &request.resource_logs {
+            events.extend(decode_resource_logs(resource_logs)?);
+        }
+        Ok(events)
     }
 
     /// Decodes an OTLP export and assigns its events contiguous shard-stream offsets.
@@ -75,41 +142,48 @@ impl OtlpLogDecoder {
         topic_partition: TopicPartition,
         first_offset: LogicalOffset,
         payload: &[u8],
-    ) -> LogDbResult<Vec<DurableLogRecord>> {
+    ) -> TelemetryResult<Vec<DurableLog>> {
         self.decode(payload)?
             .into_iter()
             .enumerate()
             .map(|(index, event)| {
                 let relative_offset = u64::try_from(index)
-                    .map_err(|_| LogDbError::OffsetExhausted(topic_partition))?;
+                    .map_err(|_| TelemetryError::OffsetExhausted(topic_partition))?;
                 let offset = first_offset
                     .get()
                     .checked_add(relative_offset)
                     .map(LogicalOffset::new)
-                    .ok_or(LogDbError::OffsetExhausted(topic_partition))?;
+                    .ok_or(TelemetryError::OffsetExhausted(topic_partition))?;
                 Ok(event.into_durable(stream_shard_id, topic_partition, offset))
             })
             .collect()
     }
 }
 
-fn decode_resource_logs(resource_logs: &ResourceLogs) -> Vec<OtlpLogEvent> {
+fn decode_resource_logs(resource_logs: &ResourceLogs) -> TelemetryResult<Vec<OtlpLogEvent>> {
     let resource_fields = resource_logs
         .resource
         .as_ref()
         .map_or_else(Vec::new, resource_fields);
-    resource_logs
-        .scope_logs
-        .iter()
-        .flat_map(|scope_logs| decode_scope_logs(scope_logs, &resource_fields))
-        .collect()
+    let resource = Arc::new(resource_context(resource_logs));
+    let mut events = Vec::new();
+    for scope_logs in &resource_logs.scope_logs {
+        events.extend(decode_scope_logs(
+            scope_logs,
+            &resource_fields,
+            Arc::clone(&resource),
+        )?);
+    }
+    Ok(events)
 }
 
 fn decode_scope_logs(
     scope_logs: &ScopeLogs,
     resource_fields: &[MetadataField],
-) -> Vec<OtlpLogEvent> {
+    resource: Arc<ResourceContext>,
+) -> TelemetryResult<Vec<OtlpLogEvent>> {
     let scope_fields = scope_fields(scope_logs.scope.as_ref());
+    let scope = Arc::new(scope_context(scope_logs));
     let compression_cohort = compression_cohort(resource_fields, scope_logs.scope.as_ref());
     scope_logs
         .log_records
@@ -121,14 +195,133 @@ fn decode_scope_logs(
             fields.extend_from_slice(resource_fields);
             fields.extend_from_slice(&scope_fields);
             fields.extend(record_fields(record));
-            OtlpLogEvent {
-                timestamp_unix_nanos: record.time_unix_nano.max(record.observed_time_unix_nano),
+            let trace_id = optional_trace_id(&record.trace_id)?;
+            let span_id = optional_span_id(&record.span_id)?;
+            Ok(OtlpLogEvent {
+                timestamp_unix_nanos: record.time_unix_nano,
+                observed_timestamp_unix_nanos: record.observed_time_unix_nano,
+                body: record.body.as_ref().map(decode_telemetry_value),
                 message: body_text(record.body.as_ref()),
                 fields: Arc::new(fields),
+                attributes: Arc::new(decode_telemetry_attributes(&record.attributes)),
+                resource: Arc::clone(&resource),
+                scope: Arc::clone(&scope),
+                severity_number: record.severity_number,
+                severity_text: Arc::from(record.severity_text.as_str()),
+                dropped_attributes_count: record.dropped_attributes_count,
+                flags: record.flags,
+                trace_id,
+                span_id,
+                event_name: Arc::from(record.event_name.as_str()),
                 compression_cohort,
-            }
+            })
         })
         .collect()
+}
+
+fn resource_context(resource_logs: &ResourceLogs) -> ResourceContext {
+    decode_resource_context(resource_logs.resource.as_ref(), &resource_logs.schema_url)
+}
+
+pub(crate) fn decode_resource_context(
+    resource: Option<&Resource>,
+    schema_url: &str,
+) -> ResourceContext {
+    ResourceContext {
+        attributes: Arc::new(resource.map_or_else(Vec::new, |value| {
+            decode_telemetry_attributes(&value.attributes)
+        })),
+        dropped_attributes_count: resource.map_or(0, |value| value.dropped_attributes_count),
+        schema_url: Arc::from(schema_url),
+        entity_refs: Arc::new(resource.map_or_else(Vec::new, |value| {
+            value
+                .entity_refs
+                .iter()
+                .map(|entity| TelemetryEntityRef {
+                    schema_url: Arc::from(entity.schema_url.as_str()),
+                    entity_type: Arc::from(entity.r#type.as_str()),
+                    id_keys: Arc::new(
+                        entity
+                            .id_keys
+                            .iter()
+                            .map(|value| Arc::from(value.as_str()))
+                            .collect(),
+                    ),
+                    description_keys: Arc::new(
+                        entity
+                            .description_keys
+                            .iter()
+                            .map(|value| Arc::from(value.as_str()))
+                            .collect(),
+                    ),
+                })
+                .collect()
+        })),
+    }
+}
+
+fn scope_context(scope_logs: &ScopeLogs) -> ScopeContext {
+    decode_scope_context(scope_logs.scope.as_ref(), &scope_logs.schema_url)
+}
+
+pub(crate) fn decode_scope_context(
+    scope: Option<&InstrumentationScope>,
+    schema_url: &str,
+) -> ScopeContext {
+    ScopeContext {
+        name: Arc::from(scope.map_or("", |value| value.name.as_str())),
+        version: Arc::from(scope.map_or("", |value| value.version.as_str())),
+        attributes: Arc::new(scope.map_or_else(Vec::new, |value| {
+            decode_telemetry_attributes(&value.attributes)
+        })),
+        dropped_attributes_count: scope.map_or(0, |value| value.dropped_attributes_count),
+        schema_url: Arc::from(schema_url),
+    }
+}
+
+pub(crate) fn decode_telemetry_attributes(attributes: &[KeyValue]) -> Vec<TelemetryAttribute> {
+    attributes
+        .iter()
+        .map(|attribute| TelemetryAttribute {
+            key: Arc::from(attribute.key.as_str()),
+            key_strindex: attribute.key_strindex,
+            value: attribute.value.as_ref().map(decode_telemetry_value),
+        })
+        .collect()
+}
+
+pub(crate) fn decode_telemetry_value(value: &AnyValue) -> TelemetryValue {
+    match value.value.as_ref() {
+        None => TelemetryValue::Empty,
+        Some(Value::StringValue(value)) => TelemetryValue::String(Arc::from(value.as_str())),
+        Some(Value::BoolValue(value)) => TelemetryValue::Boolean(*value),
+        Some(Value::IntValue(value)) => TelemetryValue::Integer(*value),
+        Some(Value::DoubleValue(value)) => TelemetryValue::DoubleBits(value.to_bits()),
+        Some(Value::BytesValue(value)) => TelemetryValue::Bytes(Arc::from(value.as_slice())),
+        Some(Value::ArrayValue(values)) => TelemetryValue::Array(Arc::new(
+            values.values.iter().map(decode_telemetry_value).collect(),
+        )),
+        Some(Value::KvlistValue(values)) => {
+            TelemetryValue::Map(Arc::new(decode_telemetry_attributes(&values.values)))
+        }
+        Some(Value::StringValueStrindex(value)) => TelemetryValue::StringTableIndex(*value),
+    }
+}
+
+pub(crate) fn optional_trace_id(bytes: &[u8]) -> TelemetryResult<Option<TraceId>> {
+    if bytes.is_empty() {
+        Ok(None)
+    } else {
+        TraceId::from_slice(bytes).map(Some)
+    }
+}
+
+pub(crate) fn optional_span_id(bytes: &[u8]) -> TelemetryResult<Option<SpanId>> {
+    if bytes.is_empty() {
+        Ok(None)
+    } else {
+        SpanId::from_slice(bytes).map(Some)
+    }
 }
 
 fn resource_fields(resource: &Resource) -> Vec<MetadataField> {
@@ -331,8 +524,8 @@ mod tests {
                         attributes: vec![string_attribute("http.status_code", "402")],
                         dropped_attributes_count: 0,
                         flags: 0,
-                        trace_id: vec![1, 2],
-                        span_id: vec![3],
+                        trace_id: vec![1; 16],
+                        span_id: vec![3; 8],
                         event_name: String::new(),
                     }],
                     schema_url: String::new(),
@@ -345,7 +538,8 @@ mod tests {
         let events = OtlpLogDecoder.decode(&payload).expect("payload decodes");
         assert_eq!(events.len(), 1);
         let event = &events[0];
-        assert_eq!(event.timestamp_unix_nanos, 12);
+        assert_eq!(event.timestamp_unix_nanos, 11);
+        assert_eq!(event.observed_timestamp_unix_nanos, 12);
         assert_eq!(event.message.as_ref(), "payment declined");
         assert!(
             event
@@ -367,11 +561,21 @@ mod tests {
                 .fields
                 .contains(&MetadataField::new("attr.http.status_code", "402"))
         );
-        assert!(
-            event
-                .fields
-                .contains(&MetadataField::new("otel.trace_id", "0102"))
+        assert!(event.fields.contains(&MetadataField::new(
+            "otel.trace_id",
+            "01010101010101010101010101010101"
+        )));
+        assert_eq!(event.trace_id, Some(TraceId::from_bytes([1; 16]).unwrap()));
+        assert_eq!(event.span_id, Some(SpanId::from_bytes([3; 8]).unwrap()));
+        assert_eq!(
+            event.body,
+            Some(TelemetryValue::String(Arc::from("payment declined")))
         );
+
+        let packed = crate::ingest_pack::prepare_ingest_pack(&events).expect("typed log packs");
+        let recovered = crate::ingest_pack::decode_ingest_pack(&packed.payload)
+            .expect("typed log pack recovers");
+        assert_eq!(recovered, events);
 
         let durable = event.clone().into_durable(
             ShardId::new(7),
@@ -397,6 +601,6 @@ mod tests {
         let error = OtlpLogDecoder
             .decode(b"not a protobuf request")
             .expect_err("invalid input");
-        assert!(matches!(error, LogDbError::InvalidOtlpPayload(_)));
+        assert!(matches!(error, TelemetryError::InvalidOtlpPayload(_)));
     }
 }

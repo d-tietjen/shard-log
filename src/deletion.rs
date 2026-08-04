@@ -277,8 +277,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let directory =
-            std::env::temp_dir().join(format!("shard-log-deletes-{}-{nonce}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!(
+            "shard-telemetry-deletes-{}-{nonce}",
+            std::process::id()
+        ));
         let path = directory.join("deletes.json");
         let catalog = DeleteCatalog::open(path.clone()).expect("catalog");
         assert_eq!(
@@ -313,7 +315,7 @@ mod tests {
             .expect("clock")
             .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "shard-log-delete-corrupt-{}-{nonce}",
+            "shard-telemetry-delete-corrupt-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir_all(&directory).expect("directory");

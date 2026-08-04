@@ -69,7 +69,7 @@ fn parse_settings() -> Result<Settings, Box<dyn Error>> {
     let output = arguments
         .next()
         .map(PathBuf::from)
-        .ok_or("usage: shard-log-interleave <output.log> [--limit-bytes N] <input.log>...")?;
+        .ok_or("usage: shard-telemetry-interleave <output.log> [--limit-bytes N] <input.log>...")?;
     let mut inputs = Vec::new();
     let mut limit_bytes = u64::MAX;
     while let Some(argument) = arguments.next() {

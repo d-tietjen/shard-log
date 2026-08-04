@@ -222,7 +222,7 @@ original `Arc`s. The crate is an ownership and boundary primitive—the integer
 collator still performs the scoring.
 
 `CompressionPlacementId` selects active blocks and immutable dictionaries.
-`DurableLogRecord::compression_cohort` remains the producer-derived cohort.
+`DurableLog::compression_cohort` remains the producer-derived cohort.
 Because final placement does not exist until block scoring,
 `IndexReceipt` returns the record temperature, tentative collection placement,
 and zero or more descriptors sealed by that append. Every descriptor stores
@@ -315,7 +315,7 @@ queue, share a collator or compressor, or lock around compression.
 
 The structural encoder accepts a `StructuralRecordView`, allowing a parser to
 expose borrowed message, timestamp, offset, and metadata fields without first
-allocating a `DurableLogRecord` and per-record `Arc`s. Tokenization stores byte
+allocating a `DurableLog` and per-record `Arc`s. Tokenization stores byte
 ranges into the normalized message. Template groups use a hash only to find
 candidates and then compare every literal byte, so hash collisions cannot
 merge unlike templates. Only selected template literals are copied.
@@ -383,7 +383,7 @@ checksums and sampled exact reconstructions passed. The same binary sustained
 1,157.26 MiB/s on one physical core across the full 80 GiB corpus. The
 locality-enabled precursor stored 628,473,667 bytes at 1,005.02 MiB/s after
 528 unproductive splits and 83,512,504 bytes of membership handoff. Routing
-therefore remains disabled by default. The prior ShardLog format stored
+therefore remains disabled by default. The prior ShardTelemetry format stored
 826,364,011 bytes at 103.95x; the final paired ClickHouse run stored
 1,175,169,126 bytes at 73.10x and 927.43 MiB/s.
 
@@ -470,7 +470,7 @@ selection, bounded fair sampling, cumulative payback, immutable publication,
 sparse assignment runs, checksums, decompression, and byte-identical
 reconstruction.
 
-`shard-log-locality-bench` measures fingerprint sizes, tentative 16-shard
+`shard-telemetry-locality-bench` measures fingerprint sizes, tentative 16-shard
 probe cost, complete block score/split/assignment throughput,
 `bytes-handoff` membership volume, persistent state, combined single-thread
 throughput, and p50/p99 seal latency. `run-head-to-head.sh` performs sequential
@@ -526,7 +526,7 @@ index on the native/Loki durable path:
    structural length, compressed checksum, and minimum/maximum timestamp.
 6. Live ingestion hands only the already-encoded index section to the owning
    stripe. Recovery reconstructs the same index from the durable compressed
-   frame; it does not recreate millions of `DurableLogRecord` objects or a
+   frame; it does not recreate millions of `DurableLog` objects or a
    second term/field map.
 
 The in-memory stripe state retains `Bytes` slices over authoritative compressed

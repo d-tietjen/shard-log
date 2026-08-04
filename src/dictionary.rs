@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use crate::{CompressionPlacementId, LogDbError, LogDbResult};
+use crate::{CompressionPlacementId, TelemetryError, TelemetryResult};
 
 /// Stable identifier for a compression cohort, such as a service and schema version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -131,11 +131,11 @@ impl DictionaryCatalog {
     }
 
     /// Returns the current immutable publication snapshot.
-    pub fn snapshot(&self) -> LogDbResult<Arc<DictionaryCatalogSnapshot>> {
+    pub fn snapshot(&self) -> TelemetryResult<Arc<DictionaryCatalogSnapshot>> {
         self.snapshot
             .read()
             .map(|snapshot| Arc::clone(&snapshot))
-            .map_err(|_| LogDbError::DictionaryCatalogUnavailable)
+            .map_err(|_| TelemetryError::DictionaryCatalogUnavailable)
     }
 
     /// Publishes a dictionary and atomically assigns it to a placement.
@@ -148,19 +148,19 @@ impl DictionaryCatalog {
         placement_id: CompressionPlacementId,
         dictionary_id: DictionaryId,
         payload: Arc<[u8]>,
-    ) -> LogDbResult<DictionaryPublication> {
+    ) -> TelemetryResult<DictionaryPublication> {
         if payload.is_empty() {
-            return Err(LogDbError::EmptyDictionary);
+            return Err(TelemetryError::EmptyDictionary);
         }
 
         let mut snapshot = self
             .snapshot
             .write()
-            .map_err(|_| LogDbError::DictionaryCatalogUnavailable)?;
+            .map_err(|_| TelemetryError::DictionaryCatalogUnavailable)?;
         if let Some(existing) = snapshot.dictionaries.get(&dictionary_id)
             && existing.as_ref() != payload.as_ref()
         {
-            return Err(LogDbError::DictionaryIdConflict(dictionary_id));
+            return Err(TelemetryError::DictionaryIdConflict(dictionary_id));
         }
 
         let mut next = (**snapshot).clone();
@@ -209,9 +209,9 @@ pub struct DictionaryCache {
 
 impl DictionaryCache {
     /// Creates an empty LRU cache with a nonzero byte capacity.
-    pub fn new(capacity_bytes: usize) -> LogDbResult<Self> {
+    pub fn new(capacity_bytes: usize) -> TelemetryResult<Self> {
         if capacity_bytes == 0 {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "dictionary_cache_bytes must be nonzero",
             ));
         }
@@ -252,12 +252,12 @@ impl DictionaryCache {
         &mut self,
         dictionary_id: DictionaryId,
         payload: Arc<[u8]>,
-    ) -> LogDbResult<DictionaryInsert> {
+    ) -> TelemetryResult<DictionaryInsert> {
         if payload.is_empty() {
-            return Err(LogDbError::EmptyDictionary);
+            return Err(TelemetryError::EmptyDictionary);
         }
         if payload.len() > self.capacity_bytes {
-            return Err(LogDbError::DictionaryTooLarge {
+            return Err(TelemetryError::DictionaryTooLarge {
                 bytes: payload.len(),
                 capacity: self.capacity_bytes,
             });
@@ -266,7 +266,7 @@ impl DictionaryCache {
         if let Some(existing) = self.entries.get(&dictionary_id)
             && existing.payload.as_ref() != payload.as_ref()
         {
-            return Err(LogDbError::DictionaryIdConflict(dictionary_id));
+            return Err(TelemetryError::DictionaryIdConflict(dictionary_id));
         }
 
         if let Some(previous) = self.entries.remove(&dictionary_id) {

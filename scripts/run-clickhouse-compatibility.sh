@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ -z ${SHARDLOG_CLICKHOUSE_TOKEN:-} ]]; then
-    : "${SHARDLOG_CLICKHOUSE_TOKEN_FILE:?set SHARDLOG_CLICKHOUSE_TOKEN or SHARDLOG_CLICKHOUSE_TOKEN_FILE}"
-    [[ -f $SHARDLOG_CLICKHOUSE_TOKEN_FILE ]] || {
-        echo "token file does not exist: $SHARDLOG_CLICKHOUSE_TOKEN_FILE" >&2
+if [[ -z ${SHARD_TELEMETRY_CLICKHOUSE_TOKEN:-} ]]; then
+    : "${SHARD_TELEMETRY_CLICKHOUSE_TOKEN_FILE:?set SHARD_TELEMETRY_CLICKHOUSE_TOKEN or SHARD_TELEMETRY_CLICKHOUSE_TOKEN_FILE}"
+    [[ -f $SHARD_TELEMETRY_CLICKHOUSE_TOKEN_FILE ]] || {
+        echo "token file does not exist: $SHARD_TELEMETRY_CLICKHOUSE_TOKEN_FILE" >&2
         exit 2
     }
-    SHARDLOG_CLICKHOUSE_TOKEN=$(<"$SHARDLOG_CLICKHOUSE_TOKEN_FILE")
+    SHARD_TELEMETRY_CLICKHOUSE_TOKEN=$(<"$SHARD_TELEMETRY_CLICKHOUSE_TOKEN_FILE")
 fi
-[[ -n $SHARDLOG_CLICKHOUSE_TOKEN ]] || {
-    echo "ShardLog ClickHouse token must not be empty" >&2
+[[ -n $SHARD_TELEMETRY_CLICKHOUSE_TOKEN ]] || {
+    echo "ShardTelemetry ClickHouse token must not be empty" >&2
     exit 2
 }
 
 CLICKHOUSE_BIN=${CLICKHOUSE_BIN:-clickhouse}
 CLICKHOUSE_IMAGE=${CLICKHOUSE_IMAGE:-}
 CLICKHOUSE_NETWORK=${CLICKHOUSE_NETWORK:-host}
-SHARDLOG_URL=${SHARDLOG_URL:-http://127.0.0.1:3100/shardlog/api/v1/clickhouse/scan}
-SHARDLOG_TENANT=${SHARDLOG_TENANT:-fake}
+SHARD_TELEMETRY_URL=${SHARD_TELEMETRY_URL:-http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan}
+SHARD_TELEMETRY_TENANT=${SHARD_TELEMETRY_TENANT:-fake}
 EXPECTED_CLICKHOUSE_VERSION=${EXPECTED_CLICKHOUSE_VERSION:-26.3.17.56}
 STRICT_CLICKHOUSE_VERSION=${STRICT_CLICKHOUSE_VERSION:-1}
-SHARDLOG_ADAPTER_MODE=${SHARDLOG_ADAPTER_MODE:-0}
+SHARD_TELEMETRY_ADAPTER_MODE=${SHARD_TELEMETRY_ADAPTER_MODE:-0}
 
 if [[ -n $CLICKHOUSE_IMAGE ]]; then
     command -v docker >/dev/null || {
@@ -59,20 +59,20 @@ escape_sql() {
     printf '%s' "$value"
 }
 
-URL_SQL=$(escape_sql "$SHARDLOG_URL")
-TOKEN_SQL=$(escape_sql "$SHARDLOG_CLICKHOUSE_TOKEN")
-TENANT_SQL=$(escape_sql "$SHARDLOG_TENANT")
+URL_SQL=$(escape_sql "$SHARD_TELEMETRY_URL")
+TOKEN_SQL=$(escape_sql "$SHARD_TELEMETRY_CLICKHOUSE_TOKEN")
+TENANT_SQL=$(escape_sql "$SHARD_TELEMETRY_TENANT")
 STRUCTURE="tenant String, timestamp DateTime64(9, 'UTC'), partition UInt32, offset UInt64, message String, labels Map(String, String), metadata Map(String, String)"
 STRUCTURE_SQL=$(escape_sql "$STRUCTURE")
-if [[ $SHARDLOG_ADAPTER_MODE -eq 1 ]]; then
-    SOURCE=shardlog_source
-    SOURCE_SETUP="CREATE TABLE shardlog_source ($STRUCTURE) ENGINE = ShardLog('$URL_SQL', 'ArrowStream', headers('Authorization' = 'Bearer $TOKEN_SQL', 'X-Scope-OrgID' = '$TENANT_SQL'));"
+if [[ $SHARD_TELEMETRY_ADAPTER_MODE -eq 1 ]]; then
+    SOURCE=shardtelemetry_source
+    SOURCE_SETUP="CREATE TABLE shardtelemetry_source ($STRUCTURE) ENGINE = ShardTelemetry('$URL_SQL', 'ArrowStream', headers('Authorization' = 'Bearer $TOKEN_SQL', 'X-Scope-OrgID' = '$TENANT_SQL'));"
 else
     SOURCE="url('$URL_SQL', 'ArrowStream', '$STRUCTURE_SQL', headers('Authorization' = 'Bearer $TOKEN_SQL', 'X-Scope-OrgID' = '$TENANT_SQL'))"
     SOURCE_SETUP=
 fi
 
-RESULT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/shard-log-clickhouse-compat.XXXXXX")
+RESULT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/shard-telemetry-clickhouse-compat.XXXXXX")
 cleanup() {
     rm -rf -- "$RESULT_DIR"
 }
@@ -122,8 +122,8 @@ for entry in "${queries[@]}"; do
     echo "PASS $name"
 done
 
-if [[ $SHARDLOG_ADAPTER_MODE -eq 1 ]]; then
-    echo "StorageShardLog compatibility smoke passed with $OBSERVED_CLICKHOUSE_VERSION"
+if [[ $SHARD_TELEMETRY_ADAPTER_MODE -eq 1 ]]; then
+    echo "StorageShardTelemetry compatibility smoke passed with $OBSERVED_CLICKHOUSE_VERSION"
 else
     echo "ClickHouse compatibility smoke passed with $OBSERVED_CLICKHOUSE_VERSION"
 fi

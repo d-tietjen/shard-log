@@ -6,7 +6,9 @@ use bytes::Bytes;
 use shard_stream_core::LogicalOffset;
 
 use crate::structural::decode_embedded_frame_index_section;
-use crate::{CompressionCohortId, EmbeddedFrameIndex, LogDbError, LogDbResult, TierBlockEntry};
+use crate::{
+    CompressionCohortId, EmbeddedFrameIndex, TelemetryError, TelemetryResult, TierBlockEntry,
+};
 
 const QUERY_INDEX_MAGIC: &[u8; 8] = b"SLTQIX1\0";
 const QUERY_INDEX_HEADER_BYTES: usize = QUERY_INDEX_MAGIC.len() + 8;
@@ -59,9 +61,9 @@ pub(crate) fn write_tier_ingest_group(
     appends: &[TierIngestAppendSource],
     payload_path: &Path,
     query_index_path: &Path,
-) -> LogDbResult<Vec<TierBlockEntry>> {
+) -> TelemetryResult<Vec<TierBlockEntry>> {
     if appends.is_empty() || appends.iter().any(|append| append.frames.is_empty()) {
-        return Err(LogDbError::ObjectStore(
+        return Err(TelemetryError::ObjectStore(
             "an ingest tier group requires nonempty appends and frames".into(),
         ));
     }
@@ -71,14 +73,14 @@ pub(crate) fn write_tier_ingest_group(
     let mut raw_index = Vec::new();
     append_u32(
         &mut raw_index,
-        u32::try_from(appends.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+        u32::try_from(appends.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
     );
     let mut blocks = Vec::new();
     let mut payload_offset = 0u64;
     let mut previous_frame_id = None;
     for append in appends {
         if append.first_offset > append.last_offset || append.record_count == 0 {
-            return Err(LogDbError::CorruptTier(
+            return Err(TelemetryError::CorruptTier(
                 "ingest tier append bounds are invalid".into(),
             ));
         }
@@ -87,7 +89,7 @@ pub(crate) fn write_tier_ingest_group(
         append_u32(&mut raw_index, append.record_count);
         append_u32(
             &mut raw_index,
-            u32::try_from(append.frames.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+            u32::try_from(append.frames.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
         );
         for frame in &append.frames {
             if previous_frame_id.is_some_and(|previous| previous >= frame.frame_id)
@@ -95,13 +97,13 @@ pub(crate) fn write_tier_ingest_group(
                 || frame.compressed.is_empty()
                 || frame.min_timestamp_unix_nanos > frame.max_timestamp_unix_nanos
             {
-                return Err(LogDbError::CorruptTier(
+                return Err(TelemetryError::CorruptTier(
                     "ingest tier frame metadata is invalid".into(),
                 ));
             }
             previous_frame_id = Some(frame.frame_id);
-            let payload_bytes =
-                u64::try_from(frame.compressed.len()).map_err(|_| LogDbError::RecordTooLarge)?;
+            let payload_bytes = u64::try_from(frame.compressed.len())
+                .map_err(|_| TelemetryError::RecordTooLarge)?;
             let payload_checksum = checksum_bytes(&frame.compressed);
             payload
                 .write_all(&frame.compressed)
@@ -112,7 +114,8 @@ pub(crate) fn write_tier_ingest_group(
             append_u32(&mut raw_index, frame.record_count);
             append_u64(
                 &mut raw_index,
-                u64::try_from(frame.structural_bytes).map_err(|_| LogDbError::RecordTooLarge)?,
+                u64::try_from(frame.structural_bytes)
+                    .map_err(|_| TelemetryError::RecordTooLarge)?,
             );
             append_u64(&mut raw_index, frame.min_timestamp_unix_nanos);
             append_u64(&mut raw_index, frame.max_timestamp_unix_nanos);
@@ -130,9 +133,9 @@ pub(crate) fn write_tier_ingest_group(
                 last_offset: append.last_offset.get(),
                 record_count: frame.record_count,
                 source_bytes: u64::try_from(frame.structural_bytes)
-                    .map_err(|_| LogDbError::RecordTooLarge)?,
+                    .map_err(|_| TelemetryError::RecordTooLarge)?,
                 structural_bytes: u64::try_from(frame.structural_bytes)
-                    .map_err(|_| LogDbError::RecordTooLarge)?,
+                    .map_err(|_| TelemetryError::RecordTooLarge)?,
                 stored_bytes: payload_bytes,
                 min_timestamp_unix_nanos: frame.min_timestamp_unix_nanos,
                 max_timestamp_unix_nanos: frame.max_timestamp_unix_nanos,
@@ -146,17 +149,17 @@ pub(crate) fn write_tier_ingest_group(
             });
             payload_offset = payload_offset
                 .checked_add(payload_bytes)
-                .ok_or(LogDbError::RecordTooLarge)?;
+                .ok_or(TelemetryError::RecordTooLarge)?;
         }
     }
     if raw_index.len() > MAX_QUERY_INDEX_BYTES {
-        return Err(LogDbError::RecordTooLarge);
+        return Err(TelemetryError::RecordTooLarge);
     }
     payload
         .sync_all()
         .map_err(|error| storage_io("sync ingest payload pack", error))?;
     let compressed_index = zstd::bulk::compress(&raw_index, QUERY_INDEX_LEVEL)
-        .map_err(|error| LogDbError::CompressionFailed(error.to_string()))?;
+        .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
     let mut index_file = open_truncated(query_index_path, "create ingest query index")?;
     index_file
         .write_all(QUERY_INDEX_MAGIC)
@@ -174,11 +177,11 @@ pub(crate) fn write_tier_ingest_group(
 pub(crate) fn decode_tier_ingest_group(
     encoded: &[u8],
     blocks: &[TierBlockEntry],
-) -> LogDbResult<Vec<DecodedTierIngestAppend>> {
+) -> TelemetryResult<Vec<DecodedTierIngestAppend>> {
     if encoded.len() < QUERY_INDEX_HEADER_BYTES
         || encoded.get(..QUERY_INDEX_MAGIC.len()) != Some(QUERY_INDEX_MAGIC)
     {
-        return Err(LogDbError::CorruptTier(
+        return Err(TelemetryError::CorruptTier(
             "ingest query-index header is invalid".into(),
         ));
     }
@@ -187,18 +190,18 @@ pub(crate) fn decode_tier_ingest_group(
             .try_into()
             .expect("fixed query-index length"),
     ))
-    .map_err(|_| LogDbError::RecordTooLarge)?;
+    .map_err(|_| TelemetryError::RecordTooLarge)?;
     if uncompressed_bytes == 0 || uncompressed_bytes > MAX_QUERY_INDEX_BYTES {
-        return Err(LogDbError::CorruptTier(
+        return Err(TelemetryError::CorruptTier(
             "ingest query-index decoded length is invalid".into(),
         ));
     }
     let raw = zstd::bulk::decompress(&encoded[QUERY_INDEX_HEADER_BYTES..], uncompressed_bytes)
         .map_err(|error| {
-            LogDbError::CorruptTier(format!("decompress ingest query index: {error}"))
+            TelemetryError::CorruptTier(format!("decompress ingest query index: {error}"))
         })?;
     if raw.len() != uncompressed_bytes {
-        return Err(LogDbError::CorruptTier(
+        return Err(TelemetryError::CorruptTier(
             "ingest query-index decoded length changed".into(),
         ));
     }
@@ -213,7 +216,7 @@ pub(crate) fn decode_tier_ingest_group(
         let record_count = read_u32(&raw, &mut cursor)?;
         let frame_count = read_u32(&raw, &mut cursor)? as usize;
         if first_offset > last_offset || record_count == 0 {
-            return Err(LogDbError::CorruptTier(
+            return Err(TelemetryError::CorruptTier(
                 "ingest query-index append metadata is invalid".into(),
             ));
         }
@@ -224,7 +227,7 @@ pub(crate) fn decode_tier_ingest_group(
             let cohort = CompressionCohortId::new(read_u64(&raw, &mut cursor)?);
             let frame_record_count = read_u32(&raw, &mut cursor)?;
             let structural_bytes = usize::try_from(read_u64(&raw, &mut cursor)?)
-                .map_err(|_| LogDbError::RecordTooLarge)?;
+                .map_err(|_| TelemetryError::RecordTooLarge)?;
             let min_timestamp_unix_nanos = read_u64(&raw, &mut cursor)?;
             let max_timestamp_unix_nanos = read_u64(&raw, &mut cursor)?;
             let payload_offset = read_u64(&raw, &mut cursor)?;
@@ -232,10 +235,12 @@ pub(crate) fn decode_tier_ingest_group(
             let index_bytes = read_bytes(&raw, &mut cursor)?;
             let index = decode_embedded_frame_index_section(
                 index_bytes,
-                usize::try_from(frame_record_count).map_err(|_| LogDbError::RecordTooLarge)?,
+                usize::try_from(frame_record_count).map_err(|_| TelemetryError::RecordTooLarge)?,
             )?;
             let block = blocks.get(block_index).ok_or_else(|| {
-                LogDbError::CorruptTier("ingest query index has more frames than manifest".into())
+                TelemetryError::CorruptTier(
+                    "ingest query index has more frames than manifest".into(),
+                )
             })?;
             if block.block_id != frame_id
                 || block.source_compression_cohort != cohort.get()
@@ -248,7 +253,7 @@ pub(crate) fn decode_tier_ingest_group(
                 || block.payload_offset != payload_offset
                 || block.payload_bytes != payload_bytes
             {
-                return Err(LogDbError::CorruptTier(
+                return Err(TelemetryError::CorruptTier(
                     "ingest query index disagrees with group manifest".into(),
                 ));
             }
@@ -267,7 +272,7 @@ pub(crate) fn decode_tier_ingest_group(
             block_index += 1;
         }
         if frames.is_empty() {
-            return Err(LogDbError::CorruptTier(
+            return Err(TelemetryError::CorruptTier(
                 "ingest query-index append has no frames".into(),
             ));
         }
@@ -279,14 +284,14 @@ pub(crate) fn decode_tier_ingest_group(
         });
     }
     if cursor != raw.len() || block_index != blocks.len() {
-        return Err(LogDbError::CorruptTier(
+        return Err(TelemetryError::CorruptTier(
             "ingest query index has trailing or missing frames".into(),
         ));
     }
     Ok(appends)
 }
 
-fn create_parent(path: &Path) -> LogDbResult<()> {
+fn create_parent(path: &Path) -> TelemetryResult<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| storage_io("create ingest tier spool", error))?;
@@ -294,7 +299,7 @@ fn create_parent(path: &Path) -> LogDbResult<()> {
     Ok(())
 }
 
-fn open_truncated(path: &Path, operation: &str) -> LogDbResult<File> {
+fn open_truncated(path: &Path, operation: &str) -> TelemetryResult<File> {
     OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -303,7 +308,7 @@ fn open_truncated(path: &Path, operation: &str) -> LogDbResult<File> {
         .map_err(|error| storage_io(operation, error))
 }
 
-fn sync_parent(path: &Path) -> LogDbResult<()> {
+fn sync_parent(path: &Path) -> TelemetryResult<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
@@ -320,51 +325,53 @@ fn append_u64(output: &mut Vec<u8>, value: u64) {
     output.extend_from_slice(&value.to_le_bytes());
 }
 
-fn append_bytes(output: &mut Vec<u8>, value: &[u8]) -> LogDbResult<()> {
+fn append_bytes(output: &mut Vec<u8>, value: &[u8]) -> TelemetryResult<()> {
     append_u32(
         output,
-        u32::try_from(value.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+        u32::try_from(value.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
     );
     output.extend_from_slice(value);
     Ok(())
 }
 
-fn read_u32(bytes: &[u8], cursor: &mut usize) -> LogDbResult<u32> {
+fn read_u32(bytes: &[u8], cursor: &mut usize) -> TelemetryResult<u32> {
     Ok(u32::from_le_bytes(read_array(bytes, cursor)?))
 }
 
-fn read_u64(bytes: &[u8], cursor: &mut usize) -> LogDbResult<u64> {
+fn read_u64(bytes: &[u8], cursor: &mut usize) -> TelemetryResult<u64> {
     Ok(u64::from_le_bytes(read_array(bytes, cursor)?))
 }
 
-fn read_bytes<'a>(bytes: &'a [u8], cursor: &mut usize) -> LogDbResult<&'a [u8]> {
+fn read_bytes<'a>(bytes: &'a [u8], cursor: &mut usize) -> TelemetryResult<&'a [u8]> {
     let length = read_u32(bytes, cursor)? as usize;
     let end = cursor
         .checked_add(length)
-        .ok_or(LogDbError::RecordTooLarge)?;
-    let value = bytes
-        .get(*cursor..end)
-        .ok_or_else(|| LogDbError::CorruptTier("ingest query-index field is truncated".into()))?;
+        .ok_or(TelemetryError::RecordTooLarge)?;
+    let value = bytes.get(*cursor..end).ok_or_else(|| {
+        TelemetryError::CorruptTier("ingest query-index field is truncated".into())
+    })?;
     *cursor = end;
     Ok(value)
 }
 
-fn read_array<const N: usize>(bytes: &[u8], cursor: &mut usize) -> LogDbResult<[u8; N]> {
-    let end = cursor.checked_add(N).ok_or(LogDbError::RecordTooLarge)?;
+fn read_array<const N: usize>(bytes: &[u8], cursor: &mut usize) -> TelemetryResult<[u8; N]> {
+    let end = cursor
+        .checked_add(N)
+        .ok_or(TelemetryError::RecordTooLarge)?;
     let value = bytes
         .get(*cursor..end)
-        .ok_or_else(|| LogDbError::CorruptTier("ingest query index is truncated".into()))?
+        .ok_or_else(|| TelemetryError::CorruptTier("ingest query index is truncated".into()))?
         .try_into()
         .expect("fixed read length");
     *cursor = end;
     Ok(value)
 }
 
-fn ensure_count(count: usize, remaining: usize) -> LogDbResult<()> {
+fn ensure_count(count: usize, remaining: usize) -> TelemetryResult<()> {
     if count <= remaining {
         Ok(())
     } else {
-        Err(LogDbError::CorruptTier(
+        Err(TelemetryError::CorruptTier(
             "ingest query-index count exceeds remaining bytes".into(),
         ))
     }
@@ -374,6 +381,6 @@ fn checksum_bytes(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
-fn storage_io(operation: &str, error: std::io::Error) -> LogDbError {
-    LogDbError::StorageIo(format!("{operation}: {error}"))
+fn storage_io(operation: &str, error: std::io::Error) -> TelemetryError {
+    TelemetryError::StorageIo(format!("{operation}: {error}"))
 }

@@ -6,7 +6,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Instant;
 
 use crate::structural::dictionary_training_sections;
-use crate::{CompressionPlacementId, DictionaryCatalog, DictionaryId, LogDbError, LogDbResult};
+use crate::{
+    CompressionPlacementId, DictionaryCatalog, DictionaryId, TelemetryError, TelemetryResult,
+};
 
 const TRAINING_SAMPLE_CHUNK_BYTES: usize = 16 * 1024;
 
@@ -55,34 +57,34 @@ impl Default for RealtimeDictionaryConfig {
 }
 
 impl RealtimeDictionaryConfig {
-    fn validate(&self) -> LogDbResult<()> {
+    fn validate(&self) -> TelemetryResult<()> {
         if self.max_block_sample_bytes < 8 {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "realtime dictionary max_block_sample_bytes must be at least 8",
             ));
         }
         if self.training_sample_bytes < self.max_block_sample_bytes {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "realtime dictionary training_sample_bytes must cover one block sample",
             ));
         }
         if self.dictionary_bytes < 256 || self.dictionary_bytes >= self.training_sample_bytes {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "realtime dictionary dictionary_bytes must be at least 256 and smaller than the training sample",
             ));
         }
         if self.holdout_blocks == 0 || self.queue_blocks == 0 || self.max_placements == 0 {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "realtime dictionary holdout_blocks, queue_blocks, and max_placements must be nonzero",
             ));
         }
         if self.min_net_savings_bps > 10_000 {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "realtime dictionary min_net_savings_bps cannot exceed 10000",
             ));
         }
         if self.retrain_after_bytes == 0 {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "realtime dictionary retrain_after_bytes must be nonzero",
             ));
         }
@@ -297,10 +299,10 @@ impl RealtimeDictionaryTrainer {
         config: RealtimeDictionaryConfig,
         compression_level: i32,
         catalog: Arc<DictionaryCatalog>,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         config.validate()?;
         if !zstd::compression_level_range().contains(&compression_level) {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "realtime dictionary compression level is outside zstd's supported range",
             ));
         }
@@ -310,7 +312,7 @@ impl RealtimeDictionaryTrainer {
         let worker_catalog = Arc::clone(&catalog);
         let worker_stats = Arc::clone(&stats);
         let worker = thread::Builder::new()
-            .name("shard-log-dictionary-trainer".to_owned())
+            .name("shard-telemetry-dictionary-trainer".to_owned())
             .spawn(move || {
                 run_trainer(
                     receiver,
@@ -321,7 +323,7 @@ impl RealtimeDictionaryTrainer {
                 );
             })
             .map_err(|error| {
-                LogDbError::DictionaryTrainingFailed(format!(
+                TelemetryError::DictionaryTrainingFailed(format!(
                     "failed to spawn dictionary trainer: {error}"
                 ))
             })?;
@@ -351,14 +353,14 @@ impl RealtimeDictionaryTrainer {
     }
 
     /// Waits until all observations submitted before this call have been handled.
-    pub fn flush(&self) -> LogDbResult<()> {
+    pub fn flush(&self) -> TelemetryResult<()> {
         let (complete, receiver) = sync_channel(1);
         self.sender
             .send(TrainerCommand::Flush(complete))
-            .map_err(|_| LogDbError::DictionaryTrainerUnavailable)?;
+            .map_err(|_| TelemetryError::DictionaryTrainerUnavailable)?;
         receiver
             .recv()
-            .map_err(|_| LogDbError::DictionaryTrainerUnavailable)
+            .map_err(|_| TelemetryError::DictionaryTrainerUnavailable)
     }
 
     /// Returns a lock-free statistics snapshot.
@@ -905,7 +907,7 @@ mod tests {
         config.dictionary_bytes = config.training_sample_bytes;
         let error = RealtimeDictionaryTrainer::start(config, 1, catalog)
             .expect_err("invalid config is rejected");
-        assert!(matches!(error, LogDbError::InvalidConfig(_)));
+        assert!(matches!(error, TelemetryError::InvalidConfig(_)));
     }
 
     #[test]

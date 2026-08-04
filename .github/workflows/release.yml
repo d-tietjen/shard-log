@@ -34,13 +34,13 @@ jobs:
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
           cargo test --workspace --all-targets --all-features --locked
-          cargo build --release --locked --bin shard-log-server
+          cargo build --release --locked --bin shard-telemetry-server
       - name: Assemble distribution
         run: |
           version="${GITHUB_REF_NAME#v}"
-          package="shard-log-${version}-x86_64-unknown-linux-gnu"
+          package="shard-telemetry-${version}-x86_64-unknown-linux-gnu"
           mkdir -p "dist/${package}"
-          cp target/release/shard-log-server "dist/${package}/"
+          cp target/release/shard-telemetry-server "dist/${package}/"
           cp LICENSE NOTICE THIRD_PARTY_NOTICES README.md CHANGELOG.md SECURITY.md "dist/${package}/"
           tar -C dist -czf "dist/${package}.tar.gz" "${package}"
           sha256sum "dist/${package}.tar.gz" > dist/SHA256SUMS
@@ -49,7 +49,7 @@ jobs:
         with:
           path: dist
           format: spdx-json
-          output-file: dist/shard-log.spdx.json
+          output-file: dist/shard-telemetry.spdx.json
           dependency-snapshot: true
       - name: Attest release archive
         uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4

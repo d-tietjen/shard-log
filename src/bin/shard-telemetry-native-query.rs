@@ -5,15 +5,15 @@ use std::net::TcpStream;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use shard_log::{
+use shard_telemetry::{
     NATIVE_FRAME_HEADER_BYTES, NativeFrame, NativeFrameHeader, NativeOpcode, NativeQuery,
-    NativeQueryDirection, NativeStatus, decode_native_log_batch, encode_native_query,
+    NativeQueryDirection, NativeStatus, decode_native_log_query_result, encode_native_query,
 };
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "shard-log-native-query",
-    about = "Exact indexed-query latency client for ShardLog's native protocol"
+    name = "shard-telemetry-native-query",
+    about = "Exact indexed-query latency client for ShardTelemetry's native protocol"
 )]
 struct Arguments {
     #[arg(long, default_value = "127.0.0.1")]
@@ -128,8 +128,8 @@ fn execute(
         .into());
     }
     let response_bytes = response.len();
-    let batch = decode_native_log_batch(&response)?;
-    Ok((batch.entries.len(), response_bytes))
+    let result = decode_native_log_query_result(&response)?;
+    Ok((result.entries.len(), response_bytes))
 }
 
 fn percentile(latencies: &[Duration], percentile: f64) -> f64 {

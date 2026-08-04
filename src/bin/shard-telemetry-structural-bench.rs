@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 
 use memmap2::{Mmap, MmapOptions};
 use serde::Deserialize;
-use shard_log::{
+use shard_stream_core::{LogicalOffset, LogicalPartitionId, TopicId, TopicPartition};
+use shard_telemetry::{
     BlockQueryIndex, CompressionBlockCollator, CompressionCohortId, CompressionLocalityConfig,
     CompressionLocalityRecord, CompressionLocalityStats, CompressionPlacementId,
     DecodedStructuralRecord, DictionaryCatalog, DictionaryId, MessageFingerprint,
@@ -25,7 +26,6 @@ use shard_log::{
     RealtimeDictionaryStats, RealtimeDictionaryTrainer, StructuralRecordView,
     decode_structural_block, encode_indexed_structural_records, fingerprint_message,
 };
-use shard_stream_core::{LogicalOffset, LogicalPartitionId, TopicId, TopicPartition};
 
 const DEFAULT_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
 const DEFAULT_BLOCK_BYTES: usize = 8 * 1024 * 1024;
@@ -285,7 +285,7 @@ fn parse_settings() -> Result<Settings, Box<dyn Error>> {
     let input = arguments
         .next()
         .map(PathBuf::from)
-        .ok_or("usage: shard-log-structural-bench <docker-json.log> [--report PATH] [--output-dir PATH] [--limit-bytes N] [--block-bytes N] [--workers N] [--locality enabled|disabled] [--dictionary disabled|realtime] [--index disabled|persistent]")?;
+        .ok_or("usage: shard-telemetry-structural-bench <docker-json.log> [--report PATH] [--output-dir PATH] [--limit-bytes N] [--block-bytes N] [--workers N] [--locality enabled|disabled] [--dictionary disabled|realtime] [--index disabled|persistent]")?;
     let mut settings = Settings {
         input,
         report_path: None,
@@ -1172,7 +1172,7 @@ fn write_dictionary_assignments(
 
 fn write_dictionaries(
     output_dir: &std::path::Path,
-    snapshot: &shard_log::DictionaryCatalogSnapshot,
+    snapshot: &shard_telemetry::DictionaryCatalogSnapshot,
 ) -> Result<u64, Box<dyn Error>> {
     let dictionaries = snapshot.dictionaries().collect::<Vec<_>>();
     if dictionaries.is_empty() {
@@ -1776,7 +1776,7 @@ fn merge_locality_stats(
 }
 
 fn render_report(settings: &Settings, benchmark: &Benchmark) -> String {
-    let mut report = String::from("shard-log Docker JSON structural benchmark\n");
+    let mut report = String::from("shard-telemetry Docker JSON structural benchmark\n");
     report.push_str(&format!("input: {}\n", settings.input.display()));
     if let Some(output_dir) = &settings.output_dir {
         report.push_str(&format!("output directory: {}\n", output_dir.display()));
@@ -2112,7 +2112,7 @@ mod tests {
     #[test]
     fn deterministic_spans_skip_partial_edges_without_gaps() {
         let path = std::env::temp_dir().join(format!(
-            "shard-log-spans-{}-{}.json",
+            "shard-telemetry-spans-{}-{}.json",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -2175,7 +2175,7 @@ mod tests {
     #[test]
     fn dictionary_assignments_are_sparse_run_length_encoded() {
         let directory = std::env::temp_dir().join(format!(
-            "shard-log-dictionary-runs-{}-{}",
+            "shard-telemetry-dictionary-runs-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)

@@ -6,11 +6,15 @@ use std::sync::Arc;
 
 use pco::standalone::{simple_compress, simple_decompress_into};
 use pco::{ChunkConfig, DeltaSpec, ModeSpec};
+use serde::{Deserialize, Serialize};
 use shard_stream_core::LogicalOffset;
 
-use crate::{DurableLogRecord, LogDbError, LogDbResult, MetadataField};
+use crate::{
+    DurableLog, MetadataField, ResourceContext, ScopeContext, SpanId, TelemetryAttribute,
+    TelemetryError, TelemetryResult, TelemetryValue, TraceId,
+};
 
-const STRUCTURAL_BLOCK_MAGIC: &[u8; 4] = b"SLOG";
+const STRUCTURAL_BLOCK_MAGIC: &[u8; 4] = b"STLG";
 const EMBEDDED_INDEX_MAGIC: &[u8; 4] = b"SLI1";
 const RAW_BODY: u8 = 0;
 const TEMPLATE_BODY: u8 = 1;
@@ -36,13 +40,14 @@ struct SeekableRecordLane<'a> {
 }
 
 impl SeekableRecordLane<'_> {
-    fn checkpoint_payload(&self, checkpoint: usize) -> LogDbResult<&[u8]> {
-        let start = *self
-            .checkpoints
-            .get(checkpoint)
-            .ok_or(LogDbError::InvalidBlockEncoding(
-                "record lane checkpoint is missing",
-            ))?;
+    fn checkpoint_payload(&self, checkpoint: usize) -> TelemetryResult<&[u8]> {
+        let start =
+            *self
+                .checkpoints
+                .get(checkpoint)
+                .ok_or(TelemetryError::InvalidBlockEncoding(
+                    "record lane checkpoint is missing",
+                ))?;
         let end = self
             .checkpoints
             .get(checkpoint + 1)
@@ -50,7 +55,7 @@ impl SeekableRecordLane<'_> {
             .unwrap_or(self.payload.len());
         self.payload
             .get(start..end)
-            .ok_or(LogDbError::InvalidBlockEncoding(
+            .ok_or(TelemetryError::InvalidBlockEncoding(
                 "record lane checkpoint is invalid",
             ))
     }
@@ -67,6 +72,94 @@ pub struct DecodedStructuralRecord {
     pub message: Arc<str>,
     /// Exact metadata fields reconstructed from the attribute lanes.
     pub fields: Arc<Vec<MetadataField>>,
+    /// Original observed timestamp.
+    pub observed_timestamp_unix_nanos: u64,
+    /// Exact typed OTLP body.
+    pub body: Option<TelemetryValue>,
+    /// Exact typed record attributes.
+    pub attributes: Arc<Vec<TelemetryAttribute>>,
+    /// Exact resource context.
+    pub resource: Arc<ResourceContext>,
+    /// Exact instrumentation scope context.
+    pub scope: Arc<ScopeContext>,
+    /// Raw OTLP severity enum value.
+    pub severity_number: i32,
+    /// Exact severity text.
+    pub severity_text: Arc<str>,
+    /// Dropped record-attribute count.
+    pub dropped_attributes_count: u32,
+    /// Raw OTLP flags.
+    pub flags: u32,
+    /// Optional binary trace ID.
+    pub trace_id: Option<TraceId>,
+    /// Optional binary span ID.
+    pub span_id: Option<SpanId>,
+    /// Exact event name.
+    pub event_name: Arc<str>,
+}
+
+/// Borrowed exact OTLP metadata exposed to the structural encoder.
+#[derive(Debug, Clone, Copy)]
+pub struct StructuralLogMetadataRef<'a> {
+    /// Original observed timestamp.
+    pub observed_timestamp_unix_nanos: u64,
+    /// Exact body, including an explicitly empty `AnyValue`.
+    pub body: Option<&'a TelemetryValue>,
+    /// Record attributes.
+    pub attributes: &'a [TelemetryAttribute],
+    /// Resource context.
+    pub resource: &'a ResourceContext,
+    /// Scope context.
+    pub scope: &'a ScopeContext,
+    /// Raw severity enum value.
+    pub severity_number: i32,
+    /// Severity text.
+    pub severity_text: &'a str,
+    /// Dropped record-attribute count.
+    pub dropped_attributes_count: u32,
+    /// Raw log flags.
+    pub flags: u32,
+    /// Optional binary trace ID.
+    pub trace_id: Option<TraceId>,
+    /// Optional binary span ID.
+    pub span_id: Option<SpanId>,
+    /// Event name.
+    pub event_name: &'a str,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct StructuralLogMetadata {
+    observed_timestamp_unix_nanos: u64,
+    body: Option<TelemetryValue>,
+    attributes: Arc<Vec<TelemetryAttribute>>,
+    resource: Arc<ResourceContext>,
+    scope: Arc<ScopeContext>,
+    severity_number: i32,
+    severity_text: Arc<str>,
+    dropped_attributes_count: u32,
+    flags: u32,
+    trace_id: Option<TraceId>,
+    span_id: Option<SpanId>,
+    event_name: Arc<str>,
+}
+
+impl From<StructuralLogMetadataRef<'_>> for StructuralLogMetadata {
+    fn from(value: StructuralLogMetadataRef<'_>) -> Self {
+        Self {
+            observed_timestamp_unix_nanos: value.observed_timestamp_unix_nanos,
+            body: value.body.cloned(),
+            attributes: Arc::new(value.attributes.to_vec()),
+            resource: Arc::new(value.resource.clone()),
+            scope: Arc::new(value.scope.clone()),
+            severity_number: value.severity_number,
+            severity_text: Arc::from(value.severity_text),
+            dropped_attributes_count: value.dropped_attributes_count,
+            flags: value.flags,
+            trace_id: value.trace_id,
+            span_id: value.span_id,
+            event_name: Arc::from(value.event_name),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -115,14 +208,14 @@ impl AttributeValueTable {
         &self.entries[..self.dictionary_len]
     }
 
-    fn resolve(&self, unresolved_id: u32) -> LogDbResult<(usize, &[u8])> {
+    fn resolve(&self, unresolved_id: u32) -> TelemetryResult<(usize, &[u8])> {
         let entry_id = *self.resolved_entry_ids.get(unresolved_id as usize).ok_or(
-            LogDbError::InvalidBlockEncoding("attribute value ID is out of range"),
+            TelemetryError::InvalidBlockEncoding("attribute value ID is out of range"),
         )? as usize;
         let value = self
             .entries
             .get(entry_id)
-            .ok_or(LogDbError::InvalidBlockEncoding(
+            .ok_or(TelemetryError::InvalidBlockEncoding(
                 "resolved attribute value ID is out of range",
             ))?;
         Ok((entry_id, value))
@@ -322,7 +415,7 @@ impl EmbeddedFrameIndex {
     }
 
     /// Encoded bytes occupied by the embedded frame-index section.
-    pub fn encoded_bytes(&self) -> LogDbResult<Vec<u8>> {
+    pub fn encoded_bytes(&self) -> TelemetryResult<Vec<u8>> {
         self.encode()
     }
 
@@ -331,13 +424,13 @@ impl EmbeddedFrameIndex {
         template_ids: &[Option<usize>],
         attributes: &AttributeTables,
         fields: &ParsedFieldSets,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         let record_count =
-            u32::try_from(messages.layout_ids.len()).map_err(|_| LogDbError::RecordTooLarge)?;
+            u32::try_from(messages.layout_ids.len()).map_err(|_| TelemetryError::RecordTooLarge)?;
         if template_ids.len() != messages.layouts.len()
             || fields.set_ids.len() != messages.layout_ids.len()
         {
-            return Err(LogDbError::InvalidBlockEncoding(
+            return Err(TelemetryError::InvalidBlockEncoding(
                 "embedded index column count mismatch",
             ));
         }
@@ -348,16 +441,16 @@ impl EmbeddedFrameIndex {
             .max()
             .map_or(0usize, |maximum| maximum.saturating_add(1));
         let fallback_layout_id =
-            u32::try_from(template_count).map_err(|_| LogDbError::RecordTooLarge)?;
+            u32::try_from(template_count).map_err(|_| TelemetryError::RecordTooLarge)?;
         let layout_count = if record_count == 0 {
             0
         } else {
             fallback_layout_id
                 .checked_add(1)
-                .ok_or(LogDbError::RecordTooLarge)?
+                .ok_or(TelemetryError::RecordTooLarge)?
         };
         let field_set_count =
-            u32::try_from(fields.sets.len()).map_err(|_| LogDbError::RecordTooLarge)?;
+            u32::try_from(fields.sets.len()).map_err(|_| TelemetryError::RecordTooLarge)?;
 
         let mut term_layouts = HashMap::<String, Vec<u32>>::new();
         let mut term_membership = MembershipFilter::new();
@@ -371,14 +464,15 @@ impl EmbeddedFrameIndex {
                 for term in &message.terms {
                     let term =
                         std::str::from_utf8(&message.message[term.clone()]).map_err(|_| {
-                            LogDbError::InvalidBlockEncoding("message term is invalid UTF-8")
+                            TelemetryError::InvalidBlockEncoding("message term is invalid UTF-8")
                         })?;
                     let normalized = normalize_index_term(term);
                     term_membership.insert(normalized.as_bytes());
                 }
                 continue;
             };
-            let template_id = u32::try_from(template_id).map_err(|_| LogDbError::RecordTooLarge)?;
+            let template_id =
+                u32::try_from(template_id).map_err(|_| TelemetryError::RecordTooLarge)?;
             if !message.values.is_empty() {
                 residual_layout_ids.push(template_id);
             }
@@ -389,7 +483,7 @@ impl EmbeddedFrameIndex {
                     .any(|value| term_range.start < value.end && value.start < term_range.end);
                 let term =
                     std::str::from_utf8(&message.message[term_range.clone()]).map_err(|_| {
-                        LogDbError::InvalidBlockEncoding("message term is invalid UTF-8")
+                        TelemetryError::InvalidBlockEncoding("message term is invalid UTF-8")
                     })?;
                 let normalized = normalize_index_term(term);
                 term_membership.insert(normalized.as_bytes());
@@ -420,22 +514,23 @@ impl EmbeddedFrameIndex {
         let mut field_sets = HashMap::<(String, String), Vec<u32>>::new();
         for (field_set_id, field_set) in fields.sets.iter().enumerate() {
             let field_set_id =
-                u32::try_from(field_set_id).map_err(|_| LogDbError::RecordTooLarge)?;
+                u32::try_from(field_set_id).map_err(|_| TelemetryError::RecordTooLarge)?;
             for (key_id, value_id) in field_set {
                 let key = attributes.keys.get(*key_id as usize).ok_or(
-                    LogDbError::InvalidBlockEncoding("embedded field key ID is out of range"),
+                    TelemetryError::InvalidBlockEncoding("embedded field key ID is out of range"),
                 )?;
                 let value = attributes
                     .values
                     .get(*key_id as usize)
                     .and_then(|values| values.dictionary().get(*value_id as usize))
-                    .ok_or(LogDbError::InvalidBlockEncoding(
+                    .ok_or(TelemetryError::InvalidBlockEncoding(
                         "embedded field value ID is out of range",
                     ))?;
-                let key = std::str::from_utf8(key)
-                    .map_err(|_| LogDbError::InvalidBlockEncoding("field key is invalid UTF-8"))?;
+                let key = std::str::from_utf8(key).map_err(|_| {
+                    TelemetryError::InvalidBlockEncoding("field key is invalid UTF-8")
+                })?;
                 let value = std::str::from_utf8(value).map_err(|_| {
-                    LogDbError::InvalidBlockEncoding("field value is invalid UTF-8")
+                    TelemetryError::InvalidBlockEncoding("field value is invalid UTF-8")
                 })?;
                 let set_ids = field_sets
                     .entry((key.to_owned(), value.to_owned()))
@@ -484,7 +579,7 @@ impl EmbeddedFrameIndex {
         })
     }
 
-    fn encode(&self) -> LogDbResult<Vec<u8>> {
+    fn encode(&self) -> TelemetryResult<Vec<u8>> {
         let mut encoded = Vec::new();
         encoded.extend_from_slice(EMBEDDED_INDEX_MAGIC);
         write_varint(u64::from(self.record_count), &mut encoded);
@@ -492,7 +587,7 @@ impl EmbeddedFrameIndex {
         encode_optional_sorted_ids(&self.residual_layout_ids, self.layout_count, &mut encoded)?;
         encode_membership_filter(&self.term_membership, &mut encoded);
         write_varint(
-            u64::try_from(self.terms.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+            u64::try_from(self.terms.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
             &mut encoded,
         );
         for locator in &self.terms {
@@ -502,7 +597,7 @@ impl EmbeddedFrameIndex {
         encode_packed_column(&self.field_set_ids, self.field_set_count, &mut encoded)?;
         encode_membership_filter(&self.field_membership, &mut encoded);
         write_varint(
-            u64::try_from(self.fields.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+            u64::try_from(self.fields.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
             &mut encoded,
         );
         for locator in &self.fields {
@@ -513,9 +608,9 @@ impl EmbeddedFrameIndex {
         Ok(encoded)
     }
 
-    fn decode(encoded: &[u8]) -> LogDbResult<Self> {
+    fn decode(encoded: &[u8]) -> TelemetryResult<Self> {
         if encoded.get(..EMBEDDED_INDEX_MAGIC.len()) != Some(EMBEDDED_INDEX_MAGIC) {
-            return Err(LogDbError::InvalidBlockEncoding(
+            return Err(TelemetryError::InvalidBlockEncoding(
                 "missing embedded index magic",
             ));
         }
@@ -538,7 +633,7 @@ impl EmbeddedFrameIndex {
                 .last()
                 .is_some_and(|previous: &EmbeddedTermLocator| previous.term >= term)
             {
-                return Err(LogDbError::InvalidBlockEncoding(
+                return Err(TelemetryError::InvalidBlockEncoding(
                     "embedded terms are not ordered",
                 ));
             }
@@ -565,7 +660,7 @@ impl EmbeddedFrameIndex {
                         >= (key.as_ref(), value.as_ref())
                 })
             {
-                return Err(LogDbError::InvalidBlockEncoding(
+                return Err(TelemetryError::InvalidBlockEncoding(
                     "embedded fields are not ordered",
                 ));
             }
@@ -614,7 +709,7 @@ impl Default for AttributeValueCounts {
 
 impl AttributeValueCounts {
     #[inline(always)]
-    fn increment(&mut self, value: &[u8]) -> LogDbResult<(u32, bool)> {
+    fn increment(&mut self, value: &[u8]) -> TelemetryResult<(u32, bool)> {
         let address = value.as_ptr() as usize;
         if self.last_entry_id != u32::MAX
             && self.last_address == address
@@ -624,14 +719,14 @@ impl AttributeValueCounts {
             self.entries[entry_id].1 = self.entries[entry_id]
                 .1
                 .checked_add(1)
-                .ok_or(LogDbError::RecordTooLarge)?;
+                .ok_or(TelemetryError::RecordTooLarge)?;
             return Ok((self.last_entry_id, false));
         }
         self.increment_slow(value, address)
     }
 
     #[inline(never)]
-    fn increment_slow(&mut self, value: &[u8], address: usize) -> LogDbResult<(u32, bool)> {
+    fn increment_slow(&mut self, value: &[u8], address: usize) -> TelemetryResult<(u32, bool)> {
         let entry_id = if let Some(ids) = &self.ids {
             ids.get(value).copied()
         } else {
@@ -643,8 +738,8 @@ impl AttributeValueCounts {
             self.entries[entry_id].1 = self.entries[entry_id]
                 .1
                 .checked_add(1)
-                .ok_or(LogDbError::RecordTooLarge)?;
-            let entry_id = u32::try_from(entry_id).map_err(|_| LogDbError::RecordTooLarge)?;
+                .ok_or(TelemetryError::RecordTooLarge)?;
+            let entry_id = u32::try_from(entry_id).map_err(|_| TelemetryError::RecordTooLarge)?;
             self.last_address = address;
             self.last_length = value.len();
             self.last_entry_id = entry_id;
@@ -666,14 +761,14 @@ impl AttributeValueCounts {
         if let Some(ids) = &mut self.ids {
             ids.insert(value, entry_id);
         }
-        let entry_id = u32::try_from(entry_id).map_err(|_| LogDbError::RecordTooLarge)?;
+        let entry_id = u32::try_from(entry_id).map_err(|_| TelemetryError::RecordTooLarge)?;
         self.last_address = address;
         self.last_length = self.entries[entry_id as usize].0.len();
         self.last_entry_id = entry_id;
         Ok((entry_id, true))
     }
 
-    fn into_table(self) -> LogDbResult<AttributeValueTable> {
+    fn into_table(self) -> TelemetryResult<AttributeValueTable> {
         let entry_count = self.entries.len();
         let mut dictionary = Vec::new();
         let mut direct = Vec::new();
@@ -689,7 +784,8 @@ impl AttributeValueCounts {
         let mut entries = Vec::with_capacity(entry_count);
         let mut resolved_entry_ids = vec![0_u32; entry_count];
         for (unresolved_id, value) in dictionary.into_iter().chain(direct) {
-            let entry_id = u32::try_from(entries.len()).map_err(|_| LogDbError::RecordTooLarge)?;
+            let entry_id =
+                u32::try_from(entries.len()).map_err(|_| TelemetryError::RecordTooLarge)?;
             resolved_entry_ids[unresolved_id] = entry_id;
             entries.push(value);
         }
@@ -704,7 +800,7 @@ impl AttributeValueCounts {
 /// Read-only normalized record fields consumed by the structural encoder.
 ///
 /// Implementations can expose thread-local parser output directly, avoiding
-/// transient [`DurableLogRecord`] and [`Arc`] allocation before a block seals.
+/// transient [`DurableLog`] and [`Arc`] allocation before a block seals.
 pub trait StructuralRecordView {
     /// Durable logical offset inside the record's topic partition.
     fn structural_offset(&self) -> LogicalOffset;
@@ -721,19 +817,24 @@ pub trait StructuralRecordView {
     /// Metadata field at `index`, if present.
     fn structural_field(&self, index: usize) -> Option<(&str, &str)>;
 
+    /// Returns exact typed OTLP metadata when this record originated as OTLP.
+    fn structural_log_metadata(&self) -> Option<StructuralLogMetadataRef<'_>> {
+        None
+    }
+
     /// Visits normalized metadata fields in their durable order.
     ///
     /// Implementations with segmented storage can override this method to
     /// avoid repeatedly resolving an indexed field accessor.
     #[inline]
-    fn try_for_each_structural_field<F>(&self, mut visitor: F) -> LogDbResult<()>
+    fn try_for_each_structural_field<F>(&self, mut visitor: F) -> TelemetryResult<()>
     where
-        F: FnMut(&str, &str) -> LogDbResult<()>,
+        F: FnMut(&str, &str) -> TelemetryResult<()>,
     {
         for field_index in 0..self.structural_field_count() {
             let (key, value) =
                 self.structural_field(field_index)
-                    .ok_or(LogDbError::InvalidBlockEncoding(
+                    .ok_or(TelemetryError::InvalidBlockEncoding(
                         "record field count changed while encoding",
                     ))?;
             visitor(key, value)?;
@@ -742,7 +843,7 @@ pub trait StructuralRecordView {
     }
 }
 
-impl StructuralRecordView for DurableLogRecord {
+impl StructuralRecordView for DurableLog {
     fn structural_offset(&self) -> LogicalOffset {
         self.record_ref.offset
     }
@@ -763,6 +864,23 @@ impl StructuralRecordView for DurableLogRecord {
         self.fields
             .get(index)
             .map(|field| (field.key.as_ref(), field.value.as_ref()))
+    }
+
+    fn structural_log_metadata(&self) -> Option<StructuralLogMetadataRef<'_>> {
+        typed_metadata_ref(
+            self.observed_timestamp_unix_nanos,
+            self.body.as_ref(),
+            &self.attributes,
+            &self.resource,
+            &self.scope,
+            self.severity_number,
+            &self.severity_text,
+            self.dropped_attributes_count,
+            self.flags,
+            self.trace_id,
+            self.span_id,
+            &self.event_name,
+        )
     }
 }
 
@@ -788,18 +906,80 @@ impl StructuralRecordView for DecodedStructuralRecord {
             .get(index)
             .map(|field| (field.key.as_ref(), field.value.as_ref()))
     }
+
+    fn structural_log_metadata(&self) -> Option<StructuralLogMetadataRef<'_>> {
+        typed_metadata_ref(
+            self.observed_timestamp_unix_nanos,
+            self.body.as_ref(),
+            &self.attributes,
+            &self.resource,
+            &self.scope,
+            self.severity_number,
+            &self.severity_text,
+            self.dropped_attributes_count,
+            self.flags,
+            self.trace_id,
+            self.span_id,
+            &self.event_name,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn typed_metadata_ref<'a>(
+    observed_timestamp_unix_nanos: u64,
+    body: Option<&'a TelemetryValue>,
+    attributes: &'a [TelemetryAttribute],
+    resource: &'a ResourceContext,
+    scope: &'a ScopeContext,
+    severity_number: i32,
+    severity_text: &'a str,
+    dropped_attributes_count: u32,
+    flags: u32,
+    trace_id: Option<TraceId>,
+    span_id: Option<SpanId>,
+    event_name: &'a str,
+) -> Option<StructuralLogMetadataRef<'a>> {
+    let present = observed_timestamp_unix_nanos != 0
+        || body.is_some()
+        || !attributes.is_empty()
+        || resource != &ResourceContext::default()
+        || scope != &ScopeContext::default()
+        || severity_number != 0
+        || !severity_text.is_empty()
+        || dropped_attributes_count != 0
+        || flags != 0
+        || trace_id.is_some()
+        || span_id.is_some()
+        || !event_name.is_empty();
+    present.then_some(StructuralLogMetadataRef {
+        observed_timestamp_unix_nanos,
+        body,
+        attributes,
+        resource,
+        scope,
+        severity_number,
+        severity_text,
+        dropped_attributes_count,
+        flags,
+        trace_id,
+        span_id,
+        event_name,
+    })
 }
 
 /// Returns the legacy row-byte accounting used for block sealing and storage
 /// ratio reporting. The structural wire layout may be smaller or larger before
 /// compression, but this byte count continues to represent the logical record
 /// payload that the block stores.
-pub(crate) fn row_source_bytes(record: &DurableLogRecord) -> LogDbResult<u64> {
+pub(crate) fn row_source_bytes(record: &DurableLog) -> TelemetryResult<u64> {
     validate_u32_length(record.message.len())?;
     validate_u32_length(record.fields.len())?;
     let mut total = 24u64
-        .checked_add(u64::try_from(record.message.len()).map_err(|_| LogDbError::RecordTooLarge)?)
-        .ok_or(LogDbError::RecordTooLarge)?;
+        .checked_add(
+            u64::try_from(record.message.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
+        )
+        .ok_or(TelemetryError::RecordTooLarge)?;
     for field in record.fields.iter() {
         validate_u32_length(field.key.len())?;
         validate_u32_length(field.value.len())?;
@@ -807,7 +987,7 @@ pub(crate) fn row_source_bytes(record: &DurableLogRecord) -> LogDbResult<u64> {
             .checked_add(8)
             .and_then(|value| value.checked_add(u64::try_from(field.key.len()).ok()?))
             .and_then(|value| value.checked_add(u64::try_from(field.value.len()).ok()?))
-            .ok_or(LogDbError::RecordTooLarge)?;
+            .ok_or(TelemetryError::RecordTooLarge)?;
     }
     Ok(total)
 }
@@ -816,13 +996,15 @@ pub(crate) fn row_source_bytes(record: &DurableLogRecord) -> LogDbResult<u64> {
 ///
 /// The resulting bytes must be compressed with the descriptor's codec before
 /// storage and can be reconstructed with [`decode_structural_block`].
-pub fn encode_structural_block(records: &[DurableLogRecord]) -> LogDbResult<Vec<u8>> {
+pub fn encode_structural_block(records: &[DurableLog]) -> TelemetryResult<Vec<u8>> {
     encode_structural_records(records)
 }
 
 /// Encodes any zero-copy normalized record view into the current structural
 /// block layout.
-pub fn encode_structural_records<R: StructuralRecordView>(records: &[R]) -> LogDbResult<Vec<u8>> {
+pub fn encode_structural_records<R: StructuralRecordView>(
+    records: &[R],
+) -> TelemetryResult<Vec<u8>> {
     Ok(encode_indexed_structural_records(records)?.structural)
 }
 
@@ -830,7 +1012,7 @@ pub fn encode_structural_records<R: StructuralRecordView>(records: &[R]) -> LogD
 /// template and metadata dictionary pass.
 pub fn encode_indexed_structural_records<R: StructuralRecordView>(
     records: &[R],
-) -> LogDbResult<IndexedStructuralBlock> {
+) -> TelemetryResult<IndexedStructuralBlock> {
     let parsed_messages = parse_messages(records)?;
     let (templates, template_ids) = select_templates(&parsed_messages)?;
     let (attributes, resolved_fields, field_membership) = build_attribute_tables(records)?;
@@ -841,6 +1023,7 @@ pub fn encode_indexed_structural_records<R: StructuralRecordView>(
     let bodies = encode_bodies(&parsed_messages, &template_ids)?;
     let attribute_tables = encode_attribute_tables(&attributes)?;
     let (fields, parsed_fields) = encode_fields(&resolved_fields, &attributes, field_membership)?;
+    let typed_metadata = encode_typed_metadata(records)?;
     let index =
         EmbeddedFrameIndex::build(&parsed_messages, &template_ids, &attributes, &parsed_fields)?;
     let embedded_index = index.encode()?;
@@ -849,7 +1032,7 @@ pub fn encode_indexed_structural_records<R: StructuralRecordView>(
     let mut encoded = Vec::new();
     encoded.extend_from_slice(STRUCTURAL_BLOCK_MAGIC);
     write_varint(
-        u64::try_from(records.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+        u64::try_from(records.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
         &mut encoded,
     );
     for section in [
@@ -859,6 +1042,7 @@ pub fn encode_indexed_structural_records<R: StructuralRecordView>(
         bodies,
         attribute_tables,
         fields,
+        typed_metadata,
         embedded_index,
     ] {
         append_bytes(&mut encoded, &section)?;
@@ -872,7 +1056,7 @@ pub fn encode_indexed_structural_records<R: StructuralRecordView>(
 
 /// Opens the exact embedded index without reconstructing record bodies or
 /// metadata values.
-pub fn decode_embedded_frame_index(encoded: &[u8]) -> LogDbResult<EmbeddedFrameIndex> {
+pub fn decode_embedded_frame_index(encoded: &[u8]) -> TelemetryResult<EmbeddedFrameIndex> {
     let (record_count, embedded_index) = structural_sections(encoded)?;
     decode_embedded_frame_index_section(embedded_index, record_count)
 }
@@ -880,10 +1064,10 @@ pub fn decode_embedded_frame_index(encoded: &[u8]) -> LogDbResult<EmbeddedFrameI
 pub(crate) fn decode_embedded_frame_index_section(
     encoded: &[u8],
     expected_record_count: usize,
-) -> LogDbResult<EmbeddedFrameIndex> {
+) -> TelemetryResult<EmbeddedFrameIndex> {
     let index = EmbeddedFrameIndex::decode(encoded)?;
     if index.record_count as usize != expected_record_count {
-        return Err(LogDbError::InvalidBlockEncoding(
+        return Err(TelemetryError::InvalidBlockEncoding(
             "embedded index record count mismatch",
         ));
     }
@@ -893,10 +1077,10 @@ pub(crate) fn decode_embedded_frame_index_section(
 /// Reconstructs exact record data from one decompressed structural block.
 ///
 /// The caller supplies the descriptor's partition, shard, and compression
-/// cohort when rebuilding a complete [`DurableLogRecord`].
-pub fn decode_structural_block(encoded: &[u8]) -> LogDbResult<Vec<DecodedStructuralRecord>> {
+/// cohort when rebuilding a complete [`DurableLog`].
+pub fn decode_structural_block(encoded: &[u8]) -> TelemetryResult<Vec<DecodedStructuralRecord>> {
     if encoded.get(..STRUCTURAL_BLOCK_MAGIC.len()) != Some(STRUCTURAL_BLOCK_MAGIC) {
-        return Err(LogDbError::InvalidBlockEncoding(
+        return Err(TelemetryError::InvalidBlockEncoding(
             "missing structural block magic",
         ));
     }
@@ -921,26 +1105,42 @@ pub fn decode_structural_block(encoded: &[u8]) -> LogDbResult<Vec<DecodedStructu
         &attributes,
         record_count,
     )?;
+    let typed_metadata = decode_typed_metadata(read_section(encoded, &mut cursor)?, record_count)?;
     let embedded_index = EmbeddedFrameIndex::decode(read_section(encoded, &mut cursor)?)?;
     if embedded_index.record_count as usize != record_count {
-        return Err(LogDbError::InvalidBlockEncoding(
+        return Err(TelemetryError::InvalidBlockEncoding(
             "embedded index record count mismatch",
         ));
     }
     if cursor != encoded.len() {
-        return Err(LogDbError::InvalidBlockEncoding("trailing bytes"));
+        return Err(TelemetryError::InvalidBlockEncoding("trailing bytes"));
     }
     Ok(offsets
         .into_iter()
         .zip(timestamps)
         .zip(messages)
         .zip(fields)
+        .zip(typed_metadata)
         .map(
-            |(((offset, timestamp_unix_nanos), message), fields)| DecodedStructuralRecord {
-                offset,
-                timestamp_unix_nanos,
-                message,
-                fields,
+            |((((offset, timestamp_unix_nanos), message), fields), metadata)| {
+                DecodedStructuralRecord {
+                    offset,
+                    timestamp_unix_nanos,
+                    message,
+                    fields,
+                    observed_timestamp_unix_nanos: metadata.observed_timestamp_unix_nanos,
+                    body: metadata.body,
+                    attributes: metadata.attributes,
+                    resource: metadata.resource,
+                    scope: metadata.scope,
+                    severity_number: metadata.severity_number,
+                    severity_text: metadata.severity_text,
+                    dropped_attributes_count: metadata.dropped_attributes_count,
+                    flags: metadata.flags,
+                    trace_id: metadata.trace_id,
+                    span_id: metadata.span_id,
+                    event_name: metadata.event_name,
+                }
             },
         )
         .collect())
@@ -955,9 +1155,9 @@ pub fn decode_structural_block(encoded: &[u8]) -> LogDbResult<Vec<DecodedStructu
 pub fn decode_structural_records(
     encoded: &[u8],
     record_ordinals: &[u32],
-) -> LogDbResult<Vec<DecodedStructuralRecord>> {
+) -> TelemetryResult<Vec<DecodedStructuralRecord>> {
     if encoded.get(..STRUCTURAL_BLOCK_MAGIC.len()) != Some(STRUCTURAL_BLOCK_MAGIC) {
-        return Err(LogDbError::InvalidBlockEncoding(
+        return Err(TelemetryError::InvalidBlockEncoding(
             "missing structural block magic",
         ));
     }
@@ -985,26 +1185,48 @@ pub fn decode_structural_records(
         record_count,
         record_ordinals,
     )?;
+    let typed_metadata = decode_selected_typed_metadata(
+        read_section(encoded, &mut cursor)?,
+        record_count,
+        record_ordinals,
+    )?;
     let embedded_index = EmbeddedFrameIndex::decode(read_section(encoded, &mut cursor)?)?;
     if embedded_index.record_count as usize != record_count {
-        return Err(LogDbError::InvalidBlockEncoding(
+        return Err(TelemetryError::InvalidBlockEncoding(
             "embedded index record count mismatch",
         ));
     }
     if cursor != encoded.len() {
-        return Err(LogDbError::InvalidBlockEncoding("trailing bytes"));
+        return Err(TelemetryError::InvalidBlockEncoding("trailing bytes"));
     }
     let mut decoded = Vec::with_capacity(record_ordinals.len());
-    for ((record_ordinal, message), fields) in
-        record_ordinals.iter().copied().zip(messages).zip(fields)
+    for (((record_ordinal, message), fields), metadata) in record_ordinals
+        .iter()
+        .copied()
+        .zip(messages)
+        .zip(fields)
+        .zip(typed_metadata)
     {
-        let index = usize::try_from(record_ordinal)
-            .map_err(|_| LogDbError::InvalidBlockEncoding("record ordinal does not fit usize"))?;
+        let index = usize::try_from(record_ordinal).map_err(|_| {
+            TelemetryError::InvalidBlockEncoding("record ordinal does not fit usize")
+        })?;
         decoded.push(DecodedStructuralRecord {
             offset: offsets[index],
             timestamp_unix_nanos: timestamps[index],
             message,
             fields,
+            observed_timestamp_unix_nanos: metadata.observed_timestamp_unix_nanos,
+            body: metadata.body,
+            attributes: metadata.attributes,
+            resource: metadata.resource,
+            scope: metadata.scope,
+            severity_number: metadata.severity_number,
+            severity_text: metadata.severity_text,
+            dropped_attributes_count: metadata.dropped_attributes_count,
+            flags: metadata.flags,
+            trace_id: metadata.trace_id,
+            span_id: metadata.span_id,
+            event_name: metadata.event_name,
         });
     }
     Ok(decoded)
@@ -1017,9 +1239,9 @@ pub fn decode_structural_records(
 /// numeric encodings change from block to block and contribute little stable
 /// byte vocabulary. The returned slices point at the exact bytes later seen by
 /// the enclosing Zstandard frame.
-pub(crate) fn dictionary_training_sections(encoded: &[u8]) -> LogDbResult<[&[u8]; 4]> {
+pub(crate) fn dictionary_training_sections(encoded: &[u8]) -> TelemetryResult<[&[u8]; 4]> {
     if encoded.get(..STRUCTURAL_BLOCK_MAGIC.len()) != Some(STRUCTURAL_BLOCK_MAGIC) {
-        return Err(LogDbError::InvalidBlockEncoding(
+        return Err(TelemetryError::InvalidBlockEncoding(
             "missing structural block magic",
         ));
     }
@@ -1031,16 +1253,17 @@ pub(crate) fn dictionary_training_sections(encoded: &[u8]) -> LogDbResult<[&[u8]
     let bodies = read_section(encoded, &mut cursor)?;
     let attribute_tables = read_section(encoded, &mut cursor)?;
     let fields = read_section(encoded, &mut cursor)?;
+    let _typed_metadata = read_section(encoded, &mut cursor)?;
     let _embedded_index = read_section(encoded, &mut cursor)?;
     if cursor != encoded.len() {
-        return Err(LogDbError::InvalidBlockEncoding("trailing bytes"));
+        return Err(TelemetryError::InvalidBlockEncoding("trailing bytes"));
     }
     Ok([templates, bodies, attribute_tables, fields])
 }
 
 fn select_templates(
     messages: &ParsedMessages<'_>,
-) -> LogDbResult<(Vec<TemplateEntry>, Vec<Option<usize>>)> {
+) -> TelemetryResult<(Vec<TemplateEntry>, Vec<Option<usize>>)> {
     let mut hash_groups = HashMap::<u64, Vec<usize>>::new();
     let mut groups = Vec::<TemplateGroup>::new();
     let mut layout_groups = vec![None; messages.layouts.len()];
@@ -1091,7 +1314,7 @@ fn select_templates(
         group.template_id = Some(id);
     }
     if entries.len() > usize::try_from(u32::MAX).expect("u32 fits usize") {
-        return Err(LogDbError::RecordTooLarge);
+        return Err(TelemetryError::RecordTooLarge);
     }
     let template_ids = layout_groups
         .into_iter()
@@ -1113,7 +1336,7 @@ fn same_template(left: &ParsedMessage<'_>, right: &ParsedMessage<'_>) -> bool {
 
 fn build_attribute_tables<R: StructuralRecordView>(
     records: &[R],
-) -> LogDbResult<(AttributeTables, ResolvedFields, MembershipFilter)> {
+) -> TelemetryResult<(AttributeTables, ResolvedFields, MembershipFilter)> {
     let mut keys = Vec::<Vec<u8>>::new();
     let mut key_ids = HashMap::<Vec<u8>, usize>::new();
     let mut value_counts = Vec::<AttributeValueCounts>::new();
@@ -1155,7 +1378,7 @@ fn build_attribute_tables<R: StructuralRecordView>(
                 key_cache[cache_slot] = CachedAttributeKey {
                     address,
                     length: key.len(),
-                    key_id: u32::try_from(key_id).map_err(|_| LogDbError::RecordTooLarge)?,
+                    key_id: u32::try_from(key_id).map_err(|_| TelemetryError::RecordTooLarge)?,
                 };
                 key_id
             };
@@ -1164,13 +1387,14 @@ fn build_attribute_tables<R: StructuralRecordView>(
                 field_membership.insert_pair(key, field_value.as_bytes());
             }
             resolved_fields.entries.push(ResolvedField {
-                key_id: u32::try_from(key_id).map_err(|_| LogDbError::RecordTooLarge)?,
+                key_id: u32::try_from(key_id).map_err(|_| TelemetryError::RecordTooLarge)?,
                 value_id,
             });
             Ok(())
         })?;
         resolved_fields.record_ends.push(
-            u32::try_from(resolved_fields.entries.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+            u32::try_from(resolved_fields.entries.len())
+                .map_err(|_| TelemetryError::RecordTooLarge)?,
         );
     }
     let mut values = Vec::with_capacity(keys.len());
@@ -1184,7 +1408,7 @@ fn build_attribute_tables<R: StructuralRecordView>(
     ))
 }
 
-fn encode_offsets<R: StructuralRecordView>(records: &[R]) -> LogDbResult<Vec<u8>> {
+fn encode_offsets<R: StructuralRecordView>(records: &[R]) -> TelemetryResult<Vec<u8>> {
     let mut encoded = Vec::new();
     let Some(first) = records.first() else {
         return Ok(encoded);
@@ -1195,14 +1419,16 @@ fn encode_offsets<R: StructuralRecordView>(records: &[R]) -> LogDbResult<Vec<u8>
         let offset = record.structural_offset().get();
         let delta = offset
             .checked_sub(previous)
-            .ok_or(LogDbError::InvalidBlockEncoding("offsets must increase"))?;
+            .ok_or(TelemetryError::InvalidBlockEncoding(
+                "offsets must increase",
+            ))?;
         write_varint(delta, &mut encoded);
         previous = offset;
     }
     Ok(encoded)
 }
 
-fn encode_timestamps<R: StructuralRecordView>(records: &[R]) -> LogDbResult<Vec<u8>> {
+fn encode_timestamps<R: StructuralRecordView>(records: &[R]) -> TelemetryResult<Vec<u8>> {
     if records.is_empty() {
         return Ok(Vec::new());
     }
@@ -1218,19 +1444,19 @@ fn encode_timestamps<R: StructuralRecordView>(records: &[R]) -> LogDbResult<Vec<
             .with_delta_spec(DeltaSpec::TryConsecutive(1)),
     )
     .map_err(|error| {
-        LogDbError::CompressionFailed(format!("Pco timestamp encoding failed: {error}"))
+        TelemetryError::CompressionFailed(format!("Pco timestamp encoding failed: {error}"))
     })
 }
 
-fn encode_templates(templates: &[TemplateEntry]) -> LogDbResult<Vec<u8>> {
+fn encode_templates(templates: &[TemplateEntry]) -> TelemetryResult<Vec<u8>> {
     let mut encoded = Vec::new();
     write_varint(
-        u64::try_from(templates.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+        u64::try_from(templates.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
         &mut encoded,
     );
     for template in templates {
         write_varint(
-            u64::try_from(template.literals.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+            u64::try_from(template.literals.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
             &mut encoded,
         );
         for literal in &template.literals {
@@ -1243,7 +1469,7 @@ fn encode_templates(templates: &[TemplateEntry]) -> LogDbResult<Vec<u8>> {
 fn encode_bodies(
     messages: &ParsedMessages<'_>,
     template_ids: &[Option<usize>],
-) -> LogDbResult<Vec<u8>> {
+) -> TelemetryResult<Vec<u8>> {
     let mut cached_bodies = Vec::with_capacity(messages.layouts.len());
     for (layout_id, message) in messages.layouts.iter().enumerate() {
         if messages.layout_counts[layout_id] < 2 {
@@ -1279,12 +1505,12 @@ fn encode_body(
     message: &ParsedMessage<'_>,
     template_id: &Option<usize>,
     encoded: &mut Vec<u8>,
-) -> LogDbResult<()> {
+) -> TelemetryResult<()> {
     match template_id {
         Some(template_id) => {
             encoded.push(TEMPLATE_BODY);
             write_varint(
-                u64::try_from(*template_id).map_err(|_| LogDbError::RecordTooLarge)?,
+                u64::try_from(*template_id).map_err(|_| TelemetryError::RecordTooLarge)?,
                 encoded,
             );
             for value in &message.values {
@@ -1299,16 +1525,16 @@ fn encode_body(
     Ok(())
 }
 
-fn encode_attribute_tables(tables: &AttributeTables) -> LogDbResult<Vec<u8>> {
+fn encode_attribute_tables(tables: &AttributeTables) -> TelemetryResult<Vec<u8>> {
     let mut encoded = Vec::new();
     write_varint(
-        u64::try_from(tables.keys.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+        u64::try_from(tables.keys.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
         &mut encoded,
     );
     for (key, values) in tables.keys.iter().zip(&tables.values) {
         append_bytes(&mut encoded, key)?;
         write_varint(
-            u64::try_from(values.dictionary_len).map_err(|_| LogDbError::RecordTooLarge)?,
+            u64::try_from(values.dictionary_len).map_err(|_| TelemetryError::RecordTooLarge)?,
             &mut encoded,
         );
         for value in values.dictionary() {
@@ -1322,7 +1548,7 @@ fn encode_fields(
     resolved: &ResolvedFields,
     tables: &AttributeTables,
     membership_filter: MembershipFilter,
-) -> LogDbResult<(Vec<u8>, ParsedFieldSets)> {
+) -> TelemetryResult<(Vec<u8>, ParsedFieldSets)> {
     let mut payload = Vec::new();
     let mut checkpoints = Vec::with_capacity(
         resolved
@@ -1338,14 +1564,14 @@ fn encode_fields(
     for (record_ordinal, field_end) in resolved.record_ends.iter().copied().enumerate() {
         let field_end = field_end as usize;
         let record_fields = resolved.entries.get(field_start..field_end).ok_or(
-            LogDbError::InvalidBlockEncoding("resolved record field range is invalid"),
+            TelemetryError::InvalidBlockEncoding("resolved record field range is invalid"),
         )?;
         indexed_pairs.clear();
         if record_ordinal % SEEK_CHECKPOINT_INTERVAL == 0 {
             checkpoints.push(payload.len());
         }
         write_varint(
-            u64::try_from(record_fields.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+            u64::try_from(record_fields.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
             &mut payload,
         );
         for field in record_fields {
@@ -1354,12 +1580,13 @@ fn encode_fields(
             let values = tables
                 .values
                 .get(key_id)
-                .ok_or(LogDbError::InvalidBlockEncoding(
+                .ok_or(TelemetryError::InvalidBlockEncoding(
                     "resolved attribute key ID is out of range",
                 ))?;
             let (value_id, field_value) = values.resolve(field.value_id)?;
             if value_id < values.dictionary_len {
-                let value_id = u32::try_from(value_id).map_err(|_| LogDbError::RecordTooLarge)?;
+                let value_id =
+                    u32::try_from(value_id).map_err(|_| TelemetryError::RecordTooLarge)?;
                 indexed_pairs.push((field.key_id, value_id));
                 payload.push(DICTIONARY_ATTRIBUTE_VALUE);
                 write_varint(u64::from(value_id), &mut payload);
@@ -1377,7 +1604,7 @@ fn encode_fields(
                 cached
             } else {
                 let field_set_id =
-                    u32::try_from(field_sets.len()).map_err(|_| LogDbError::RecordTooLarge)?;
+                    u32::try_from(field_sets.len()).map_err(|_| TelemetryError::RecordTooLarge)?;
                 field_sets.push(indexed_pairs.clone());
                 field_set_cache[cache_slot] = field_set_id;
                 field_set_id
@@ -1394,6 +1621,92 @@ fn encode_fields(
     ))
 }
 
+fn encode_typed_metadata<R: StructuralRecordView>(records: &[R]) -> TelemetryResult<Vec<u8>> {
+    let metadata = records
+        .iter()
+        .map(|record| {
+            record
+                .structural_log_metadata()
+                .map(StructuralLogMetadata::from)
+        })
+        .collect::<Vec<_>>();
+    if metadata.iter().all(Option::is_none) {
+        return Ok(Vec::new());
+    }
+    let raw = rmp_serde::to_vec_named(&metadata)
+        .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
+    let compressed = zstd::bulk::compress(&raw, 1)
+        .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
+    let mut encoded = Vec::with_capacity(4 + compressed.len());
+    encoded.extend_from_slice(
+        &u32::try_from(raw.len())
+            .map_err(|_| TelemetryError::RecordTooLarge)?
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(&compressed);
+    Ok(encoded)
+}
+
+fn decode_typed_metadata(
+    encoded: &[u8],
+    record_count: usize,
+) -> TelemetryResult<Vec<StructuralLogMetadata>> {
+    if encoded.is_empty() {
+        return Ok(vec![StructuralLogMetadata::default(); record_count]);
+    }
+    if encoded.len() < 4 {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "truncated typed log metadata lane",
+        ));
+    }
+    let raw_len = u32::from_le_bytes(encoded[..4].try_into().expect("fixed range")) as usize;
+    if raw_len > 64 * 1024 * 1024 {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "typed log metadata lane exceeds safety limit",
+        ));
+    }
+    let raw = zstd::bulk::decompress(&encoded[4..], raw_len)
+        .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid typed log metadata lane"))?;
+    if raw.len() != raw_len {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "typed log metadata length mismatch",
+        ));
+    }
+    let metadata: Vec<Option<StructuralLogMetadata>> = rmp_serde::from_slice(&raw)
+        .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid typed log metadata"))?;
+    if metadata.len() != record_count {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "typed log metadata count mismatch",
+        ));
+    }
+    Ok(metadata
+        .into_iter()
+        .map(Option::unwrap_or_default)
+        .collect())
+}
+
+fn decode_selected_typed_metadata(
+    encoded: &[u8],
+    record_count: usize,
+    selected: &[u32],
+) -> TelemetryResult<Vec<StructuralLogMetadata>> {
+    let mut metadata = decode_typed_metadata(encoded, record_count)?;
+    selected
+        .iter()
+        .map(|ordinal| {
+            let index = usize::try_from(*ordinal).map_err(|_| {
+                TelemetryError::InvalidBlockEncoding("typed metadata ordinal overflow")
+            })?;
+            metadata
+                .get_mut(index)
+                .map(std::mem::take)
+                .ok_or(TelemetryError::InvalidBlockEncoding(
+                    "typed metadata ordinal out of range",
+                ))
+        })
+        .collect()
+}
+
 fn hash_field_id_pairs(pairs: &[(u32, u32)]) -> u64 {
     let mut hash = (pairs.len() as u64).wrapping_mul(0x9e37_79b1_85eb_ca87);
     for (key_id, value_id) in pairs {
@@ -1404,10 +1717,12 @@ fn hash_field_id_pairs(pairs: &[(u32, u32)]) -> u64 {
     hash ^ (hash >> 31)
 }
 
-fn decode_offsets(encoded: &[u8], record_count: usize) -> LogDbResult<Vec<LogicalOffset>> {
+fn decode_offsets(encoded: &[u8], record_count: usize) -> TelemetryResult<Vec<LogicalOffset>> {
     if record_count == 0 {
         if !encoded.is_empty() {
-            return Err(LogDbError::InvalidBlockEncoding("offsets for empty block"));
+            return Err(TelemetryError::InvalidBlockEncoding(
+                "offsets for empty block",
+            ));
         }
         return Ok(Vec::new());
     }
@@ -1419,17 +1734,19 @@ fn decode_offsets(encoded: &[u8], record_count: usize) -> LogDbResult<Vec<Logica
         let delta = read_varint(encoded, &mut cursor)?;
         previous = previous
             .checked_add(delta)
-            .ok_or(LogDbError::InvalidBlockEncoding("offset delta overflow"))?;
+            .ok_or(TelemetryError::InvalidBlockEncoding(
+                "offset delta overflow",
+            ))?;
         offsets.push(LogicalOffset::new(previous));
     }
     require_consumed(encoded, cursor)?;
     Ok(offsets)
 }
 
-fn decode_timestamps(encoded: &[u8], record_count: usize) -> LogDbResult<Vec<u64>> {
+fn decode_timestamps(encoded: &[u8], record_count: usize) -> TelemetryResult<Vec<u64>> {
     if record_count == 0 {
         if !encoded.is_empty() {
-            return Err(LogDbError::InvalidBlockEncoding(
+            return Err(TelemetryError::InvalidBlockEncoding(
                 "timestamps for empty block",
             ));
         }
@@ -1437,16 +1754,16 @@ fn decode_timestamps(encoded: &[u8], record_count: usize) -> LogDbResult<Vec<u64
     }
     let mut timestamps = vec![0; record_count];
     let progress = simple_decompress_into(encoded, &mut timestamps)
-        .map_err(|_| LogDbError::InvalidBlockEncoding("invalid Pco timestamp section"))?;
+        .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid Pco timestamp section"))?;
     if progress.n_processed != record_count || !progress.finished {
-        return Err(LogDbError::InvalidBlockEncoding(
+        return Err(TelemetryError::InvalidBlockEncoding(
             "Pco timestamp count mismatch",
         ));
     }
     Ok(timestamps)
 }
 
-fn decode_templates(encoded: &[u8]) -> LogDbResult<Vec<Vec<Vec<u8>>>> {
+fn decode_templates(encoded: &[u8]) -> TelemetryResult<Vec<Vec<Vec<u8>>>> {
     let mut cursor = 0usize;
     let count = read_usize(encoded, &mut cursor)?;
     ensure_count_within(
@@ -1458,7 +1775,9 @@ fn decode_templates(encoded: &[u8]) -> LogDbResult<Vec<Vec<Vec<u8>>>> {
     for _ in 0..count {
         let literal_count = read_usize(encoded, &mut cursor)?;
         if literal_count == 0 {
-            return Err(LogDbError::InvalidBlockEncoding("template has no literals"));
+            return Err(TelemetryError::InvalidBlockEncoding(
+                "template has no literals",
+            ));
         }
         ensure_count_within(
             literal_count,
@@ -1479,7 +1798,7 @@ fn decode_bodies(
     encoded: &[u8],
     templates: &[Vec<Vec<u8>>],
     record_count: usize,
-) -> LogDbResult<Vec<Arc<str>>> {
+) -> TelemetryResult<Vec<Arc<str>>> {
     let lane = decode_seekable_record_lane(encoded, record_count)?;
     let mut cursor = 0usize;
     let mut messages = Vec::with_capacity(record_count);
@@ -1490,64 +1809,61 @@ fn decode_bodies(
         validate_checkpoint_cursor(&lane, record_ordinal, cursor)?;
         let record_start = cursor;
         let body_kind = read_byte(lane.payload, &mut cursor)?;
-        let message =
-            match body_kind {
-                RAW_BODY => {
-                    let bytes = read_bytes(lane.payload, &mut cursor)?;
-                    if let Some(previous) = &previous
-                        && previous.as_bytes() == bytes
+        let message = match body_kind {
+            RAW_BODY => {
+                let bytes = read_bytes(lane.payload, &mut cursor)?;
+                if let Some(previous) = &previous
+                    && previous.as_bytes() == bytes
+                {
+                    Arc::clone(previous)
+                } else {
+                    decode_text(bytes.to_vec())?
+                }
+            }
+            TEMPLATE_BODY => {
+                let template_id = read_usize(lane.payload, &mut cursor)?;
+                let literals = templates
+                    .get(template_id)
+                    .ok_or(TelemetryError::InvalidBlockEncoding("unknown template ID"))?;
+                if literals.len() == 1 {
+                    if let Some(message) = &exact_templates[template_id] {
+                        Arc::clone(message)
+                    } else {
+                        let message = decode_text(literals.first().cloned().ok_or(
+                            TelemetryError::InvalidBlockEncoding("template has no first literal"),
+                        )?)?;
+                        exact_templates[template_id] = Some(Arc::clone(&message));
+                        message
+                    }
+                } else {
+                    for _ in &literals[1..] {
+                        let _ = read_bytes(lane.payload, &mut cursor)?;
+                    }
+                    let record_end = cursor;
+                    if let (Some(previous), Some(previous_encoded)) = (&previous, &previous_encoded)
+                        && lane.payload[previous_encoded.clone()]
+                            == lane.payload[record_start..record_end]
                     {
                         Arc::clone(previous)
                     } else {
-                        decode_text(bytes.to_vec())?
+                        let mut replay = record_start;
+                        let _ = read_byte(lane.payload, &mut replay)?;
+                        let replay_template_id = read_usize(lane.payload, &mut replay)?;
+                        debug_assert_eq!(replay_template_id, template_id);
+                        let mut reconstructed = literals.first().cloned().ok_or(
+                            TelemetryError::InvalidBlockEncoding("template has no first literal"),
+                        )?;
+                        for literal in &literals[1..] {
+                            reconstructed.extend_from_slice(read_bytes(lane.payload, &mut replay)?);
+                            reconstructed.extend_from_slice(literal);
+                        }
+                        debug_assert_eq!(replay, record_end);
+                        decode_text(reconstructed)?
                     }
                 }
-                TEMPLATE_BODY => {
-                    let template_id = read_usize(lane.payload, &mut cursor)?;
-                    let literals = templates
-                        .get(template_id)
-                        .ok_or(LogDbError::InvalidBlockEncoding("unknown template ID"))?;
-                    if literals.len() == 1 {
-                        if let Some(message) = &exact_templates[template_id] {
-                            Arc::clone(message)
-                        } else {
-                            let message = decode_text(literals.first().cloned().ok_or(
-                                LogDbError::InvalidBlockEncoding("template has no first literal"),
-                            )?)?;
-                            exact_templates[template_id] = Some(Arc::clone(&message));
-                            message
-                        }
-                    } else {
-                        for _ in &literals[1..] {
-                            let _ = read_bytes(lane.payload, &mut cursor)?;
-                        }
-                        let record_end = cursor;
-                        if let (Some(previous), Some(previous_encoded)) =
-                            (&previous, &previous_encoded)
-                            && lane.payload[previous_encoded.clone()]
-                                == lane.payload[record_start..record_end]
-                        {
-                            Arc::clone(previous)
-                        } else {
-                            let mut replay = record_start;
-                            let _ = read_byte(lane.payload, &mut replay)?;
-                            let replay_template_id = read_usize(lane.payload, &mut replay)?;
-                            debug_assert_eq!(replay_template_id, template_id);
-                            let mut reconstructed = literals.first().cloned().ok_or(
-                                LogDbError::InvalidBlockEncoding("template has no first literal"),
-                            )?;
-                            for literal in &literals[1..] {
-                                reconstructed
-                                    .extend_from_slice(read_bytes(lane.payload, &mut replay)?);
-                                reconstructed.extend_from_slice(literal);
-                            }
-                            debug_assert_eq!(replay, record_end);
-                            decode_text(reconstructed)?
-                        }
-                    }
-                }
-                _ => return Err(LogDbError::InvalidBlockEncoding("invalid body kind")),
-            };
+            }
+            _ => return Err(TelemetryError::InvalidBlockEncoding("invalid body kind")),
+        };
         previous = Some(Arc::clone(&message));
         previous_encoded = Some(record_start..cursor);
         messages.push(message);
@@ -1561,13 +1877,14 @@ fn decode_selected_bodies(
     templates: &[Vec<Vec<u8>>],
     record_count: usize,
     selected: &[u32],
-) -> LogDbResult<Vec<Arc<str>>> {
+) -> TelemetryResult<Vec<Arc<str>>> {
     let lane = decode_seekable_record_lane(encoded, record_count)?;
     let mut selected_index = 0usize;
     let mut messages = Vec::with_capacity(selected.len());
     while selected_index < selected.len() {
-        let first_ordinal = usize::try_from(selected[selected_index])
-            .map_err(|_| LogDbError::InvalidBlockEncoding("record ordinal does not fit usize"))?;
+        let first_ordinal = usize::try_from(selected[selected_index]).map_err(|_| {
+            TelemetryError::InvalidBlockEncoding("record ordinal does not fit usize")
+        })?;
         let checkpoint = first_ordinal / lane.interval;
         let checkpoint_end = (checkpoint + 1)
             .saturating_mul(lane.interval)
@@ -1580,8 +1897,9 @@ fn decode_selected_bodies(
         {
             group_end += 1;
         }
-        let final_ordinal = usize::try_from(selected[group_end - 1])
-            .map_err(|_| LogDbError::InvalidBlockEncoding("record ordinal does not fit usize"))?;
+        let final_ordinal = usize::try_from(selected[group_end - 1]).map_err(|_| {
+            TelemetryError::InvalidBlockEncoding("record ordinal does not fit usize")
+        })?;
         let checkpoint_payload = lane.checkpoint_payload(checkpoint)?;
         let mut cursor = 0usize;
         let mut retained = selected_index;
@@ -1601,10 +1919,12 @@ fn decode_selected_bodies(
                     let template_id = read_usize(checkpoint_payload, &mut cursor)?;
                     let literals = templates
                         .get(template_id)
-                        .ok_or(LogDbError::InvalidBlockEncoding("unknown template ID"))?;
-                    let first = literals.first().ok_or(LogDbError::InvalidBlockEncoding(
-                        "template has no first literal",
-                    ))?;
+                        .ok_or(TelemetryError::InvalidBlockEncoding("unknown template ID"))?;
+                    let first = literals
+                        .first()
+                        .ok_or(TelemetryError::InvalidBlockEncoding(
+                            "template has no first literal",
+                        ))?;
                     if retain {
                         let mut reconstructed = first.clone();
                         for literal in &literals[1..] {
@@ -1619,7 +1939,7 @@ fn decode_selected_bodies(
                         }
                     }
                 }
-                _ => return Err(LogDbError::InvalidBlockEncoding("invalid body kind")),
+                _ => return Err(TelemetryError::InvalidBlockEncoding("invalid body kind")),
             }
             if retain {
                 retained += 1;
@@ -1633,7 +1953,7 @@ fn decode_selected_bodies(
     Ok(messages)
 }
 
-fn decode_attribute_tables(encoded: &[u8]) -> LogDbResult<DecodedAttributeTables> {
+fn decode_attribute_tables(encoded: &[u8]) -> TelemetryResult<DecodedAttributeTables> {
     let mut cursor = 0usize;
     let key_count = read_usize(encoded, &mut cursor)?;
     ensure_count_within(
@@ -1665,7 +1985,7 @@ fn decode_fields(
     encoded: &[u8],
     tables: &DecodedAttributeTables,
     record_count: usize,
-) -> LogDbResult<Vec<Arc<Vec<MetadataField>>>> {
+) -> TelemetryResult<Vec<Arc<Vec<MetadataField>>>> {
     let lane = decode_seekable_record_lane(encoded, record_count)?;
     let mut cursor = 0usize;
     let mut records = Vec::with_capacity(record_count);
@@ -1691,12 +2011,14 @@ fn decode_fields(
             let key = tables
                 .0
                 .get(key_id)
-                .ok_or(LogDbError::InvalidBlockEncoding("unknown attribute key ID"))?;
+                .ok_or(TelemetryError::InvalidBlockEncoding(
+                    "unknown attribute key ID",
+                ))?;
             match read_byte(lane.payload, &mut cursor)? {
                 DIRECT_ATTRIBUTE_VALUE => {
                     let bytes = read_bytes(lane.payload, &mut cursor)?;
                     let value = std::str::from_utf8(bytes)
-                        .map_err(|_| LogDbError::InvalidBlockEncoding("invalid UTF-8 text"))?;
+                        .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid UTF-8 text"))?;
                     if fields.is_none()
                         && previous.as_ref().is_some_and(|previous| {
                             previous[field_index].key.as_ref() == key.as_ref()
@@ -1726,7 +2048,7 @@ fn decode_fields(
                         .1
                         .get(key_id)
                         .and_then(|values| values.get(value_id))
-                        .ok_or(LogDbError::InvalidBlockEncoding(
+                        .ok_or(TelemetryError::InvalidBlockEncoding(
                             "unknown attribute value dictionary ID",
                         ))?;
                     if fields.is_none()
@@ -1753,7 +2075,7 @@ fn decode_fields(
                         });
                 }
                 _ => {
-                    return Err(LogDbError::InvalidBlockEncoding(
+                    return Err(TelemetryError::InvalidBlockEncoding(
                         "invalid attribute value kind",
                     ));
                 }
@@ -1779,13 +2101,14 @@ fn decode_selected_fields(
     tables: &DecodedAttributeTables,
     record_count: usize,
     selected: &[u32],
-) -> LogDbResult<Vec<Arc<Vec<MetadataField>>>> {
+) -> TelemetryResult<Vec<Arc<Vec<MetadataField>>>> {
     let lane = decode_seekable_record_lane(encoded, record_count)?;
     let mut selected_index = 0usize;
     let mut records = Vec::with_capacity(selected.len());
     while selected_index < selected.len() {
-        let first_ordinal = usize::try_from(selected[selected_index])
-            .map_err(|_| LogDbError::InvalidBlockEncoding("record ordinal does not fit usize"))?;
+        let first_ordinal = usize::try_from(selected[selected_index]).map_err(|_| {
+            TelemetryError::InvalidBlockEncoding("record ordinal does not fit usize")
+        })?;
         let checkpoint = first_ordinal / lane.interval;
         let checkpoint_end = (checkpoint + 1)
             .saturating_mul(lane.interval)
@@ -1798,8 +2121,9 @@ fn decode_selected_fields(
         {
             group_end += 1;
         }
-        let final_ordinal = usize::try_from(selected[group_end - 1])
-            .map_err(|_| LogDbError::InvalidBlockEncoding("record ordinal does not fit usize"))?;
+        let final_ordinal = usize::try_from(selected[group_end - 1]).map_err(|_| {
+            TelemetryError::InvalidBlockEncoding("record ordinal does not fit usize")
+        })?;
         let checkpoint_payload = lane.checkpoint_payload(checkpoint)?;
         let mut cursor = 0usize;
         let mut retained = selected_index;
@@ -1819,7 +2143,9 @@ fn decode_selected_fields(
                 let key = tables
                     .0
                     .get(key_id)
-                    .ok_or(LogDbError::InvalidBlockEncoding("unknown attribute key ID"))?;
+                    .ok_or(TelemetryError::InvalidBlockEncoding(
+                        "unknown attribute key ID",
+                    ))?;
                 let value = match read_byte(checkpoint_payload, &mut cursor)? {
                     DIRECT_ATTRIBUTE_VALUE => {
                         let bytes = read_bytes(checkpoint_payload, &mut cursor)?;
@@ -1831,13 +2157,13 @@ fn decode_selected_fields(
                             .1
                             .get(key_id)
                             .and_then(|values| values.get(value_id))
-                            .ok_or(LogDbError::InvalidBlockEncoding(
+                            .ok_or(TelemetryError::InvalidBlockEncoding(
                                 "unknown attribute value dictionary ID",
                             ))?;
                         retain.then(|| Arc::clone(value))
                     }
                     _ => {
-                        return Err(LogDbError::InvalidBlockEncoding(
+                        return Err(TelemetryError::InvalidBlockEncoding(
                             "invalid attribute value kind",
                         ));
                     }
@@ -1862,27 +2188,28 @@ fn decode_selected_fields(
     Ok(records)
 }
 
-fn encode_seekable_record_lane(payload: &[u8], checkpoints: &[usize]) -> LogDbResult<Vec<u8>> {
+fn encode_seekable_record_lane(payload: &[u8], checkpoints: &[usize]) -> TelemetryResult<Vec<u8>> {
     let mut encoded = Vec::with_capacity(payload.len().saturating_add(16 + checkpoints.len() * 3));
     encoded.extend_from_slice(payload);
-    let directory_start = u32::try_from(encoded.len()).map_err(|_| LogDbError::RecordTooLarge)?;
+    let directory_start =
+        u32::try_from(encoded.len()).map_err(|_| TelemetryError::RecordTooLarge)?;
     write_varint(
-        u64::try_from(SEEK_CHECKPOINT_INTERVAL).map_err(|_| LogDbError::RecordTooLarge)?,
+        u64::try_from(SEEK_CHECKPOINT_INTERVAL).map_err(|_| TelemetryError::RecordTooLarge)?,
         &mut encoded,
     );
     write_varint(
-        u64::try_from(checkpoints.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+        u64::try_from(checkpoints.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
         &mut encoded,
     );
     let mut previous = 0usize;
     for (index, checkpoint) in checkpoints.iter().copied().enumerate() {
         if (index == 0 && checkpoint != 0) || (index > 0 && checkpoint <= previous) {
-            return Err(LogDbError::InvalidBlockEncoding(
+            return Err(TelemetryError::InvalidBlockEncoding(
                 "record lane checkpoints are not ordered",
             ));
         }
         write_varint(
-            u64::try_from(checkpoint - previous).map_err(|_| LogDbError::RecordTooLarge)?,
+            u64::try_from(checkpoint - previous).map_err(|_| TelemetryError::RecordTooLarge)?,
             &mut encoded,
         );
         previous = checkpoint;
@@ -1894,41 +2221,41 @@ fn encode_seekable_record_lane(payload: &[u8], checkpoints: &[usize]) -> LogDbRe
 fn decode_seekable_record_lane(
     encoded: &[u8],
     record_count: usize,
-) -> LogDbResult<SeekableRecordLane<'_>> {
+) -> TelemetryResult<SeekableRecordLane<'_>> {
     let footer_start =
         encoded
             .len()
             .checked_sub(size_of::<u32>())
-            .ok_or(LogDbError::InvalidBlockEncoding(
+            .ok_or(TelemetryError::InvalidBlockEncoding(
                 "record lane footer is truncated",
             ))?;
     let directory_start = usize::try_from(u32::from_le_bytes(
         encoded[footer_start..]
             .try_into()
-            .map_err(|_| LogDbError::InvalidBlockEncoding("record lane footer is invalid"))?,
+            .map_err(|_| TelemetryError::InvalidBlockEncoding("record lane footer is invalid"))?,
     ))
-    .map_err(|_| LogDbError::InvalidBlockEncoding("record lane footer does not fit usize"))?;
+    .map_err(|_| TelemetryError::InvalidBlockEncoding("record lane footer does not fit usize"))?;
     let directory =
         encoded
             .get(directory_start..footer_start)
-            .ok_or(LogDbError::InvalidBlockEncoding(
+            .ok_or(TelemetryError::InvalidBlockEncoding(
                 "record lane directory is invalid",
             ))?;
     let payload = encoded
         .get(..directory_start)
-        .ok_or(LogDbError::InvalidBlockEncoding(
+        .ok_or(TelemetryError::InvalidBlockEncoding(
             "record lane payload is truncated",
         ))?;
     let mut cursor = 0usize;
     let interval = read_usize(directory, &mut cursor)?;
     if interval == 0 {
-        return Err(LogDbError::InvalidBlockEncoding(
+        return Err(TelemetryError::InvalidBlockEncoding(
             "record lane checkpoint interval is zero",
         ));
     }
     let checkpoint_count = read_usize(directory, &mut cursor)?;
     if checkpoint_count != record_count.div_ceil(interval) {
-        return Err(LogDbError::InvalidBlockEncoding(
+        return Err(TelemetryError::InvalidBlockEncoding(
             "record lane checkpoint count mismatch",
         ));
     }
@@ -1936,13 +2263,14 @@ fn decode_seekable_record_lane(
     let mut previous = 0usize;
     for index in 0..checkpoint_count {
         let delta = read_usize(directory, &mut cursor)?;
-        let checkpoint = previous
-            .checked_add(delta)
-            .ok_or(LogDbError::InvalidBlockEncoding(
-                "record lane checkpoint overflow",
-            ))?;
+        let checkpoint =
+            previous
+                .checked_add(delta)
+                .ok_or(TelemetryError::InvalidBlockEncoding(
+                    "record lane checkpoint overflow",
+                ))?;
         if (index == 0 && checkpoint != 0) || (index > 0 && checkpoint <= previous) {
-            return Err(LogDbError::InvalidBlockEncoding(
+            return Err(TelemetryError::InvalidBlockEncoding(
                 "record lane checkpoints are not ordered",
             ));
         }
@@ -1955,7 +2283,7 @@ fn decode_seekable_record_lane(
         .is_some_and(|checkpoint| *checkpoint >= payload.len())
         || (record_count == 0 && !payload.is_empty())
     {
-        return Err(LogDbError::InvalidBlockEncoding(
+        return Err(TelemetryError::InvalidBlockEncoding(
             "record lane checkpoint exceeds payload",
         ));
     }
@@ -1970,7 +2298,7 @@ fn validate_checkpoint_cursor(
     lane: &SeekableRecordLane<'_>,
     record_ordinal: usize,
     cursor: usize,
-) -> LogDbResult<()> {
+) -> TelemetryResult<()> {
     if record_ordinal.is_multiple_of(lane.interval)
         && lane
             .checkpoints
@@ -1978,7 +2306,7 @@ fn validate_checkpoint_cursor(
             .copied()
             != Some(cursor)
     {
-        return Err(LogDbError::InvalidBlockEncoding(
+        return Err(TelemetryError::InvalidBlockEncoding(
             "record lane checkpoint does not point to a record",
         ));
     }
@@ -2069,7 +2397,7 @@ fn unicode_term_ranges(message: &[u8]) -> Vec<Range<usize>> {
     terms
 }
 
-fn parse_messages<R: StructuralRecordView>(records: &[R]) -> LogDbResult<ParsedMessages<'_>> {
+fn parse_messages<R: StructuralRecordView>(records: &[R]) -> TelemetryResult<ParsedMessages<'_>> {
     let mut layouts = Vec::<ParsedMessage<'_>>::new();
     let mut layout_ids = Vec::with_capacity(records.len());
     let mut layout_counts = Vec::<usize>::new();
@@ -2085,14 +2413,15 @@ fn parse_messages<R: StructuralRecordView>(records: &[R]) -> LogDbResult<ParsedM
             cached_layout_id
         } else {
             let layout_id = layouts.len();
-            let cached_layout = u32::try_from(layout_id).map_err(|_| LogDbError::RecordTooLarge)?;
+            let cached_layout =
+                u32::try_from(layout_id).map_err(|_| TelemetryError::RecordTooLarge)?;
             layouts.push(parse_message(message));
             layout_counts.push(0);
             cache[cache_slot] = cached_layout;
             layout_id
         };
         layout_counts[layout_id] = layout_counts[layout_id].saturating_add(1);
-        layout_ids.push(u32::try_from(layout_id).map_err(|_| LogDbError::RecordTooLarge)?);
+        layout_ids.push(u32::try_from(layout_id).map_err(|_| TelemetryError::RecordTooLarge)?);
     }
     Ok(ParsedMessages {
         layouts,
@@ -2154,24 +2483,24 @@ fn template_hash(message: &[u8], literals: &[Range<usize>]) -> u64 {
     hash
 }
 
-fn append_bytes(encoded: &mut Vec<u8>, value: &[u8]) -> LogDbResult<()> {
+fn append_bytes(encoded: &mut Vec<u8>, value: &[u8]) -> TelemetryResult<()> {
     write_varint(
-        u64::try_from(value.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+        u64::try_from(value.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
         encoded,
     );
     encoded.extend_from_slice(value);
     Ok(())
 }
 
-fn structural_sections(encoded: &[u8]) -> LogDbResult<(usize, &[u8])> {
+fn structural_sections(encoded: &[u8]) -> TelemetryResult<(usize, &[u8])> {
     if encoded.get(..STRUCTURAL_BLOCK_MAGIC.len()) != Some(STRUCTURAL_BLOCK_MAGIC) {
-        return Err(LogDbError::InvalidBlockEncoding(
+        return Err(TelemetryError::InvalidBlockEncoding(
             "missing structural block magic",
         ));
     }
     let mut cursor = STRUCTURAL_BLOCK_MAGIC.len();
     let record_count = read_usize(encoded, &mut cursor)?;
-    for _ in 0..6 {
+    for _ in 0..7 {
         let _ = read_section(encoded, &mut cursor)?;
     }
     let embedded_index = read_section(encoded, &mut cursor)?;
@@ -2210,18 +2539,21 @@ fn encode_membership_filter(filter: &MembershipFilter, encoded: &mut Vec<u8>) {
     }
 }
 
-fn decode_membership_filter(encoded: &[u8], cursor: &mut usize) -> LogDbResult<MembershipFilter> {
+fn decode_membership_filter(
+    encoded: &[u8],
+    cursor: &mut usize,
+) -> TelemetryResult<MembershipFilter> {
     let byte_count = EMBEDDED_MEMBERSHIP_FILTER_WORDS
         .checked_mul(size_of::<u64>())
-        .ok_or(LogDbError::RecordTooLarge)?;
+        .ok_or(TelemetryError::RecordTooLarge)?;
     let end = cursor
         .checked_add(byte_count)
-        .ok_or(LogDbError::InvalidBlockEncoding(
+        .ok_or(TelemetryError::InvalidBlockEncoding(
             "membership filter length overflow",
         ))?;
     let bytes = encoded
         .get(*cursor..end)
-        .ok_or(LogDbError::InvalidBlockEncoding(
+        .ok_or(TelemetryError::InvalidBlockEncoding(
             "truncated membership filter",
         ))?;
     *cursor = end;
@@ -2242,12 +2574,12 @@ fn bits_for_dictionary(dictionary_count: u32) -> u8 {
     }
 }
 
-fn pack_ids(ids: &[u32], dictionary_count: u32) -> LogDbResult<PackedIdColumn> {
+fn pack_ids(ids: &[u32], dictionary_count: u32) -> TelemetryResult<PackedIdColumn> {
     if (ids.is_empty() && dictionary_count != 0)
         || (!ids.is_empty() && (dictionary_count == 0 || dictionary_count as usize > ids.len()))
         || ids.iter().any(|id| *id >= dictionary_count)
     {
-        return Err(LogDbError::InvalidBlockEncoding(
+        return Err(TelemetryError::InvalidBlockEncoding(
             "invalid packed ID dictionary",
         ));
     }
@@ -2261,7 +2593,7 @@ fn pack_ids(ids: &[u32], dictionary_count: u32) -> LogDbResult<PackedIdColumn> {
     let bit_count = ids
         .len()
         .checked_mul(usize::from(bits_per_id))
-        .ok_or(LogDbError::RecordTooLarge)?;
+        .ok_or(TelemetryError::RecordTooLarge)?;
     let mut values = Vec::with_capacity(bit_count.div_ceil(u8::BITS as usize));
     let mut buffered = 0u64;
     let mut buffered_bits = 0u8;
@@ -2305,18 +2637,19 @@ fn matching_packed_ids(
     record_count: u32,
     dictionary_count: u32,
     selected: &[u32],
-) -> LogDbResult<Vec<u32>> {
+) -> TelemetryResult<Vec<u32>> {
     if selected.is_empty() || record_count == 0 {
         return Ok(Vec::new());
     }
     let mut selected_ids =
-        vec![false; usize::try_from(dictionary_count).map_err(|_| LogDbError::RecordTooLarge)?];
+        vec![false; usize::try_from(dictionary_count).map_err(|_| TelemetryError::RecordTooLarge)?];
     for id in selected {
-        let slot = selected_ids
-            .get_mut(*id as usize)
-            .ok_or(LogDbError::InvalidBlockEncoding(
-                "embedded locator ID is out of range",
-            ))?;
+        let slot =
+            selected_ids
+                .get_mut(*id as usize)
+                .ok_or(TelemetryError::InvalidBlockEncoding(
+                    "embedded locator ID is out of range",
+                ))?;
         *slot = true;
     }
     let mut ordinals = Vec::new();
@@ -2332,7 +2665,7 @@ fn encode_packed_column(
     column: &PackedIdColumn,
     dictionary_count: u32,
     encoded: &mut Vec<u8>,
-) -> LogDbResult<()> {
+) -> TelemetryResult<()> {
     write_varint(u64::from(dictionary_count), encoded);
     encoded.push(column.bits_per_id);
     append_bytes(encoded, &column.values)
@@ -2342,29 +2675,29 @@ fn decode_packed_column(
     encoded: &[u8],
     cursor: &mut usize,
     record_count: u32,
-) -> LogDbResult<(u32, PackedIdColumn)> {
+) -> TelemetryResult<(u32, PackedIdColumn)> {
     let dictionary_count = read_u32(encoded, cursor)?;
     if (record_count == 0 && dictionary_count != 0)
         || (record_count != 0 && (dictionary_count == 0 || dictionary_count > record_count))
     {
-        return Err(LogDbError::InvalidBlockEncoding(
+        return Err(TelemetryError::InvalidBlockEncoding(
             "invalid embedded dictionary count",
         ));
     }
     let bits_per_id = read_byte(encoded, cursor)?;
     if bits_per_id != bits_for_dictionary(dictionary_count) {
-        return Err(LogDbError::InvalidBlockEncoding(
+        return Err(TelemetryError::InvalidBlockEncoding(
             "noncanonical packed ID width",
         ));
     }
     let values = read_bytes(encoded, cursor)?.to_vec();
     let expected_bytes = usize::try_from(record_count)
-        .map_err(|_| LogDbError::RecordTooLarge)?
+        .map_err(|_| TelemetryError::RecordTooLarge)?
         .checked_mul(usize::from(bits_per_id))
-        .ok_or(LogDbError::RecordTooLarge)?
+        .ok_or(TelemetryError::RecordTooLarge)?
         .div_ceil(u8::BITS as usize);
     if values.len() != expected_bytes {
-        return Err(LogDbError::InvalidBlockEncoding(
+        return Err(TelemetryError::InvalidBlockEncoding(
             "packed ID column length mismatch",
         ));
     }
@@ -2374,7 +2707,7 @@ fn decode_packed_column(
     };
     for ordinal in 0..record_count {
         if packed_id(&column, ordinal) >= dictionary_count {
-            return Err(LogDbError::InvalidBlockEncoding(
+            return Err(TelemetryError::InvalidBlockEncoding(
                 "packed ID exceeds its dictionary",
             ));
         }
@@ -2387,7 +2720,7 @@ fn decode_packed_column(
             .saturating_mul(usize::from(bits_per_id))
             % u8::BITS as usize;
         if used_bits != 0 && *last >> used_bits != 0 {
-            return Err(LogDbError::InvalidBlockEncoding(
+            return Err(TelemetryError::InvalidBlockEncoding(
                 "packed ID padding is nonzero",
             ));
         }
@@ -2395,17 +2728,17 @@ fn decode_packed_column(
     Ok((dictionary_count, column))
 }
 
-fn encode_sorted_ids(ids: &[u32], upper_bound: u32, encoded: &mut Vec<u8>) -> LogDbResult<()> {
+fn encode_sorted_ids(ids: &[u32], upper_bound: u32, encoded: &mut Vec<u8>) -> TelemetryResult<()> {
     if ids.is_empty()
         || ids.windows(2).any(|adjacent| adjacent[0] >= adjacent[1])
         || ids.last().is_some_and(|id| *id >= upper_bound)
     {
-        return Err(LogDbError::InvalidBlockEncoding(
+        return Err(TelemetryError::InvalidBlockEncoding(
             "embedded locator IDs are invalid",
         ));
     }
     write_varint(
-        u64::try_from(ids.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+        u64::try_from(ids.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
         encoded,
     );
     write_varint(u64::from(ids[0]), encoded);
@@ -2419,7 +2752,7 @@ fn encode_optional_sorted_ids(
     ids: &[u32],
     upper_bound: u32,
     encoded: &mut Vec<u8>,
-) -> LogDbResult<()> {
+) -> TelemetryResult<()> {
     if ids.is_empty() {
         write_varint(0, encoded);
         Ok(())
@@ -2432,7 +2765,7 @@ fn decode_optional_sorted_ids(
     encoded: &[u8],
     cursor: &mut usize,
     upper_bound: u32,
-) -> LogDbResult<Vec<u32>> {
+) -> TelemetryResult<Vec<u32>> {
     let count = read_usize(encoded, cursor)?;
     if count == 0 {
         return Ok(Vec::new());
@@ -2444,7 +2777,7 @@ fn decode_sorted_ids(
     encoded: &[u8],
     cursor: &mut usize,
     upper_bound: u32,
-) -> LogDbResult<Vec<u32>> {
+) -> TelemetryResult<Vec<u32>> {
     let count = read_usize(encoded, cursor)?;
     decode_sorted_ids_with_count(encoded, cursor, upper_bound, count)
 }
@@ -2454,16 +2787,16 @@ fn decode_sorted_ids_with_count(
     cursor: &mut usize,
     upper_bound: u32,
     count: usize,
-) -> LogDbResult<Vec<u32>> {
+) -> TelemetryResult<Vec<u32>> {
     if count == 0 || count > encoded.len().saturating_sub(*cursor) {
-        return Err(LogDbError::InvalidBlockEncoding(
+        return Err(TelemetryError::InvalidBlockEncoding(
             "invalid embedded locator count",
         ));
     }
     let mut ids = Vec::with_capacity(count);
     let first = read_u32(encoded, cursor)?;
     if first >= upper_bound {
-        return Err(LogDbError::InvalidBlockEncoding(
+        return Err(TelemetryError::InvalidBlockEncoding(
             "embedded locator ID is out of range",
         ));
     }
@@ -2471,7 +2804,7 @@ fn decode_sorted_ids_with_count(
     for _ in 1..count {
         let delta = read_u32(encoded, cursor)?;
         if delta == 0 {
-            return Err(LogDbError::InvalidBlockEncoding(
+            return Err(TelemetryError::InvalidBlockEncoding(
                 "embedded locator IDs are not ordered",
             ));
         }
@@ -2480,7 +2813,7 @@ fn decode_sorted_ids_with_count(
             .copied()
             .and_then(|previous| previous.checked_add(delta))
             .filter(|next| *next < upper_bound)
-            .ok_or(LogDbError::InvalidBlockEncoding(
+            .ok_or(TelemetryError::InvalidBlockEncoding(
                 "embedded locator ID is out of range",
             ))?;
         ids.push(next);
@@ -2488,14 +2821,14 @@ fn decode_sorted_ids_with_count(
     Ok(ids)
 }
 
-fn read_u32(encoded: &[u8], cursor: &mut usize) -> LogDbResult<u32> {
+fn read_u32(encoded: &[u8], cursor: &mut usize) -> TelemetryResult<u32> {
     u32::try_from(read_varint(encoded, cursor)?)
-        .map_err(|_| LogDbError::InvalidBlockEncoding("value does not fit u32"))
+        .map_err(|_| TelemetryError::InvalidBlockEncoding("value does not fit u32"))
 }
 
-fn read_arc_str(encoded: &[u8], cursor: &mut usize) -> LogDbResult<Arc<str>> {
+fn read_arc_str(encoded: &[u8], cursor: &mut usize) -> TelemetryResult<Arc<str>> {
     let value = std::str::from_utf8(read_bytes(encoded, cursor)?)
-        .map_err(|_| LogDbError::InvalidBlockEncoding("embedded string is invalid UTF-8"))?;
+        .map_err(|_| TelemetryError::InvalidBlockEncoding("embedded string is invalid UTF-8"))?;
     Ok(Arc::from(value))
 }
 
@@ -2518,42 +2851,45 @@ fn write_multibyte_varint(mut value: u64, encoded: &mut Vec<u8>) {
     encoded.push(value as u8);
 }
 
-fn read_section<'a>(encoded: &'a [u8], cursor: &mut usize) -> LogDbResult<&'a [u8]> {
+fn read_section<'a>(encoded: &'a [u8], cursor: &mut usize) -> TelemetryResult<&'a [u8]> {
     read_bytes(encoded, cursor)
 }
 
-fn read_bytes<'a>(encoded: &'a [u8], cursor: &mut usize) -> LogDbResult<&'a [u8]> {
+fn read_bytes<'a>(encoded: &'a [u8], cursor: &mut usize) -> TelemetryResult<&'a [u8]> {
     let length = read_usize(encoded, cursor)?;
     let end = cursor
         .checked_add(length)
-        .ok_or(LogDbError::InvalidBlockEncoding("section length overflow"))?;
+        .ok_or(TelemetryError::InvalidBlockEncoding(
+            "section length overflow",
+        ))?;
     let value = encoded
         .get(*cursor..end)
-        .ok_or(LogDbError::InvalidBlockEncoding("truncated section"))?;
+        .ok_or(TelemetryError::InvalidBlockEncoding("truncated section"))?;
     *cursor = end;
     Ok(value)
 }
 
-fn read_usize(encoded: &[u8], cursor: &mut usize) -> LogDbResult<usize> {
+fn read_usize(encoded: &[u8], cursor: &mut usize) -> TelemetryResult<usize> {
     usize::try_from(read_varint(encoded, cursor)?)
-        .map_err(|_| LogDbError::InvalidBlockEncoding("length does not fit usize"))
+        .map_err(|_| TelemetryError::InvalidBlockEncoding("length does not fit usize"))
 }
 
-fn ensure_count_within(count: usize, remaining: usize, label: &'static str) -> LogDbResult<()> {
+fn ensure_count_within(count: usize, remaining: usize, label: &'static str) -> TelemetryResult<()> {
     if count <= remaining {
         Ok(())
     } else {
-        Err(LogDbError::InvalidBlockEncoding(label))
+        Err(TelemetryError::InvalidBlockEncoding(label))
     }
 }
 
-fn validate_selected_ordinals(selected: &[u32], record_count: usize) -> LogDbResult<()> {
+fn validate_selected_ordinals(selected: &[u32], record_count: usize) -> TelemetryResult<()> {
     let mut previous = None;
     for ordinal in selected.iter().copied() {
-        let ordinal = usize::try_from(ordinal)
-            .map_err(|_| LogDbError::InvalidBlockEncoding("record ordinal does not fit usize"))?;
+        let ordinal = usize::try_from(ordinal).map_err(|_| {
+            TelemetryError::InvalidBlockEncoding("record ordinal does not fit usize")
+        })?;
         if ordinal >= record_count || previous.is_some_and(|previous| previous >= ordinal) {
-            return Err(LogDbError::InvalidBlockEncoding(
+            return Err(TelemetryError::InvalidBlockEncoding(
                 "selected record ordinals are not strictly increasing",
             ));
         }
@@ -2562,14 +2898,14 @@ fn validate_selected_ordinals(selected: &[u32], record_count: usize) -> LogDbRes
     Ok(())
 }
 
-fn read_varint(encoded: &[u8], cursor: &mut usize) -> LogDbResult<u64> {
+fn read_varint(encoded: &[u8], cursor: &mut usize) -> TelemetryResult<u64> {
     let mut value = 0u64;
     let mut shift = 0u32;
     loop {
         let byte = read_byte(encoded, cursor)?;
         let payload = u64::from(byte & 0x7f);
         if shift > 63 || (shift == 63 && payload > 1) {
-            return Err(LogDbError::InvalidBlockEncoding("varint overflow"));
+            return Err(TelemetryError::InvalidBlockEncoding("varint overflow"));
         }
         value |= payload << shift;
         if byte & 0x80 == 0 {
@@ -2577,39 +2913,41 @@ fn read_varint(encoded: &[u8], cursor: &mut usize) -> LogDbResult<u64> {
         }
         shift = shift.saturating_add(7);
         if shift > 63 {
-            return Err(LogDbError::InvalidBlockEncoding("varint is too long"));
+            return Err(TelemetryError::InvalidBlockEncoding("varint is too long"));
         }
     }
 }
 
-fn read_byte(encoded: &[u8], cursor: &mut usize) -> LogDbResult<u8> {
+fn read_byte(encoded: &[u8], cursor: &mut usize) -> TelemetryResult<u8> {
     let byte = *encoded
         .get(*cursor)
-        .ok_or(LogDbError::InvalidBlockEncoding("truncated block"))?;
+        .ok_or(TelemetryError::InvalidBlockEncoding("truncated block"))?;
     *cursor = cursor
         .checked_add(1)
-        .ok_or(LogDbError::InvalidBlockEncoding("cursor overflow"))?;
+        .ok_or(TelemetryError::InvalidBlockEncoding("cursor overflow"))?;
     Ok(byte)
 }
 
-fn decode_text(bytes: Vec<u8>) -> LogDbResult<Arc<str>> {
+fn decode_text(bytes: Vec<u8>) -> TelemetryResult<Arc<str>> {
     String::from_utf8(bytes)
         .map(Arc::<str>::from)
-        .map_err(|_| LogDbError::InvalidBlockEncoding("invalid UTF-8 text"))
+        .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid UTF-8 text"))
 }
 
-fn require_consumed(encoded: &[u8], cursor: usize) -> LogDbResult<()> {
+fn require_consumed(encoded: &[u8], cursor: usize) -> TelemetryResult<()> {
     if cursor == encoded.len() {
         Ok(())
     } else {
-        Err(LogDbError::InvalidBlockEncoding("trailing component bytes"))
+        Err(TelemetryError::InvalidBlockEncoding(
+            "trailing component bytes",
+        ))
     }
 }
 
-fn validate_u32_length(length: usize) -> LogDbResult<()> {
+fn validate_u32_length(length: usize) -> TelemetryResult<()> {
     u32::try_from(length)
         .map(|_| ())
-        .map_err(|_| LogDbError::RecordTooLarge)
+        .map_err(|_| TelemetryError::RecordTooLarge)
 }
 
 #[cfg(test)]
@@ -2621,8 +2959,8 @@ mod tests {
     use super::*;
     use crate::{CompressionCohortId, LogQuery};
 
-    fn record(offset: u64, message: &str) -> DurableLogRecord {
-        DurableLogRecord::new(
+    fn record(offset: u64, message: &str) -> DurableLog {
+        DurableLog::new(
             ShardId::new(7),
             TopicPartition::new(TopicId::new(9), LogicalPartitionId::new(3)),
             LogicalOffset::new(offset),
@@ -2635,7 +2973,7 @@ mod tests {
     }
 
     struct CountingRecord<'a> {
-        record: &'a DurableLogRecord,
+        record: &'a DurableLog,
         field_reads: &'a Cell<usize>,
     }
 
@@ -2666,11 +3004,11 @@ mod tests {
         }
     }
 
-    fn legacy_rows(records: &[DurableLogRecord]) -> Vec<u8> {
+    fn legacy_rows(records: &[DurableLog]) -> Vec<u8> {
         let capacity = records
             .iter()
             .map(row_source_bytes)
-            .collect::<LogDbResult<Vec<_>>>()
+            .collect::<TelemetryResult<Vec<_>>>()
             .expect("logical source sizes fit")
             .into_iter()
             .sum::<u64>();
@@ -3061,7 +3399,7 @@ mod tests {
         corrupted[0] ^= 0xff;
         assert_eq!(
             decode_timestamps(&corrupted, values.len()),
-            Err(LogDbError::InvalidBlockEncoding(
+            Err(TelemetryError::InvalidBlockEncoding(
                 "invalid Pco timestamp section"
             ))
         );
@@ -3073,7 +3411,7 @@ mod tests {
         let encoded = encode_timestamp_values(&values);
         assert_eq!(
             decode_timestamps(&encoded, values.len() - 1),
-            Err(LogDbError::InvalidBlockEncoding(
+            Err(TelemetryError::InvalidBlockEncoding(
                 "Pco timestamp count mismatch"
             ))
         );
@@ -3081,8 +3419,8 @@ mod tests {
 
     #[test]
     fn malformed_structural_block_rejects_unbounded_record_count() {
-        let error = decode_structural_block(b"SLOG\xff\xff\xff\xff\x0f")
+        let error = decode_structural_block(b"STLG\xff\xff\xff\xff\x0f")
             .expect_err("truncated block cannot allocate from its record count");
-        assert_eq!(error, LogDbError::InvalidBlockEncoding("record count"));
+        assert_eq!(error, TelemetryError::InvalidBlockEncoding("record count"));
     }
 }

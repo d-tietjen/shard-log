@@ -1,7 +1,7 @@
-# Releasing ShardLog
+# Releasing ShardTelemetry
 
 Releases are built from annotated `vMAJOR.MINOR.PATCH` tags by GitHub Actions.
-ShardLog is distributed as a GitHub source archive and attested server binary;
+ShardTelemetry is distributed as a GitHub source archive and attested server binary;
 `publish = false` prevents an unusable crates.io package while shard-stream is
 consumed from pinned Git revisions.
 
@@ -14,7 +14,7 @@ consumed from pinned Git revisions.
 5. Verify the GitHub release contains the Linux binary archive, source archive,
    Apache and third-party notices, SHA-256 checksums, SPDX SBOM, and
    build-provenance attestation.
-6. Install the archive on a clean Linux host and run `shard-log-server --help`
+6. Install the archive on a clean Linux host and run `shard-telemetry-server --help`
    before publishing the release notes.
 
 Never retag or replace a published release. Issue a new patch version instead.

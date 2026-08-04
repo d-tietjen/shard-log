@@ -1,9 +1,9 @@
 # ClickHouse query compatibility
 
-ShardLog delegates analytical SQL semantics to a pinned ClickHouse query node
+ShardTelemetry delegates analytical SQL semantics to a pinned ClickHouse query node
 and remains responsible for log ingestion, indexing, compression, and tiered
 storage. The query evaluator remains unmodified. Production automatic pushdown
-uses the narrow in-tree `StorageShardLog` adapter described below; the generic
+uses the narrow in-tree `StorageShardTelemetry` adapter described below; the generic
 URL path remains available for an entirely stock ClickHouse binary. The pinned
 compatibility target is `ClickHouse 26.3.17.56 LTS`. The Adam acceptance image is pinned as
 `clickhouse@sha256:badd3bb0d34055bfa521b7b71bbee92aa7ec0025a90f1a1a5ec49c5b8ee0ba90`.
@@ -12,19 +12,19 @@ This boundary makes ClickHouse, rather than a second SQL implementation, the
 semantic authority for expressions, types, aggregate functions, joins,
 subqueries, common table expressions, window functions, JSON functions,
 materialized views, output formats, and query errors. Clients that need this
-surface connect to ClickHouse. Loki, OTLP, and ShardLog-native clients continue
-to connect directly to ShardLog.
+surface connect to ClickHouse. Loki, OTLP, and ShardTelemetry-native clients continue
+to connect directly to ShardTelemetry.
 
 ## Versioned columnar source
 
 The first executable adapter is a versioned Arrow IPC stream:
 
 ```text
-GET /shardlog/api/v1/clickhouse/scan
+GET /shardtelemetry/api/v1/clickhouse/scan
 ```
 
 The route is absent by default. It is registered only when
-`shard-log-server` receives `--clickhouse-token-file`. Every request must send
+`shard-telemetry-server` receives `--clickhouse-token-file`. Every request must send
 the exact token as `Authorization: Bearer ...`. The file must contain a
 non-empty token. Treat this as an administrative credential: the holder may
 select a tenant with `X-Scope-OrgID`.
@@ -45,7 +45,7 @@ The Arrow schema is version 1:
 | `metadata` | `Map<Utf8, Utf8>` | `Map(String, String)` | Structured metadata |
 
 The response content type is `application/vnd.apache.arrow.stream` and carries
-`X-ShardLog-Schema-Version: 1` plus the pinned ClickHouse target.
+`X-ShardTelemetry-Schema-Version: 1` plus the pinned ClickHouse target.
 
 The scan is streamed in bounded 8,192-row batches. It never materializes the
 complete tenant in the HTTP layer. The durable store pages each logical
@@ -73,7 +73,7 @@ which Arrow arrays are allocated and transmitted.
 The generic ClickHouse `URL` engine does not infer these parameters from a SQL
 `WHERE` clause. It therefore supports explicit pushdown in the source URL.
 
-The pinned `StorageShardLog` adapter in `clickhouse/adapter` subclasses
+The pinned `StorageShardTelemetry` adapter in `clickhouse/adapter` subclasses
 ClickHouse's `StorageURL` and overrides only its URI-parameter hook. It obtains
 the physical projection and analyzed filter DAG from `SelectQueryInfo` and
 automatically translates safe timestamp and exact map equalities into the same
@@ -84,7 +84,7 @@ rules.
 
 ## ClickHouse source
 
-With ShardLog listening locally and the token supplied by a protected secret
+With ShardTelemetry listening locally and the token supplied by a protected secret
 source, ClickHouse can query the stream directly:
 
 ```sql
@@ -93,7 +93,7 @@ SELECT
     count() AS records,
     quantileTDigest(0.99)(lengthUTF8(message)) AS p99_message_bytes
 FROM url(
-    'http://127.0.0.1:3100/shardlog/api/v1/clickhouse/scan',
+    'http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan',
     'ArrowStream',
     'tenant String, timestamp DateTime64(9, \'UTC\'), partition UInt32, offset UInt64, message String, labels Map(String, String), metadata Map(String, String)',
     headers(
@@ -105,8 +105,8 @@ GROUP BY service
 ORDER BY records DESC;
 ```
 
-`clickhouse/shardlog-url.sql` contains the generic URL-engine template and
-`clickhouse/shardlog-engine.sql` contains the automatic-pushdown template.
+`clickhouse/shardtelemetry-url.sql` contains the generic URL-engine template and
+`clickhouse/shardtelemetry-engine.sql` contains the automatic-pushdown template.
 ClickHouse stores engine headers in table metadata, so production
 deployments should inject a short-lived credential or use a trusted local
 proxy rather than committing a token to SQL.
@@ -116,7 +116,7 @@ proxy rather than committing a token to SQL.
 `scripts/run-clickhouse-compatibility.sh` evaluates the same deterministic
 query matrix against:
 
-1. the live ShardLog Arrow source; and
+1. the live ShardTelemetry Arrow source; and
 2. an equivalent ClickHouse `Memory` table populated from that source.
 
 It compares exact serialized results for filters, native-map grouping,
@@ -126,9 +126,9 @@ semantics, aliases, subqueries, and aggregate combinators. The harness refuses
 a ClickHouse version other than `26.3.17.56` unless
 `STRICT_CLICKHOUSE_VERSION=0` is supplied for developer smoke testing.
 
-Set `SHARDLOG_ADAPTER_MODE=1`, or run
+Set `SHARD_TELEMETRY_ADAPTER_MODE=1`, or run
 `scripts/run-clickhouse-adapter-compatibility.sh`, to create a
-`StorageShardLog` source table and exercise automatic pushdown. Adapter mode
+`StorageShardTelemetry` source table and exercise automatic pushdown. Adapter mode
 requires a ClickHouse binary or image built with the pinned adapter.
 
 This proves the adapter and evaluator path; it does not replace the larger
@@ -141,7 +141,7 @@ types, aliases, lambdas, aggregate combinators, joins, windows, and errors.
 | Area | Status |
 | --- | --- |
 | ClickHouse `SELECT` evaluator semantics | Supplied by pinned ClickHouse |
-| Bounded typed ShardLog scan | Implemented |
+| Bounded typed ShardTelemetry scan | Implemented |
 | Authentication and tenant selection | Implemented; route disabled by default |
 | Explicit timestamp/term/label/metadata pushdown | Implemented |
 | Explicit column projection | Implemented |
@@ -194,7 +194,7 @@ The isolated 581 MiB source/build/data directory from the initial run was
 removed because Adam was at 93% disk utilization. The pinned stock ClickHouse
 image remains installed for the full corpus campaign.
 
-ShardLog must not claim standalone ClickHouse compatibility while the pending
+ShardTelemetry must not claim standalone ClickHouse compatibility while the pending
 gates remain open. The current claim is narrower and precise: the pinned
 ClickHouse evaluator can execute its complete analytical SQL surface over the
-versioned ShardLog log source.
+versioned ShardTelemetry log source.

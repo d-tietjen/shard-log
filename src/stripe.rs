@@ -20,11 +20,11 @@ use crate::{
     CompressionCodec, CompressionCohortId, CompressionLocalityConfig, CompressionLocalityRecord,
     CompressionLocalityStats, CompressionPlacement, CompressionPlacementId, CompressionTemperature,
     DictionaryCache, DictionaryCatalog, DictionaryCatalogSnapshot, DictionaryId, DictionaryInsert,
-    DurableLogRecord, EmbeddedFrameIndex, LogDbError, LogDbResult, LogMatch, LogObjectTier,
-    LogQuery, MessageFingerprint, ObjectMetadata, ObjectTierConfig, OtlpLogDecoder, OtlpLogEvent,
-    QueryOrder, RealtimeDictionaryObserver, RealtimeDictionaryTrainer, RecordRef,
-    SharedLogObjectStore, SsdObjectCache, TierArtifactKind, TierArtifactSource, TierCheckpoint,
-    TierGroupSource, TierQueryRange, fingerprint_message, scan_message_terms,
+    DurableLog, EmbeddedFrameIndex, LogMatch, LogQuery, MessageFingerprint, ObjectMetadata,
+    ObjectTierConfig, OtlpLogDecoder, OtlpLogEvent, QueryOrder, RealtimeDictionaryObserver,
+    RealtimeDictionaryTrainer, SharedTelemetryObjectStore, SsdObjectCache, TelemetryError,
+    TelemetryObjectTier, TelemetryRecordRef, TelemetryResult, TierArtifactKind, TierArtifactSource,
+    TierCheckpoint, TierGroupSource, TierQueryRange, fingerprint_message, scan_message_terms,
     structural::{encode_structural_block, row_source_bytes},
 };
 
@@ -156,25 +156,25 @@ impl Default for StripeConfig {
 }
 
 impl StripeConfig {
-    fn validate(&self) -> LogDbResult<()> {
+    fn validate(&self) -> TelemetryResult<()> {
         if self.target_block_bytes == 0 {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "target_block_bytes must be nonzero",
             ));
         }
         if self.dictionary_cache_bytes == 0 {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "dictionary_cache_bytes must be nonzero",
             ));
         }
         if !zstd::compression_level_range().contains(&self.compression_level) {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "compression_level is outside zstd's supported range",
             ));
         }
         self.compression_locality
             .validate()
-            .map_err(LogDbError::InvalidConfig)?;
+            .map_err(TelemetryError::InvalidConfig)?;
         Ok(())
     }
 }
@@ -195,7 +195,7 @@ struct DictionarySelection {
 
 #[derive(Debug, Clone)]
 struct IndexedRecord {
-    record: DurableLogRecord,
+    record: DurableLog,
     tentative_placement: CompressionPlacement,
     temperature: CompressionTemperature,
     final_placement: Option<CompressionPlacement>,
@@ -242,7 +242,7 @@ struct IndexedFramePartition {
 
 #[derive(Debug)]
 struct StripeTierState {
-    tiers: HashMap<TopicPartition, LogObjectTier<SharedLogObjectStore>>,
+    tiers: HashMap<TopicPartition, TelemetryObjectTier<SharedTelemetryObjectStore>>,
     spool_directory: PathBuf,
     cache: Arc<SsdObjectCache>,
     config: ObjectTierConfig,
@@ -279,7 +279,7 @@ impl PartitionIndex {
 
 #[derive(Debug, Clone)]
 struct PendingRecord {
-    record: DurableLogRecord,
+    record: DurableLog,
     source_bytes: u64,
     fingerprint: MessageFingerprint,
 }
@@ -415,12 +415,12 @@ impl std::fmt::Debug for StripeCompressor {
 }
 
 impl StripeCompressor {
-    fn new(zstd_level: i32) -> LogDbResult<Self> {
+    fn new(zstd_level: i32) -> TelemetryResult<Self> {
         Ok(Self {
             zstd_level,
             active_dictionary: None,
             zstd: zstd::bulk::Compressor::new(zstd_level)
-                .map_err(|error| LogDbError::CompressionFailed(error.to_string()))?,
+                .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?,
         })
     }
 
@@ -429,23 +429,23 @@ impl StripeCompressor {
         source: &[u8],
         dictionary_id: Option<DictionaryId>,
         dictionary_payload: Option<&[u8]>,
-    ) -> LogDbResult<Vec<u8>> {
+    ) -> TelemetryResult<Vec<u8>> {
         if self.active_dictionary != dictionary_id {
             let dictionary = match (dictionary_id, dictionary_payload) {
                 (Some(_), Some(payload)) => payload,
                 (Some(dictionary_id), None) => {
-                    return Err(LogDbError::MissingDictionary(dictionary_id));
+                    return Err(TelemetryError::MissingDictionary(dictionary_id));
                 }
                 (None, _) => &[],
             };
             self.zstd
                 .set_dictionary(self.zstd_level, dictionary)
-                .map_err(|error| LogDbError::CompressionFailed(error.to_string()))?;
+                .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
             self.active_dictionary = dictionary_id;
         }
         self.zstd
             .compress(source)
-            .map_err(|error| LogDbError::CompressionFailed(error.to_string()))
+            .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))
     }
 }
 
@@ -453,7 +453,7 @@ impl StripeCompressor {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexReceipt {
     /// Record made visible to term and metadata queries.
-    pub record_ref: RecordRef,
+    pub record_ref: TelemetryRecordRef,
     /// Indexed watermark after the publication.
     pub indexed_through: LogicalOffset,
     /// Per-record temperature used for block scoring.
@@ -478,7 +478,7 @@ struct AppliedRecord {
 /// replaying records from the last sealed index-block watermark.
 pub trait ShardStreamDurableSink {
     /// Publishes a durable log event into the shard-local hot index.
-    fn on_durable_append(&mut self, record: DurableLogRecord) -> LogDbResult<IndexReceipt>;
+    fn on_durable_append(&mut self, record: DurableLog) -> TelemetryResult<IndexReceipt>;
 }
 
 /// A lock-free-by-ownership hot index for one shard-stream physical shard.
@@ -512,7 +512,7 @@ pub struct LogStripe {
 
 impl LogStripe {
     /// Creates a stripe owned by one physical shard-stream shard.
-    pub fn new(stream_shard_id: ShardId, config: StripeConfig) -> LogDbResult<Self> {
+    pub fn new(stream_shard_id: ShardId, config: StripeConfig) -> TelemetryResult<Self> {
         config.validate()?;
         let compression_level = config.compression_level;
         let block_collator = CompressionBlockCollator::new(
@@ -551,7 +551,7 @@ impl LogStripe {
         stream_shard_id: ShardId,
         config: StripeConfig,
         dictionary_catalog: Arc<DictionaryCatalog>,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         let mut stripe = Self::new(stream_shard_id, config)?;
         stripe.dictionary_catalog = Some(dictionary_catalog);
         stripe.refresh_dictionary_catalog()?;
@@ -564,7 +564,7 @@ impl LogStripe {
         stream_shard_id: ShardId,
         config: StripeConfig,
         trainer: &RealtimeDictionaryTrainer,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         let mut stripe = Self::with_dictionary_catalog(stream_shard_id, config, trainer.catalog())?;
         stripe.realtime_dictionary = Some(trainer.observer());
         Ok(stripe)
@@ -608,26 +608,26 @@ impl LogStripe {
     /// durable recovery watermarks.
     pub(crate) fn attach_object_tier(
         &mut self,
-        store: SharedLogObjectStore,
+        store: SharedTelemetryObjectStore,
         spool_directory: PathBuf,
         cache: Arc<SsdObjectCache>,
         partitions: impl IntoIterator<Item = TopicPartition>,
         config: ObjectTierConfig,
-    ) -> LogDbResult<Vec<DurableSinkCheckpoint>> {
+    ) -> TelemetryResult<Vec<DurableSinkCheckpoint>> {
         if self.tier.is_some() {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "an object tier is already attached to this stripe",
             ));
         }
         let spool_directory = spool_directory.join(format!("shard-{}", self.stream_shard_id.get()));
         fs::create_dir_all(&spool_directory)
-            .map_err(|error| LogDbError::StorageIo(format!("create tier spool: {error}")))?;
+            .map_err(|error| TelemetryError::StorageIo(format!("create tier spool: {error}")))?;
         let mut tiers = HashMap::new();
         let mut checkpoints = Vec::new();
         let mut next_frame_id = self.next_frame_id;
         for partition in partitions {
             let object_tier =
-                LogObjectTier::open(store.clone(), self.stream_shard_id, partition, config)?;
+                TelemetryObjectTier::open(store.clone(), self.stream_shard_id, partition, config)?;
             next_frame_id = next_frame_id.max(object_tier.root().next_block_id);
             if let Some(checkpoint) = object_tier.root().latest_checkpoint {
                 checkpoints.push(DurableSinkCheckpoint {
@@ -639,13 +639,13 @@ impl LogStripe {
                 });
             }
             if tiers.insert(partition, object_tier).is_some() {
-                return Err(LogDbError::InvalidConfig(
+                return Err(TelemetryError::InvalidConfig(
                     "object tier contains a duplicate partition",
                 ));
             }
         }
         if tiers.is_empty() {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "object tier requires at least one partition",
             ));
         }
@@ -702,7 +702,7 @@ impl LogStripe {
     #[must_use]
     pub fn final_compression_placement(
         &self,
-        record_ref: RecordRef,
+        record_ref: TelemetryRecordRef,
     ) -> Option<CompressionPlacement> {
         self.partitions
             .get(&record_ref.topic_partition)
@@ -711,7 +711,7 @@ impl LogStripe {
     }
 
     /// Adopts control-plane state at an append boundary.
-    pub fn begin_append_batch(&mut self) -> LogDbResult<bool> {
+    pub fn begin_append_batch(&mut self) -> TelemetryResult<bool> {
         self.refresh_dictionary_catalog()
     }
 
@@ -721,7 +721,7 @@ impl LogStripe {
     /// stripe-owned assignment map and LRU. The durable sink invokes it once
     /// before each append batch, while embedded callers can choose their own
     /// safe batch boundary.
-    pub fn refresh_dictionary_catalog(&mut self) -> LogDbResult<bool> {
+    pub fn refresh_dictionary_catalog(&mut self) -> TelemetryResult<bool> {
         let Some(dictionary_catalog) = &self.dictionary_catalog else {
             return Ok(false);
         };
@@ -749,7 +749,7 @@ impl LogStripe {
         placement_id: CompressionPlacementId,
         dictionary_id: DictionaryId,
         payload: Arc<[u8]>,
-    ) -> LogDbResult<DictionaryInsert> {
+    ) -> TelemetryResult<DictionaryInsert> {
         if let Some(dictionary_catalog) = &self.dictionary_catalog {
             dictionary_catalog.publish(placement_id, dictionary_id, Arc::clone(&payload))?;
             self.refresh_dictionary_catalog()?;
@@ -766,9 +766,9 @@ impl LogStripe {
     /// Index postings are written before the visible watermark advances. A
     /// query constrained to [`Self::indexed_through`] consequently cannot see
     /// an incomplete posting update.
-    pub fn apply_durable(&mut self, record: DurableLogRecord) -> LogDbResult<IndexReceipt> {
+    pub fn apply_durable(&mut self, record: DurableLog) -> TelemetryResult<IndexReceipt> {
         if record.stream_shard_id != self.stream_shard_id {
-            return Err(LogDbError::WrongStripe {
+            return Err(TelemetryError::WrongStripe {
                 expected: self.stream_shard_id,
                 observed: record.stream_shard_id,
             });
@@ -779,7 +779,7 @@ impl LogStripe {
             .and_then(|partition| partition.record(record.record_ref.offset))
             .is_some()
         {
-            return Err(LogDbError::DuplicateRecord {
+            return Err(TelemetryError::DuplicateRecord {
                 partition: record.record_ref.topic_partition,
                 offset: record.record_ref.offset,
             });
@@ -787,16 +787,16 @@ impl LogStripe {
         self.apply_durable_new(record)
     }
 
-    fn apply_durable_new(&mut self, record: DurableLogRecord) -> LogDbResult<IndexReceipt> {
+    fn apply_durable_new(&mut self, record: DurableLog) -> TelemetryResult<IndexReceipt> {
         self.apply_durable_new_inner(record, true)
             .map(|applied| applied.receipt)
     }
 
     fn apply_durable_new_inner(
         &mut self,
-        record: DurableLogRecord,
+        record: DurableLog,
         index_record: bool,
-    ) -> LogDbResult<AppliedRecord> {
+    ) -> TelemetryResult<AppliedRecord> {
         self.validate_offset(&record)?;
 
         let record_source_bytes = row_source_bytes(&record)?;
@@ -830,8 +830,8 @@ impl LogStripe {
                 .partitions
                 .entry(reference.topic_partition)
                 .or_default();
-            let record_ordinal =
-                u32::try_from(partition.records.len()).map_err(|_| LogDbError::RecordTooLarge)?;
+            let record_ordinal = u32::try_from(partition.records.len())
+                .map_err(|_| TelemetryError::RecordTooLarge)?;
             partition.records.push(IndexedRecord {
                 record: record.clone(),
                 tentative_placement: tentative_compression_placement,
@@ -918,7 +918,7 @@ impl LogStripe {
         topic_partition: TopicPartition,
         first_offset: LogicalOffset,
         events: impl IntoIterator<Item = OtlpLogEvent>,
-    ) -> LogDbResult<Vec<IndexReceipt>> {
+    ) -> TelemetryResult<Vec<IndexReceipt>> {
         self.begin_append_batch()?;
         let events = events.into_iter().collect::<Vec<_>>();
         validate_batch_offset_range(topic_partition, first_offset, events.len())?;
@@ -954,7 +954,7 @@ impl LogStripe {
         record_count: u32,
         payload: Bytes,
         transient_context: Option<&[u8]>,
-    ) -> LogDbResult<()> {
+    ) -> TelemetryResult<()> {
         self.apply_indexed_ingest_pack_inner(
             topic_partition,
             first_offset,
@@ -973,12 +973,12 @@ impl LogStripe {
         payload: Bytes,
         transient_context: Option<&[u8]>,
         checkpoints: (DurableSinkCheckpoint, DurableSinkCheckpoint),
-    ) -> LogDbResult<()> {
+    ) -> TelemetryResult<()> {
         let (expected_checkpoint, next_checkpoint) = checkpoints;
         if expected_checkpoint.topic_partition != topic_partition
             || next_checkpoint.topic_partition != topic_partition
         {
-            return Err(LogDbError::CorruptSinkJournal(
+            return Err(TelemetryError::CorruptSinkJournal(
                 "indexed append checkpoints refer to another partition".into(),
             ));
         }
@@ -1000,9 +1000,9 @@ impl LogStripe {
         payload: Bytes,
         transient_context: Option<&[u8]>,
         next_checkpoint: Option<DurableSinkCheckpoint>,
-    ) -> LogDbResult<()> {
+    ) -> TelemetryResult<()> {
         if record_count == 0 {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "compressed ingest append must contain records",
             ));
         }
@@ -1010,7 +1010,7 @@ impl LogStripe {
             topic_partition,
             first_offset,
             usize::try_from(record_count - 1)
-                .map_err(|_| LogDbError::OffsetExhausted(topic_partition))?,
+                .map_err(|_| TelemetryError::OffsetExhausted(topic_partition))?,
         )?;
         if let Some(previous) = self.indexed_through(topic_partition)
             && first_offset <= previous
@@ -1022,8 +1022,8 @@ impl LogStripe {
                 .get()
                 .checked_add(1)
                 .map(LogicalOffset::new)
-                .ok_or(LogDbError::OffsetExhausted(topic_partition))?;
-            return Err(LogDbError::OffsetOutOfOrder {
+                .ok_or(TelemetryError::OffsetExhausted(topic_partition))?;
+            return Err(TelemetryError::OffsetOutOfOrder {
                 partition: topic_partition,
                 expected,
                 observed: first_offset,
@@ -1035,7 +1035,7 @@ impl LogStripe {
             self.next_frame_id = self
                 .next_frame_id
                 .checked_add(1)
-                .ok_or(LogDbError::RecordTooLarge)?;
+                .ok_or(TelemetryError::RecordTooLarge)?;
         }
         let partition = self
             .indexed_frame_partitions
@@ -1065,7 +1065,7 @@ impl LogStripe {
         topic_partition: TopicPartition,
         first_offset: LogicalOffset,
         payload: &[u8],
-    ) -> LogDbResult<Vec<IndexReceipt>> {
+    ) -> TelemetryResult<Vec<IndexReceipt>> {
         self.apply_otlp_events(
             topic_partition,
             first_offset,
@@ -1074,7 +1074,7 @@ impl LogStripe {
     }
 
     /// Seals every active block and returns their immutable descriptors.
-    pub fn seal_active_blocks(&mut self) -> LogDbResult<Vec<BlockDescriptor>> {
+    pub fn seal_active_blocks(&mut self) -> TelemetryResult<Vec<BlockDescriptor>> {
         let active_blocks = std::mem::take(&mut self.active_blocks);
         let mut sealed = Vec::new();
         for (key, active) in active_blocks {
@@ -1087,7 +1087,7 @@ impl LogStripe {
     ///
     /// When `force` is false, only groups at the configured target size are
     /// published. A forced pass seals every remaining checkpointed append.
-    pub(crate) fn offload_indexed_groups(&mut self, force: bool) -> LogDbResult<usize> {
+    pub(crate) fn offload_indexed_groups(&mut self, force: bool) -> TelemetryResult<usize> {
         let Some(state) = self.tier.as_ref() else {
             return Ok(0);
         };
@@ -1108,11 +1108,11 @@ impl LogStripe {
         &mut self,
         partition: TopicPartition,
         force: bool,
-    ) -> LogDbResult<bool> {
+    ) -> TelemetryResult<bool> {
         let state = self
             .tier
             .as_ref()
-            .ok_or(LogDbError::InvalidConfig("object tier is not attached"))?;
+            .ok_or(TelemetryError::InvalidConfig("object tier is not attached"))?;
         let config = state.config;
         let Some(resident) = self.indexed_frame_partitions.get(&partition) else {
             return Ok(false);
@@ -1128,15 +1128,15 @@ impl LogStripe {
                 total
                     .checked_add(
                         u64::try_from(frame.compressed.len())
-                            .map_err(|_| LogDbError::RecordTooLarge)?,
+                            .map_err(|_| TelemetryError::RecordTooLarge)?,
                     )
-                    .ok_or(LogDbError::RecordTooLarge)
+                    .ok_or(TelemetryError::RecordTooLarge)
             })?;
             let append_frames = append.frames.len();
             if append_payload_bytes > config.max_group_payload_bytes
                 || append_frames > config.max_blocks_per_group
             {
-                return Err(LogDbError::ObjectStore(
+                return Err(TelemetryError::ObjectStore(
                     "one durable append exceeds the object-tier group limit".into(),
                 ));
             }
@@ -1150,10 +1150,10 @@ impl LogStripe {
             selected_appends += 1;
             selected_payload_bytes = selected_payload_bytes
                 .checked_add(append_payload_bytes)
-                .ok_or(LogDbError::RecordTooLarge)?;
+                .ok_or(TelemetryError::RecordTooLarge)?;
             selected_frames = selected_frames
                 .checked_add(append_frames)
-                .ok_or(LogDbError::RecordTooLarge)?;
+                .ok_or(TelemetryError::RecordTooLarge)?;
             if selected_payload_bytes >= config.target_group_payload_bytes {
                 break;
             }
@@ -1249,7 +1249,7 @@ impl LogStripe {
         &mut self,
         block_id: BlockId,
         object_key: impl Into<Arc<str>>,
-    ) -> LogDbResult<()> {
+    ) -> TelemetryResult<()> {
         self.catalog.mark_offloaded(block_id, object_key)
     }
 
@@ -1259,7 +1259,7 @@ impl LogStripe {
         block_id: BlockId,
         object_key: impl Into<Arc<str>>,
         object_offset: u64,
-    ) -> LogDbResult<()> {
+    ) -> TelemetryResult<()> {
         self.catalog
             .mark_offloaded_range(block_id, object_key, object_offset)
     }
@@ -1274,7 +1274,7 @@ impl LogStripe {
         self.query_checked(query).unwrap_or_default()
     }
 
-    pub(crate) fn query_checked(&self, query: &LogQuery) -> LogDbResult<Vec<LogMatch>> {
+    pub(crate) fn query_checked(&self, query: &LogQuery) -> TelemetryResult<Vec<LogMatch>> {
         if query.limit == Some(0) || query.has_invalid_range() {
             return Ok(Vec::new());
         }
@@ -1293,14 +1293,14 @@ impl LogStripe {
     pub(crate) fn query_partitions_checked(
         &self,
         queries: &[LogQuery],
-    ) -> LogDbResult<Vec<LogMatch>> {
+    ) -> TelemetryResult<Vec<LogMatch>> {
         let Some(ordering_query) = queries.first() else {
             return Ok(Vec::new());
         };
         if self.tier.is_some() {
             let mut matches = queries.iter().try_fold(Vec::new(), |mut matches, query| {
                 matches.extend(self.query_checked(query)?);
-                Ok::<_, LogDbError>(matches)
+                Ok::<_, TelemetryError>(matches)
             })?;
             matches.sort_unstable_by(|left, right| {
                 ordering_query.compare(&left.record, &right.record)
@@ -1418,7 +1418,7 @@ impl LogStripe {
     /// list and intersects each remaining list with a linear merge, making
     /// constraint order irrelevant to the asymptotic cost.
     #[must_use]
-    pub fn query_refs(&self, query: &LogQuery) -> Vec<RecordRef> {
+    pub fn query_refs(&self, query: &LogQuery) -> Vec<TelemetryRecordRef> {
         self.query(query)
             .into_iter()
             .map(|matched| matched.record.record_ref)
@@ -1429,7 +1429,7 @@ impl LogStripe {
         &self,
         query: &LogQuery,
         partition: &IndexedFramePartition,
-    ) -> LogDbResult<Vec<LogMatch>> {
+    ) -> TelemetryResult<Vec<LogMatch>> {
         let constraints = query.required_index_constraints();
         if constraints.impossible {
             return Ok(Vec::new());
@@ -1449,7 +1449,7 @@ impl LogStripe {
         Ok(matches)
     }
 
-    fn query_tiered_groups(&self, query: &LogQuery) -> LogDbResult<Vec<LogMatch>> {
+    fn query_tiered_groups(&self, query: &LogQuery) -> TelemetryResult<Vec<LogMatch>> {
         let Some(state) = &self.tier else {
             return Ok(Vec::new());
         };
@@ -1478,13 +1478,13 @@ impl LogStripe {
             let manifest = tier.load_group(&group)?;
             let query_artifact = manifest
                 .artifact(TierArtifactKind::QueryIndex)
-                .ok_or_else(|| LogDbError::CorruptTier("group has no query index".into()))?;
+                .ok_or_else(|| TelemetryError::CorruptTier("group has no query index".into()))?;
             let query_index =
                 tier.read_artifact(query_artifact, MAX_TIER_QUERY_INDEX_READ_BYTES)?;
             let appends = decode_tier_ingest_group(&query_index, &manifest.blocks)?;
             let payload_artifact = manifest
                 .artifact(TierArtifactKind::PayloadPack)
-                .ok_or_else(|| LogDbError::CorruptTier("group has no payload pack".into()))?;
+                .ok_or_else(|| TelemetryError::CorruptTier("group has no payload pack".into()))?;
             let payload_metadata = ObjectMetadata {
                 bytes: payload_artifact.bytes,
                 version_token: payload_artifact.checksum.clone(),
@@ -1516,7 +1516,7 @@ impl LogStripe {
                     let range_end = cold_frame
                         .payload_offset
                         .checked_add(cold_frame.payload_bytes)
-                        .ok_or(LogDbError::RecordTooLarge)?;
+                        .ok_or(TelemetryError::RecordTooLarge)?;
                     let compressed = state.cache.read_range_with_metadata(
                         tier.object_store(),
                         &payload_artifact.object_key,
@@ -1524,7 +1524,7 @@ impl LogStripe {
                         cold_frame.payload_offset..range_end,
                     )?;
                     if blake3::hash(&compressed).to_hex().as_str() != cold_frame.payload_checksum {
-                        return Err(LogDbError::CorruptTier(format!(
+                        return Err(TelemetryError::CorruptTier(format!(
                             "tiered frame {} payload checksum failed",
                             cold_frame.frame_id
                         )));
@@ -1556,7 +1556,7 @@ impl LogStripe {
         query: &LogQuery,
         append: &IndexedFrameAppend,
         frame: &IndexedIngestFrame,
-    ) -> LogDbResult<Vec<LogMatch>> {
+    ) -> TelemetryResult<Vec<LogMatch>> {
         let candidates = indexed_frame_candidates(query, &frame.index, frame.record_count);
         if candidates.is_empty() {
             return Ok(Vec::new());
@@ -1570,12 +1570,12 @@ impl LogStripe {
         append: &IndexedFrameAppend,
         frame: &IndexedIngestFrame,
         candidates: &[u32],
-    ) -> LogDbResult<Vec<LogMatch>> {
+    ) -> TelemetryResult<Vec<LogMatch>> {
         let mut matches = Vec::new();
         for decoded in decode_indexed_ingest_records(frame, candidates)? {
             let relative_offset = decoded.offset.get();
             if relative_offset >= u64::from(append.record_count) {
-                return Err(LogDbError::InvalidBlockEncoding(
+                return Err(TelemetryError::InvalidBlockEncoding(
                     "compressed ingest record ordinal is out of range",
                 ));
             }
@@ -1584,13 +1584,25 @@ impl LogStripe {
                 .get()
                 .checked_add(relative_offset)
                 .map(LogicalOffset::new)
-                .ok_or(LogDbError::OffsetExhausted(query.topic_partition))?;
-            let record = DurableLogRecord {
+                .ok_or(TelemetryError::OffsetExhausted(query.topic_partition))?;
+            let record = DurableLog {
                 stream_shard_id: self.stream_shard_id,
-                record_ref: RecordRef::new(query.topic_partition, absolute_offset),
+                record_ref: TelemetryRecordRef::new(query.topic_partition, absolute_offset),
                 timestamp_unix_nanos: decoded.timestamp_unix_nanos,
+                observed_timestamp_unix_nanos: decoded.observed_timestamp_unix_nanos,
+                body: decoded.body,
                 message: decoded.message,
                 fields: decoded.fields,
+                attributes: decoded.attributes,
+                resource: decoded.resource,
+                scope: decoded.scope,
+                severity_number: decoded.severity_number,
+                severity_text: decoded.severity_text,
+                dropped_attributes_count: decoded.dropped_attributes_count,
+                flags: decoded.flags,
+                trace_id: decoded.trace_id,
+                span_id: decoded.span_id,
+                event_name: decoded.event_name,
                 compression_cohort: frame.cohort,
             };
             if query.matches(&record) {
@@ -1711,7 +1723,7 @@ impl LogStripe {
         ordinals
     }
 
-    fn validate_offset(&self, record: &DurableLogRecord) -> LogDbResult<()> {
+    fn validate_offset(&self, record: &DurableLog) -> TelemetryResult<()> {
         let Some(previous) = self
             .partitions
             .get(&record.record_ref.topic_partition)
@@ -1723,11 +1735,11 @@ impl LogStripe {
             .get()
             .checked_add(1)
             .map(LogicalOffset::new)
-            .ok_or(LogDbError::OffsetExhausted(
+            .ok_or(TelemetryError::OffsetExhausted(
                 record.record_ref.topic_partition,
             ))?;
         if record.record_ref.offset <= previous {
-            return Err(LogDbError::OffsetOutOfOrder {
+            return Err(TelemetryError::OffsetOutOfOrder {
                 partition: record.record_ref.topic_partition,
                 expected,
                 observed: record.record_ref.offset,
@@ -1736,7 +1748,7 @@ impl LogStripe {
         Ok(())
     }
 
-    fn apply_durable_idempotent(&mut self, record: DurableLogRecord) -> LogDbResult<IndexReceipt> {
+    fn apply_durable_idempotent(&mut self, record: DurableLog) -> TelemetryResult<IndexReceipt> {
         let topic_partition = record.record_ref.topic_partition;
         let offset = record.record_ref.offset;
         let existing = self.partitions.get(&topic_partition).and_then(|partition| {
@@ -1749,7 +1761,7 @@ impl LogStripe {
         });
         if let Some(existing) = existing {
             if existing.record != record {
-                return Err(LogDbError::ConflictingRecord {
+                return Err(TelemetryError::ConflictingRecord {
                     partition: topic_partition,
                     offset,
                 });
@@ -1796,7 +1808,7 @@ impl LogStripe {
         topic_partition: TopicPartition,
         first_offset: LogicalOffset,
         events: Vec<OtlpLogEvent>,
-    ) -> LogDbResult<Vec<IndexReceipt>> {
+    ) -> TelemetryResult<Vec<IndexReceipt>> {
         let mut events = events.into_iter().enumerate();
         let (first_index, first_event) = events
             .next()
@@ -1894,7 +1906,7 @@ impl LogStripe {
         partition.indexed_through = Some(last_offset);
     }
 
-    fn index_terms(&mut self, record: &DurableLogRecord, record_ordinal: u32) -> Arc<[usize]> {
+    fn index_terms(&mut self, record: &DurableLog, record_ordinal: u32) -> Arc<[usize]> {
         let topic_partition = record.record_ref.topic_partition;
         let cache_slot = message_term_cache_slot(topic_partition, record.message.as_bytes());
         let term_ids = if let Some(cached) = &self.message_term_cache[cache_slot]
@@ -1949,7 +1961,7 @@ impl LogStripe {
         term_ids
     }
 
-    fn index_fields(&mut self, record: &DurableLogRecord, record_ordinal: u32) -> Arc<[usize]> {
+    fn index_fields(&mut self, record: &DurableLog, record_ordinal: u32) -> Arc<[usize]> {
         let topic_partition = record.record_ref.topic_partition;
         let cache_slot = field_cache_slot(topic_partition, &record.fields);
         let field_ids = if let Some(cached) = &self.field_cache[cache_slot]
@@ -2015,7 +2027,7 @@ impl LogStripe {
     fn resolve_dictionary(
         &mut self,
         placement_id: CompressionPlacementId,
-    ) -> LogDbResult<DictionarySelection> {
+    ) -> TelemetryResult<DictionarySelection> {
         let Some(dictionary_id) = self.placement_dictionaries.get(&placement_id).copied() else {
             return Ok(DictionarySelection {
                 dictionary_id: None,
@@ -2033,7 +2045,7 @@ impl LogStripe {
             .dictionary_snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.dictionary(dictionary_id))
-            .ok_or(LogDbError::MissingDictionary(dictionary_id))?;
+            .ok_or(TelemetryError::MissingDictionary(dictionary_id))?;
         self.dictionary_cache
             .insert(dictionary_id, Arc::clone(&payload))?;
         Ok(DictionarySelection {
@@ -2047,7 +2059,7 @@ impl LogStripe {
         initial_key: ActiveBlockKey,
         initial_block: ActiveBlock,
         force_seal: bool,
-    ) -> LogDbResult<Vec<BlockDescriptor>> {
+    ) -> TelemetryResult<Vec<BlockDescriptor>> {
         if !self.block_collator.is_enabled() {
             let temperature = CompressionTemperature::new(0);
             let placement =
@@ -2153,7 +2165,7 @@ impl LogStripe {
         active: &ActiveBlock,
         placement: CompressionPlacement,
         score: CompressionBlockScore,
-    ) -> LogDbResult<BlockDescriptor> {
+    ) -> TelemetryResult<BlockDescriptor> {
         let durable_records = active
             .records
             .iter()
@@ -2210,28 +2222,28 @@ impl LogStripe {
 }
 
 impl ShardStreamDurableSink for LogStripe {
-    fn on_durable_append(&mut self, record: DurableLogRecord) -> LogDbResult<IndexReceipt> {
+    fn on_durable_append(&mut self, record: DurableLog) -> TelemetryResult<IndexReceipt> {
         self.apply_durable(record)
     }
 }
 
-/// Container for independently owned shard-logdb stripes.
+/// Container for independently owned ShardTelemetry log stripes.
 ///
 /// A deployment should hand each [`LogStripe`] to the matching shard-stream
 /// worker and invoke [`Self::apply_durable`] in that worker. This container is
 /// useful for single-process tests and embedded deployments; it never creates a
 /// shared global hot index.
 #[derive(Debug)]
-pub struct ShardLogDb {
+pub struct ShardTelemetry {
     stripes: HashMap<ShardId, LogStripe>,
 }
 
-impl ShardLogDb {
+impl ShardTelemetry {
     /// Creates one log stripe for each supplied shard-stream shard.
     pub fn new(
         shard_ids: impl IntoIterator<Item = ShardId>,
         config: StripeConfig,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         Self::new_with_optional_dictionary_catalog(shard_ids, config, None)
     }
 
@@ -2241,7 +2253,7 @@ impl ShardLogDb {
         shard_ids: impl IntoIterator<Item = ShardId>,
         config: StripeConfig,
         dictionary_catalog: Arc<DictionaryCatalog>,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         Self::new_with_optional_dictionary_catalog(shard_ids, config, Some(dictionary_catalog))
     }
 
@@ -2251,7 +2263,7 @@ impl ShardLogDb {
         shard_ids: impl IntoIterator<Item = ShardId>,
         config: StripeConfig,
         trainer: &RealtimeDictionaryTrainer,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         let mut database = Self::with_dictionary_catalog(shard_ids, config, trainer.catalog())?;
         for stripe in database.stripes.values_mut() {
             stripe.attach_realtime_dictionary(trainer.observer());
@@ -2263,11 +2275,11 @@ impl ShardLogDb {
         shard_ids: impl IntoIterator<Item = ShardId>,
         config: StripeConfig,
         dictionary_catalog: Option<Arc<DictionaryCatalog>>,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         let mut stripes = HashMap::new();
         for shard_id in shard_ids {
             if stripes.contains_key(&shard_id) {
-                return Err(LogDbError::DuplicateStripe(shard_id));
+                return Err(TelemetryError::DuplicateStripe(shard_id));
             }
             let stripe = match &dictionary_catalog {
                 Some(dictionary_catalog) => LogStripe::with_dictionary_catalog(
@@ -2280,7 +2292,9 @@ impl ShardLogDb {
             stripes.insert(shard_id, stripe);
         }
         if stripes.is_empty() {
-            return Err(LogDbError::InvalidConfig("at least one stripe is required"));
+            return Err(TelemetryError::InvalidConfig(
+                "at least one stripe is required",
+            ));
         }
         Ok(Self { stripes })
     }
@@ -2297,19 +2311,23 @@ impl ShardLogDb {
     }
 
     /// Routes an already durable shard-stream record to its matching log stripe.
-    pub fn apply_durable(&mut self, record: DurableLogRecord) -> LogDbResult<IndexReceipt> {
+    pub fn apply_durable(&mut self, record: DurableLog) -> TelemetryResult<IndexReceipt> {
         self.stripes
             .get_mut(&record.stream_shard_id)
-            .ok_or(LogDbError::UnknownStripe(record.stream_shard_id))?
+            .ok_or(TelemetryError::UnknownStripe(record.stream_shard_id))?
             .apply_durable(record)
     }
 
     /// Runs a partition-local query through one stripe.
-    pub fn query(&self, stream_shard_id: ShardId, query: &LogQuery) -> LogDbResult<Vec<LogMatch>> {
+    pub fn query(
+        &self,
+        stream_shard_id: ShardId,
+        query: &LogQuery,
+    ) -> TelemetryResult<Vec<LogMatch>> {
         let stripe = self
             .stripes
             .get(&stream_shard_id)
-            .ok_or(LogDbError::UnknownStripe(stream_shard_id))?;
+            .ok_or(TelemetryError::UnknownStripe(stream_shard_id))?;
         Ok(stripe.query(query))
     }
 
@@ -2326,7 +2344,7 @@ impl ShardLogDb {
         &self,
         stream_shard_ids: impl IntoIterator<Item = ShardId>,
         query: &LogQuery,
-    ) -> LogDbResult<Vec<LogMatch>> {
+    ) -> TelemetryResult<Vec<LogMatch>> {
         let mut seen = HashSet::new();
         let mut stripes = Vec::new();
         for stream_shard_id in stream_shard_ids {
@@ -2334,7 +2352,7 @@ impl ShardLogDb {
                 stripes.push(
                     self.stripes
                         .get(&stream_shard_id)
-                        .ok_or(LogDbError::UnknownStripe(stream_shard_id))?,
+                        .ok_or(TelemetryError::UnknownStripe(stream_shard_id))?,
                 );
             }
         }
@@ -2364,8 +2382,8 @@ impl ShardLogDb {
     }
 }
 
-impl ShardStreamDurableSink for ShardLogDb {
-    fn on_durable_append(&mut self, record: DurableLogRecord) -> LogDbResult<IndexReceipt> {
+impl ShardStreamDurableSink for ShardTelemetry {
+    fn on_durable_append(&mut self, record: DurableLog) -> TelemetryResult<IndexReceipt> {
         self.apply_durable(record)
     }
 }
@@ -2382,7 +2400,7 @@ fn validate_batch_offset_range(
     topic_partition: TopicPartition,
     first_offset: LogicalOffset,
     record_count: usize,
-) -> LogDbResult<()> {
+) -> TelemetryResult<()> {
     let Some(last_index) = record_count.checked_sub(1) else {
         return Ok(());
     };
@@ -2393,14 +2411,14 @@ fn batch_offset(
     topic_partition: TopicPartition,
     first_offset: LogicalOffset,
     index: usize,
-) -> LogDbResult<LogicalOffset> {
+) -> TelemetryResult<LogicalOffset> {
     let relative_offset =
-        u64::try_from(index).map_err(|_| LogDbError::OffsetExhausted(topic_partition))?;
+        u64::try_from(index).map_err(|_| TelemetryError::OffsetExhausted(topic_partition))?;
     first_offset
         .get()
         .checked_add(relative_offset)
         .map(LogicalOffset::new)
-        .ok_or(LogDbError::OffsetExhausted(topic_partition))
+        .ok_or(TelemetryError::OffsetExhausted(topic_partition))
 }
 
 #[inline]
@@ -2546,7 +2564,7 @@ fn remove_published_spool_file(path: &std::path::Path) {
         && error.kind() != std::io::ErrorKind::NotFound
     {
         eprintln!(
-            "shard-log retained published tier spool {} after cleanup failed: {error}",
+            "shard-telemetry retained published tier spool {} after cleanup failed: {error}",
             path.display()
         );
     }
@@ -2626,12 +2644,12 @@ mod tests {
         TopicPartition::new(TopicId::new(9), LogicalPartitionId::new(3))
     }
 
-    fn record(offset: u64, message: &str) -> DurableLogRecord {
+    fn record(offset: u64, message: &str) -> DurableLog {
         record_on(ShardId::new(7), offset, message)
     }
 
-    fn record_on(stream_shard_id: ShardId, offset: u64, message: &str) -> DurableLogRecord {
-        DurableLogRecord::new(
+    fn record_on(stream_shard_id: ShardId, offset: u64, message: &str) -> DurableLog {
+        DurableLog::new(
             stream_shard_id,
             partition(),
             LogicalOffset::new(offset),
@@ -2682,8 +2700,8 @@ mod tests {
 
     #[test]
     fn durable_records_become_visible_to_term_and_metadata_queries() {
-        let mut database =
-            ShardLogDb::new([ShardId::new(7)], StripeConfig::default()).expect("database opens");
+        let mut database = ShardTelemetry::new([ShardId::new(7)], StripeConfig::default())
+            .expect("database opens");
         database
             .apply_durable(record(0, "ERROR cannot connect").with_field("service", "api"))
             .expect("first append indexes");
@@ -2725,6 +2743,7 @@ mod tests {
                     MetadataField::new("trace", format!("trace-{ordinal}")),
                 ]),
                 compression_cohort: CompressionCohortId::new(ordinal % 3),
+                ..OtlpLogEvent::default()
             })
             .collect::<Vec<_>>();
         let prepared = prepare_ingest_pack(&events).expect("indexed ingest pack prepares");
@@ -2737,7 +2756,7 @@ mod tests {
             first_offset,
             events.len() as u32,
             payload.clone(),
-            Some(&prepared.transient_context),
+            None,
         )
         .expect("live frame indexes install");
         let mut recovered = LogStripe::new(ShardId::new(7), StripeConfig::default())
@@ -2810,6 +2829,7 @@ mod tests {
                     message: Arc::from(format!("ERROR request {timestamp} failed")),
                     fields: Arc::new(vec![MetadataField::new("service", "api")]),
                     compression_cohort: CompressionCohortId::new(1),
+                    ..OtlpLogEvent::default()
                 });
                 let prepared = prepare_ingest_pack(&events).expect("pack prepares");
                 stripe
@@ -2818,7 +2838,7 @@ mod tests {
                         LogicalOffset::new((batch * 2) as u64),
                         events.len() as u32,
                         Bytes::from(prepared.payload),
-                        Some(&prepared.transient_context),
+                        None,
                     )
                     .expect("frame append indexes");
             }
@@ -2865,6 +2885,7 @@ mod tests {
             message,
             fields,
             compression_cohort: CompressionCohortId::new(4),
+            ..OtlpLogEvent::default()
         };
         let mut stripe =
             LogStripe::new(ShardId::new(7), StripeConfig::default()).expect("stripe opens");
@@ -2917,6 +2938,7 @@ mod tests {
             message: Arc::from(message),
             fields: Arc::clone(&fields),
             compression_cohort: CompressionCohortId::new(4),
+            ..OtlpLogEvent::default()
         };
         let mut stripe =
             LogStripe::new(ShardId::new(7), StripeConfig::default()).expect("stripe opens");
@@ -2957,7 +2979,7 @@ mod tests {
     #[test]
     fn database_fanout_merges_selected_stripes_without_duplicate_results() {
         let mut database =
-            ShardLogDb::new([ShardId::new(7), ShardId::new(8)], StripeConfig::default())
+            ShardTelemetry::new([ShardId::new(7), ShardId::new(8)], StripeConfig::default())
                 .expect("database opens");
         for offset in 0..10 {
             let shard = if offset < 5 {
@@ -2995,7 +3017,7 @@ mod tests {
         );
         assert!(matches!(
             database.query_stripes([ShardId::new(99)], &query),
-            Err(LogDbError::UnknownStripe(shard)) if shard == ShardId::new(99)
+            Err(TelemetryError::UnknownStripe(shard)) if shard == ShardId::new(99)
         ));
     }
 
@@ -3152,7 +3174,7 @@ mod tests {
             .expect_err("offset regression is rejected");
         assert_eq!(
             error,
-            LogDbError::OffsetOutOfOrder {
+            TelemetryError::OffsetOutOfOrder {
                 partition: partition(),
                 expected: LogicalOffset::new(8),
                 observed: LogicalOffset::new(6),
@@ -3284,7 +3306,7 @@ mod tests {
         .expect("stripe opens");
         let source = CompressionCohortId::new(4);
         let records = [
-            DurableLogRecord::new(
+            DurableLog::new(
                 ShardId::new(7),
                 partition(),
                 LogicalOffset::new(0),
@@ -3293,7 +3315,7 @@ mod tests {
                 source,
             )
             .with_field("service", "paiements"),
-            DurableLogRecord::new(
+            DurableLog::new(
                 ShardId::new(7),
                 partition(),
                 LogicalOffset::new(1),
@@ -3302,7 +3324,7 @@ mod tests {
                 source,
             )
             .with_field("service", "paiements"),
-            DurableLogRecord::new(
+            DurableLog::new(
                 ShardId::new(7),
                 partition(),
                 LogicalOffset::new(2),
@@ -3311,7 +3333,7 @@ mod tests {
                 source,
             )
             .with_field("service", "paiements"),
-            DurableLogRecord::new(
+            DurableLog::new(
                 ShardId::new(7),
                 partition(),
                 LogicalOffset::new(3),
@@ -3460,7 +3482,7 @@ mod tests {
             .collect::<Vec<_>>();
         for (index, message) in messages.iter().enumerate() {
             stripe
-                .apply_durable(DurableLogRecord::new(
+                .apply_durable(DurableLog::new(
                     ShardId::new(7),
                     partition(),
                     LogicalOffset::new(u64::try_from(index).expect("offset fits")),

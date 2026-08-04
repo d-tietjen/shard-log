@@ -1,4 +1,4 @@
-ShardLog includes third-party software. The corresponding license expressions
+ShardTelemetry includes third-party software. The corresponding license expressions
 and dependency versions are recorded in Cargo.lock and the release SPDX SBOM.
 
 --------------------------------------------------------------------------------

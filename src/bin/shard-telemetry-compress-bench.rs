@@ -109,7 +109,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let raw = compress_raw(&settings, &[])?;
     let raw_with_dictionary = compress_raw(&settings, &dictionary)?;
     let template = compress_template(&settings)?;
-    let mut report = String::from("shard-log real-log compression benchmark\n");
+    let mut report = String::from("shard-telemetry real-log compression benchmark\n");
     report.push_str(&format!("input: {}\n", settings.input.display()));
     report.push_str(&format!("source bytes: {}\n", raw.source_bytes));
     report.push_str(&format!("block target: {}\n", settings.block_bytes));
@@ -159,7 +159,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn parse_settings() -> Result<Settings, Box<dyn Error>> {
     let mut arguments = env::args_os().skip(1);
     let input = arguments.next().map(PathBuf::from).ok_or(
-        "usage: shard-log-compress-bench <raw-log-file|-> [--spool-stdin-to PATH] [--report PATH] [--limit-bytes N] [--block-bytes N]",
+        "usage: shard-telemetry-compress-bench <raw-log-file|-> [--spool-stdin-to PATH] [--report PATH] [--limit-bytes N] [--block-bytes N]",
     )?;
     let mut limit_bytes = DEFAULT_LIMIT_BYTES;
     let mut block_bytes = DEFAULT_BLOCK_BYTES;

@@ -2,24 +2,45 @@ use std::fmt;
 use std::sync::Arc;
 
 use regex::{Regex, RegexBuilder};
+use serde::{Deserialize, Serialize};
 use shard_stream_core::{LogicalOffset, ShardId, TopicPartition};
 
-use crate::{CompressionCohortId, LogDbError, LogDbResult};
+use crate::{
+    CompressionCohortId, ResourceContext, ScopeContext, SpanId, TelemetryAttribute, TelemetryError,
+    TelemetryResult, TelemetrySignal, TelemetryValue, TraceId,
+};
 
 /// Stable address of one log record in shard-stream's ordered append log.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RecordRef {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct TelemetryRecordRef {
+    /// Signal represented by this offset.
+    pub signal: TelemetrySignal,
     /// Logical topic and partition containing the record.
     pub topic_partition: TopicPartition,
     /// Durable logical offset of the record.
     pub offset: LogicalOffset,
 }
 
-impl RecordRef {
+impl TelemetryRecordRef {
     /// Creates a record address.
     #[must_use]
     pub const fn new(topic_partition: TopicPartition, offset: LogicalOffset) -> Self {
         Self {
+            signal: TelemetrySignal::Logs,
+            topic_partition,
+            offset,
+        }
+    }
+
+    /// Creates a signal-aware record address.
+    #[must_use]
+    pub const fn for_signal(
+        signal: TelemetrySignal,
+        topic_partition: TopicPartition,
+        offset: LogicalOffset,
+    ) -> Self {
+        Self {
+            signal,
             topic_partition,
             offset,
         }
@@ -48,22 +69,46 @@ impl MetadataField {
 
 /// One log event accepted after the corresponding shard-stream append is durable.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DurableLogRecord {
+pub struct DurableLog {
     /// The physical shard-stream worker that owns this record.
     pub stream_shard_id: ShardId,
     /// Ordered log address assigned by shard-stream.
-    pub record_ref: RecordRef,
+    pub record_ref: TelemetryRecordRef,
     /// Event timestamp in Unix nanoseconds.
     pub timestamp_unix_nanos: u64,
+    /// Original observed timestamp, independently preserved from event time.
+    pub observed_timestamp_unix_nanos: u64,
+    /// Exact typed OTLP body. `None` is distinct from an empty body value.
+    pub body: Option<TelemetryValue>,
     /// Original unstructured message body.
     pub message: Arc<str>,
     /// Extracted exact-match metadata.
     pub fields: Arc<Vec<MetadataField>>,
+    /// Exact typed record attributes in wire order.
+    pub attributes: Arc<Vec<TelemetryAttribute>>,
+    /// Exact resource context and schema URL.
+    pub resource: Arc<ResourceContext>,
+    /// Exact instrumentation scope context and schema URL.
+    pub scope: Arc<ScopeContext>,
+    /// OTLP severity enum value, including unknown future values.
+    pub severity_number: i32,
+    /// Exact severity text.
+    pub severity_text: Arc<str>,
+    /// Number of record attributes dropped before export.
+    pub dropped_attributes_count: u32,
+    /// OTLP log flags, including unknown future bits.
+    pub flags: u32,
+    /// Binary trace ID when present.
+    pub trace_id: Option<TraceId>,
+    /// Binary span ID when present.
+    pub span_id: Option<SpanId>,
+    /// Exact event name.
+    pub event_name: Arc<str>,
     /// Compression cohort selected by the producer or parser.
     pub compression_cohort: CompressionCohortId,
 }
 
-impl DurableLogRecord {
+impl DurableLog {
     /// Constructs a durable log record with no extracted metadata.
     #[must_use]
     pub fn new(
@@ -76,10 +121,22 @@ impl DurableLogRecord {
     ) -> Self {
         Self {
             stream_shard_id,
-            record_ref: RecordRef::new(topic_partition, offset),
+            record_ref: TelemetryRecordRef::new(topic_partition, offset),
             timestamp_unix_nanos,
+            observed_timestamp_unix_nanos: 0,
+            body: None,
             message: message.into(),
             fields: Arc::new(Vec::new()),
+            attributes: Arc::new(Vec::new()),
+            resource: Arc::new(ResourceContext::default()),
+            scope: Arc::new(ScopeContext::default()),
+            severity_number: 0,
+            severity_text: Arc::from(""),
+            dropped_attributes_count: 0,
+            flags: 0,
+            trace_id: None,
+            span_id: None,
+            event_name: Arc::from(""),
             compression_cohort,
         }
     }
@@ -88,6 +145,13 @@ impl DurableLogRecord {
     #[must_use]
     pub fn with_field(mut self, key: impl Into<Arc<str>>, value: impl Into<Arc<str>>) -> Self {
         Arc::make_mut(&mut self.fields).push(MetadataField::new(key, value));
+        self
+    }
+
+    /// Adds one exact typed OTLP record attribute.
+    #[must_use]
+    pub fn with_attribute(mut self, attribute: TelemetryAttribute) -> Self {
+        Arc::make_mut(&mut self.attributes).push(attribute);
         self
     }
 }
@@ -165,12 +229,12 @@ impl LogRegex {
     pub fn new(
         pattern: impl Into<Arc<str>>,
         case_sensitivity: CaseSensitivity,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         let pattern = pattern.into();
         let compiled = RegexBuilder::new(&pattern)
             .case_insensitive(case_sensitivity == CaseSensitivity::Insensitive)
             .build()
-            .map_err(|error| LogDbError::InvalidQuery(error.to_string()))?;
+            .map_err(|error| TelemetryError::InvalidQuery(error.to_string()))?;
         Ok(Self {
             pattern,
             case_sensitivity,
@@ -238,7 +302,7 @@ pub enum LogPredicate {
     MatchAll,
     /// Matches no records.
     MatchNone,
-    /// Matches one case-insensitive token produced by ShardLog's scanner.
+    /// Matches one case-insensitive token produced by ShardTelemetry's scanner.
     Term(Arc<str>),
     /// Matches the complete message with a literal text operation.
     Message(TextMatcher),
@@ -311,7 +375,7 @@ impl LogPredicate {
     pub fn message_regex(
         pattern: impl Into<Arc<str>>,
         case_sensitivity: CaseSensitivity,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         Ok(Self::MessageRegex(LogRegex::new(
             pattern,
             case_sensitivity,
@@ -359,7 +423,7 @@ impl LogPredicate {
         key: impl Into<Arc<str>>,
         pattern: impl Into<Arc<str>>,
         case_sensitivity: CaseSensitivity,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         Ok(Self::FieldRegex {
             key: key.into(),
             regex: LogRegex::new(pattern, case_sensitivity)?,
@@ -580,5 +644,5 @@ impl LogQuery {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogMatch {
     /// The durable indexed record.
-    pub record: DurableLogRecord,
+    pub record: DurableLog,
 }

@@ -402,7 +402,10 @@ fn build_loki_router(
         router
     };
     let router = if analytics_enabled {
-        router.route("/shardlog/api/v1/clickhouse/scan", get(clickhouse_scan))
+        router.route(
+            "/shardtelemetry/api/v1/clickhouse/scan",
+            get(clickhouse_scan),
+        )
     } else {
         router
     };
@@ -433,7 +436,7 @@ async fn production_gate(State(state): State<ApiState>, request: Request, next: 
     if matches!(path, "/ready" | "/metrics") {
         return next.run(request).await;
     }
-    let analytics = path == "/shardlog/api/v1/clickhouse/scan";
+    let analytics = path == "/shardtelemetry/api/v1/clickhouse/scan";
     if !analytics {
         let observed = bearer_token(request.headers());
         let authenticated = observed.is_some_and(|observed| runtime.authenticates(observed));
@@ -4318,21 +4321,21 @@ async fn metrics(State(state): State<ApiState>) -> Response {
         .health()
         .is_ok_and(|health| health.ready && lifecycle == ServiceState::Ready);
     let mut output = format!(
-        "# HELP shard_log_ready Whether ShardLog is ready.\n\
-         # TYPE shard_log_ready gauge\n\
-         shard_log_ready {}\n\
-         # HELP shard_log_durable_sink_pending_items Durable sink items waiting for indexing.\n\
-         # TYPE shard_log_durable_sink_pending_items gauge\n\
-         shard_log_durable_sink_pending_items {}\n\
-         shard_log_durable_sink_pending_bytes {}\n\
-         shard_log_durable_sink_checkpoint_age_milliseconds {}\n\
-         shard_log_durable_sink_applied_appends_total {}\n\
-         shard_log_durable_sink_retries_total {}\n\
-         shard_log_durable_sink_failures_total {}\n\
-         shard_log_durable_sink_dirty_partitions {}\n\
-         shard_log_retention_runs_total {}\n\
-         shard_log_retention_advanced_offsets_total {}\n\
-         shard_log_retention_failures_total {}\n",
+        "# HELP shard_telemetry_ready Whether ShardTelemetry is ready.\n\
+         # TYPE shard_telemetry_ready gauge\n\
+         shard_telemetry_ready {}\n\
+         # HELP shard_telemetry_durable_sink_pending_items Durable sink items waiting for indexing.\n\
+         # TYPE shard_telemetry_durable_sink_pending_items gauge\n\
+         shard_telemetry_durable_sink_pending_items {}\n\
+         shard_telemetry_durable_sink_pending_bytes {}\n\
+         shard_telemetry_durable_sink_checkpoint_age_milliseconds {}\n\
+         shard_telemetry_durable_sink_applied_appends_total {}\n\
+         shard_telemetry_durable_sink_retries_total {}\n\
+         shard_telemetry_durable_sink_failures_total {}\n\
+         shard_telemetry_durable_sink_dirty_partitions {}\n\
+         shard_telemetry_retention_runs_total {}\n\
+         shard_telemetry_retention_advanced_offsets_total {}\n\
+         shard_telemetry_retention_failures_total {}\n",
         u8::from(ready),
         store.pending_items,
         store.pending_bytes,
@@ -4347,27 +4350,27 @@ async fn metrics(State(state): State<ApiState>) -> Response {
     );
     if let Some(retained_payload_bytes) = store.retained_payload_bytes {
         output.push_str(&format!(
-            "shard_log_retained_payload_bytes {retained_payload_bytes}\n"
+            "shard_telemetry_retained_payload_bytes {retained_payload_bytes}\n"
         ));
     }
     if let Some(runtime) = &state.production {
         let protocol = runtime.metrics();
         let (http, ingest, query, tail, native) = runtime.admission_in_flight();
         output.push_str(&format!(
-            "shard_log_http_requests_total {}\n\
-             shard_log_authentication_failures_total {}\n\
-             shard_log_rejected_requests_total {}\n\
-             shard_log_ingest_requests_total {}\n\
-             shard_log_ingest_bytes_total {}\n\
-             shard_log_ingest_records_total {}\n\
-             shard_log_query_requests_total {}\n\
-             shard_log_native_connections_total {}\n\
-             shard_log_tail_subscriptions_total {}\n\
-             shard_log_http_in_flight {}\n\
-             shard_log_ingest_in_flight {}\n\
-             shard_log_query_in_flight {}\n\
-             shard_log_tail_in_flight {}\n\
-             shard_log_native_connections_in_flight {}\n",
+            "shard_telemetry_http_requests_total {}\n\
+             shard_telemetry_authentication_failures_total {}\n\
+             shard_telemetry_rejected_requests_total {}\n\
+             shard_telemetry_ingest_requests_total {}\n\
+             shard_telemetry_ingest_bytes_total {}\n\
+             shard_telemetry_ingest_records_total {}\n\
+             shard_telemetry_query_requests_total {}\n\
+             shard_telemetry_native_connections_total {}\n\
+             shard_telemetry_tail_subscriptions_total {}\n\
+             shard_telemetry_http_in_flight {}\n\
+             shard_telemetry_ingest_in_flight {}\n\
+             shard_telemetry_query_in_flight {}\n\
+             shard_telemetry_tail_in_flight {}\n\
+             shard_telemetry_native_connections_in_flight {}\n",
             protocol.http_requests,
             protocol.authentication_failures,
             protocol.rejected_requests,
@@ -4401,7 +4404,7 @@ async fn services(State(state): State<ApiState>) -> Json<Value> {
         .as_ref()
         .map(|runtime| runtime.lifecycle().state().as_str())
         .unwrap_or("ready");
-    Json(json!({"services": [{"service": "shard-log", "status": status}]}))
+    Json(json!({"services": [{"service": "shard-telemetry", "status": status}]}))
 }
 
 async fn log_level() -> Json<Value> {
@@ -4445,10 +4448,10 @@ async fn flush_store(state: &ApiState) -> Result<(), LokiApiError> {
 async fn build_info() -> Json<Value> {
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "revision": option_env!("SHARD_LOG_GIT_REVISION").unwrap_or("unknown"),
+        "revision": option_env!("SHARD_TELEMETRY_GIT_REVISION").unwrap_or("unknown"),
         "branch": "unknown",
         "buildUser": "cargo",
-        "buildDate": option_env!("SHARD_LOG_BUILD_DATE").unwrap_or("unknown"),
+        "buildDate": option_env!("SHARD_TELEMETRY_BUILD_DATE").unwrap_or("unknown"),
         "goVersion": "",
     }))
 }
@@ -5153,7 +5156,7 @@ mod tests {
         let response = disabled
             .oneshot(
                 Request::builder()
-                    .uri("/shardlog/api/v1/clickhouse/scan")
+                    .uri("/shardtelemetry/api/v1/clickhouse/scan")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -5183,7 +5186,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/shardlog/api/v1/clickhouse/scan")
+                    .uri("/shardtelemetry/api/v1/clickhouse/scan")
                     .header("x-scope-orgid", "tenant-a")
                     .body(Body::empty())
                     .expect("request"),
@@ -5195,7 +5198,7 @@ mod tests {
         let authorized = app
             .oneshot(
                 Request::builder()
-                    .uri("/shardlog/api/v1/clickhouse/scan?term=failed&label.app=api&metadata.code=500")
+                    .uri("/shardtelemetry/api/v1/clickhouse/scan?term=failed&label.app=api&metadata.code=500")
                     .header("authorization", "Bearer analytics-secret")
                     .header("x-scope-orgid", "tenant-a")
                     .body(Body::empty())
@@ -5378,8 +5381,8 @@ mod tests {
             .await
             .expect("metrics body");
         let body = std::str::from_utf8(&body).expect("UTF-8 metrics");
-        assert!(body.contains("shard_log_authentication_failures_total"));
-        assert!(body.contains("shard_log_ingest_records_total"));
+        assert!(body.contains("shard_telemetry_authentication_failures_total"));
+        assert!(body.contains("shard_telemetry_ingest_records_total"));
         let counters = runtime.metrics();
         assert_eq!(counters.authentication_failures, 1);
         assert_eq!(counters.ingest_records, 1);

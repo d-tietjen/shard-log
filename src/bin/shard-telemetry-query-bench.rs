@@ -2,11 +2,11 @@ use std::error::Error;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use shard_log::{
-    CaseSensitivity, CompressionCohortId, DurableLogRecord, LogPredicate, LogQuery, LogStripe,
+use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicId, TopicPartition};
+use shard_telemetry::{
+    CaseSensitivity, CompressionCohortId, DurableLog, LogPredicate, LogQuery, LogStripe,
     NumericComparison, QueryCursor, StripeConfig,
 };
-use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicId, TopicPartition};
 
 const DEFAULT_RECORDS: usize = 100_000;
 const DEFAULT_ITERATIONS: usize = 100;
@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             message.push_str(" rare");
         }
         stripe.apply_durable(
-            DurableLogRecord::new(
+            DurableLog::new(
                 shard_id,
                 partition,
                 LogicalOffset::new(u64::try_from(index)?),
@@ -204,7 +204,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
     ];
 
-    println!("shard-log hot-query benchmark");
+    println!("shard-telemetry hot-query benchmark");
     println!("records: {}", settings.records);
     println!("iterations: {}", settings.iterations);
     println!("index build seconds: {:.6}", build_elapsed.as_secs_f64());

@@ -6,7 +6,7 @@ index 420c5c7f88..46e15a1f3b 100644
  void registerStorageMemory(StorageFactory & factory);
  void registerStorageFile(StorageFactory & factory);
  void registerStorageURL(StorageFactory & factory);
-+void registerStorageShardLog(StorageFactory & factory);
++void registerStorageShardTelemetry(StorageFactory & factory);
  void registerStorageDictionary(StorageFactory & factory);
  void registerStorageSet(StorageFactory & factory);
  void registerStorageJoin(StorageFactory & factory);
@@ -14,7 +14,7 @@ index 420c5c7f88..46e15a1f3b 100644
      registerStorageMemory(factory);
      registerStorageFile(factory);
      registerStorageURL(factory);
-+    registerStorageShardLog(factory);
++    registerStorageShardTelemetry(factory);
      registerStorageDictionary(factory);
      registerStorageSet(factory);
      registerStorageJoin(factory);

@@ -1,10 +1,11 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use rayon::prelude::*;
 use shard_stream_core::{
     LogicalOffset, LogicalPartitionId, PlacementSequence, TopicId, TopicPartition,
 };
@@ -15,17 +16,17 @@ use shard_stream_engine::{
 use shard_stream_protocol::{AppendRequest, Durability, FetchMode, FetchRequest};
 
 use crate::deletion::DeleteCatalog;
-use crate::ingest_pack::{decode_ingest_pack, prepare_native_ingest_pack};
+use crate::ingest_pack::decode_ingest_pack;
 use crate::loki_api::{LogicalDeleteFilter, LokiApiError, apply_logical_deletes};
 use crate::storage_format::DataDirectoryLease;
 use crate::{
     AnalyticsLogRow, AnalyticsScanRequest, DeleteRequest, LocalObjectStore, LogMatch, LogQuery,
-    LokiEntry, LokiStore, NativeAppendAck, NativeQuery, NativeQueryDirection, ObjectTierConfig,
-    OtlpSinkConfig, QueryCursor, ShardLogService, ShardLogSinkFactory, SinkObjectTierConfig,
-    SsdCacheConfig, StoreHealth, StoreMetrics, StripeConfig, encode_native_log_batch,
+    LokiEntry, LokiStore, NativeQuery, NativeQueryDirection, ObjectTierConfig, OtlpSinkConfig,
+    QueryCursor, SinkObjectTierConfig, SsdCacheConfig, StoreHealth, StoreMetrics, StripeConfig,
+    TelemetryService, TelemetrySinkFactory,
 };
 
-const LOKI_TOPIC_ID: TopicId = TopicId::new(1);
+const LOKI_TOPIC_ID: TopicId = crate::LOGS_TOPIC_ID;
 const LABEL_PREFIX: &str = "resource.loki.label.";
 const METADATA_PREFIX: &str = "attr.loki.metadata.";
 const TENANT_FIELD: &str = "resource.loki.tenant";
@@ -35,7 +36,7 @@ const TENANT_FIELD: &str = "resource.loki.tenant";
 pub struct DurableLokiConfig {
     /// Directory containing shard-stream packs, coordinator state, and index journals.
     pub data_directory: PathBuf,
-    /// Optional local object-store directory used by shard-stream and ShardLog.
+    /// Optional local object-store directory used by shard-stream and ShardTelemetry.
     pub object_store_directory: Option<PathBuf>,
     /// Retain a second raw-payload journal for faster hot-index recovery.
     ///
@@ -94,15 +95,16 @@ impl DurableLokiConfig {
 }
 
 /// Loki protocol backend whose acknowledged writes are durable shard-stream
-/// appends and whose reads execute on the owning ShardLog stripe workers.
+/// appends and whose reads execute on the owning ShardTelemetry stripe workers.
 pub struct DurableLokiStore {
     _data_directory_lease: DataDirectoryLease,
     engine: Arc<StreamEngine>,
-    service: ShardLogService,
+    service: TelemetryService,
     tenant_partitions: u32,
     ingest_stripes_per_tenant: u32,
     indexed_ack_timeout: Duration,
     next_request_id: AtomicU64,
+    remote_write_append: Mutex<()>,
     deletes: DeleteCatalog,
     retention: Option<Duration>,
     retention_runs: AtomicU64,
@@ -146,11 +148,11 @@ impl DurableLokiStore {
             replication_factor: 1,
             min_in_sync_replicas: 1,
             queue_slots_per_shard: 1_024,
-            queue_bytes_per_shard: 32 * 1024 * 1024,
+            queue_bytes_per_shard: 128 * 1024 * 1024,
             target_pack_bytes: 8 * 1024 * 1024,
             max_pack_age: Duration::from_secs(1),
-            max_batch_bytes: 16 * 1024 * 1024,
-            max_fetch_bytes: 16 * 1024 * 1024,
+            max_batch_bytes: 64 * 1024 * 1024,
+            max_fetch_bytes: 64 * 1024 * 1024,
             append_linger: config.append_linger,
         };
         let sink_object_tier = config
@@ -158,7 +160,7 @@ impl DurableLokiStore {
             .as_ref()
             .map(|directory| {
                 let store = LocalObjectStore::open(directory)?;
-                Ok::<_, crate::LogDbError>(SinkObjectTierConfig {
+                Ok::<_, crate::TelemetryError>(SinkObjectTierConfig {
                     store: store.into(),
                     spool_directory: config.data_directory.join("tier-spool"),
                     cache_directory: config.data_directory.join("tier-cache"),
@@ -182,7 +184,7 @@ impl DurableLokiStore {
             ..OtlpSinkConfig::default()
         };
         let factory = Arc::new(
-            ShardLogSinkFactory::new(engine_config.shard_ids(), sink_config)
+            TelemetrySinkFactory::new(engine_config.shard_ids(), sink_config)
                 .map_err(|error| LokiApiError::internal(error.to_string()))?,
         );
         let service = factory.service();
@@ -206,6 +208,16 @@ impl DurableLokiStore {
             Ok(()) | Err(EngineError::TopicAlreadyExists(_)) => {}
             Err(error) => return Err(engine_error(error)),
         }
+        for topic_id in [crate::TRACES_TOPIC_ID, crate::METRICS_TOPIC_ID] {
+            match engine.create_topic(TopicConfig {
+                topic_id,
+                partitions: config.tenant_partitions,
+                shards: None,
+            }) {
+                Ok(()) | Err(EngineError::TopicAlreadyExists(_)) => {}
+                Err(error) => return Err(engine_error(error)),
+            }
+        }
         Ok(Self {
             _data_directory_lease: data_directory_lease,
             engine,
@@ -214,6 +226,7 @@ impl DurableLokiStore {
             ingest_stripes_per_tenant: config.shard_count.min(config.tenant_partitions),
             indexed_ack_timeout: config.indexed_ack_timeout,
             next_request_id: AtomicU64::new(1),
+            remote_write_append: Mutex::new(()),
             deletes,
             retention: config.retention,
             retention_runs: AtomicU64::new(0),
@@ -222,16 +235,16 @@ impl DurableLokiStore {
         })
     }
 
-    /// Attaches ShardLog's Loki/query surface to a stream engine opened by an
+    /// Attaches ShardTelemetry's Loki/query surface to a stream engine opened by an
     /// external HA host.
     ///
-    /// The host must install the matching [`ShardLogSinkFactory`] as the
+    /// The host must install the matching [`TelemetrySinkFactory`] as the
     /// engine's durable sink before recovery. This constructor never opens a
     /// second WAL and never changes the host's replication or fencing policy.
     pub fn attach(
         data_directory: PathBuf,
         engine: Arc<StreamEngine>,
-        service: ShardLogService,
+        service: TelemetryService,
         tenant_partitions: u32,
         ingest_stripes_per_tenant: u32,
         indexed_ack_timeout: Duration,
@@ -259,13 +272,19 @@ impl DurableLokiStore {
         }
         let data_directory_lease = DataDirectoryLease::acquire(&data_directory)?;
         let deletes = DeleteCatalog::open(data_directory.join("delete-catalog-v1.json"))?;
-        match engine.create_topic(TopicConfig {
-            topic_id: LOKI_TOPIC_ID,
-            partitions: tenant_partitions,
-            shards: None,
-        }) {
-            Ok(()) | Err(EngineError::TopicAlreadyExists(_)) => {}
-            Err(error) => return Err(engine_error(error)),
+        for topic_id in [
+            LOKI_TOPIC_ID,
+            crate::TRACES_TOPIC_ID,
+            crate::METRICS_TOPIC_ID,
+        ] {
+            match engine.create_topic(TopicConfig {
+                topic_id,
+                partitions: tenant_partitions,
+                shards: None,
+            }) {
+                Ok(()) | Err(EngineError::TopicAlreadyExists(_)) => {}
+                Err(error) => return Err(engine_error(error)),
+            }
         }
         Ok(Self {
             _data_directory_lease: data_directory_lease,
@@ -275,6 +294,7 @@ impl DurableLokiStore {
             ingest_stripes_per_tenant,
             indexed_ack_timeout,
             next_request_id: AtomicU64::new(1),
+            remote_write_append: Mutex::new(()),
             deletes,
             retention,
             retention_runs: AtomicU64::new(0),
@@ -316,14 +336,10 @@ impl DurableLokiStore {
         )
     }
 
-    fn tenant_partitions(&self, tenant: &str) -> impl Iterator<Item = TopicPartition> {
-        let base = self.tenant_partition_base(tenant);
-        let count = self.ingest_stripes_per_tenant;
-        (0..count).map(move |stripe| {
-            TopicPartition::new(
-                LOKI_TOPIC_ID,
-                LogicalPartitionId::new((base + stripe) % self.tenant_partitions),
-            )
+    fn tenant_partitions(&self, _tenant: &str) -> impl Iterator<Item = TopicPartition> {
+        let count = self.tenant_partitions;
+        (0..count).map(move |partition| {
+            TopicPartition::new(LOKI_TOPIC_ID, LogicalPartitionId::new(partition))
         })
     }
 
@@ -396,7 +412,14 @@ impl DurableLokiStore {
                     break;
                 }
                 for batch in batches {
-                    let records = decode_ingest_pack(&batch.payload)
+                    let envelope = crate::TelemetryEnvelope::decode(&batch.payload)
+                        .map_err(|error| LokiApiError::internal(error.to_string()))?;
+                    if envelope.signal != crate::TelemetrySignal::Logs {
+                        return Err(LokiApiError::internal(
+                            "log retention encountered a non-log envelope",
+                        ));
+                    }
+                    let records = decode_ingest_pack(&envelope.payload)
                         .map_err(|error| LokiApiError::internal(error.to_string()))?;
                     if records
                         .iter()
@@ -427,73 +450,162 @@ impl DurableLokiStore {
         Ok(report)
     }
 
-    /// Appends an already encoded grouped native batch without a protobuf
-    /// transcode and waits until the stripe-owned index checkpoint is durable.
-    pub fn append_native_batch(&self, payload: Vec<u8>) -> Result<NativeAppendAck, LokiApiError> {
-        self.append_native_batch_with_visibility(payload, true)
-    }
-
-    /// Appends an already encoded grouped native batch and acknowledges as
-    /// soon as its checksummed ingest pack is durable in shard-stream.
+    /// Appends every partition in one validated native v2 telemetry batch in parallel.
     ///
-    /// The stripe index applies the append asynchronously under bounded
-    /// shard-stream backpressure. Callers that require immediate query
-    /// visibility should use [`Self::append_native_batch`].
-    pub fn append_native_batch_durable(
+    /// The response retains request order and contains one acknowledgement per
+    /// resulting partition. Any partition failure makes the request retryable;
+    /// trace and metric retries resolve idempotently by durable identity.
+    pub fn append_telemetry_batch(
         &self,
-        payload: Vec<u8>,
-    ) -> Result<NativeAppendAck, LokiApiError> {
-        self.append_native_batch_with_visibility(payload, false)
+        batch: &crate::NativeTelemetryBatch,
+        wait_for_index: bool,
+    ) -> Result<crate::NativeTelemetryAppendAck, LokiApiError> {
+        let encoded = batch
+            .encode()
+            .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
+        let validated = crate::NativeTelemetryBatch::decode(&encoded)
+            .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
+        let acknowledgements = validated
+            .partitions
+            .par_iter()
+            .map(|partition| self.append_telemetry_partition(partition, wait_for_index))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(crate::NativeTelemetryAppendAck {
+            partitions: acknowledgements,
+        })
     }
 
-    pub(crate) fn append_native_batch_for_tenant(
+    /// Validates and appends one complete Remote Write request under serialized
+    /// same-timestamp conflict semantics.
+    pub fn append_remote_write_batch(
         &self,
-        payload: Vec<u8>,
-        expected_tenant: &str,
-        wait_for_index: bool,
-    ) -> Result<(NativeAppendAck, u32), LokiApiError> {
-        let prepared = prepare_native_ingest_pack(&payload)
-            .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
-        if prepared.tenant != expected_tenant {
-            return Err(LokiApiError::forbidden(
-                "native batch tenant does not match the authenticated tenant",
-            ));
+        batch: &crate::NativeTelemetryBatch,
+    ) -> Result<crate::NativeTelemetryAppendAck, LokiApiError> {
+        let _guard = self
+            .remote_write_append
+            .lock()
+            .map_err(|_| LokiApiError::internal("Remote Write append lock poisoned"))?;
+        let mut request_samples = BTreeMap::new();
+        for partition in &batch.partitions {
+            if partition.envelope.signal != crate::TelemetrySignal::Metrics
+                || partition.envelope.routing_metadata.len() != 5
+                || partition.envelope.routing_metadata[4]
+                    != crate::MetricIngestProtocol::RemoteWrite.to_wire()
+            {
+                return Err(LokiApiError::bad_request(
+                    "Remote Write batch contains a non-Remote-Write metric envelope",
+                ));
+            }
+            for point in crate::decode_metric_chunk(&partition.envelope.payload)
+                .map_err(|error| LokiApiError::bad_request(error.to_string()))?
+            {
+                let key = (point.series_fingerprint(), point.timestamp_unix_nanos);
+                if let Some(existing) = request_samples.insert(key, point.clone())
+                    && !same_remote_write_sample(&existing, &point)
+                {
+                    return Err(LokiApiError::bad_request(format!(
+                        "conflicting samples for series {:032x} at {}",
+                        key.0.get(),
+                        key.1
+                    )));
+                }
+                let existing = self.query_metrics(&crate::MetricQuery {
+                    tenant: Arc::clone(&point.identity.tenant),
+                    series: Some(point.series_fingerprint()),
+                    name: None,
+                    exact_labels: Arc::new(Vec::new()),
+                    start_time_unix_nanos: Some(point.timestamp_unix_nanos),
+                    end_time_unix_nanos: Some(point.timestamp_unix_nanos),
+                    limit: usize::MAX,
+                })?;
+                if existing
+                    .iter()
+                    .any(|stored| !same_remote_write_sample(stored, &point))
+                {
+                    return Err(LokiApiError::bad_request(format!(
+                        "conflicting sample for series {:032x} at {}",
+                        key.0.get(),
+                        key.1
+                    )));
+                }
+            }
         }
-        if prepared.record_count == 0 {
-            return Err(LokiApiError::bad_request(
-                "native append batch must contain at least one record",
-            ));
-        }
-        let records = prepared.record_count;
-        let acknowledgement = self.append_encoded(
-            &prepared.tenant,
-            records,
-            prepared.ingest_pack.payload,
-            prepared.ingest_pack.transient_context,
-            wait_for_index,
-        )?;
-        Ok((acknowledgement, records))
+        self.append_telemetry_batch(batch, true)
     }
 
-    fn append_native_batch_with_visibility(
+    /// Executes a native trace query on the owner stripes.
+    pub fn query_traces(
         &self,
-        payload: Vec<u8>,
+        query: &crate::TraceQuery,
+    ) -> Result<Vec<crate::DurableSpan>, LokiApiError> {
+        self.service
+            .query_traces(query)
+            .map_err(|error| LokiApiError::internal(error.to_string()))
+    }
+
+    /// Executes a native exact raw-metric query on the owner stripes.
+    pub fn query_metrics(
+        &self,
+        query: &crate::MetricQuery,
+    ) -> Result<Vec<crate::DurableMetricPoint>, LokiApiError> {
+        self.service
+            .query_metrics(query)
+            .map_err(|error| LokiApiError::internal(error.to_string()))
+    }
+
+    fn append_telemetry_partition(
+        &self,
+        partition: &crate::NativePartitionAppend,
         wait_for_index: bool,
-    ) -> Result<NativeAppendAck, LokiApiError> {
-        let prepared = prepare_native_ingest_pack(&payload)
+    ) -> Result<crate::NativePartitionAck, LokiApiError> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let payload = partition
+            .envelope
+            .encode()
             .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
-        if prepared.record_count == 0 {
-            return Err(LokiApiError::bad_request(
-                "native append batch must contain at least one record",
-            ));
+        let appended = self
+            .engine
+            .append(AppendRequest {
+                request_id: u128::from(request_id),
+                topic_id: partition.topic_partition.topic_id,
+                partition_id: partition.topic_partition.partition_id,
+                record_count: partition.envelope.item_count,
+                payload: Bytes::from(payload),
+                durability: Durability::Leader,
+                producer: None,
+                atomic_group: None,
+                leader_epoch: None,
+                extension_context: None,
+            })
+            .map_err(engine_error)?;
+        if wait_for_index {
+            let target = DurableSinkCheckpoint {
+                topic_partition: partition.topic_partition,
+                next_placement_sequence: PlacementSequence::new(
+                    appended
+                        .placement
+                        .sequence
+                        .get()
+                        .checked_add(1)
+                        .ok_or_else(|| LokiApiError::internal("placement sequence exhausted"))?,
+                ),
+                next_offset: LogicalOffset::new(
+                    appended
+                        .last_offset
+                        .get()
+                        .checked_add(1)
+                        .ok_or_else(|| LokiApiError::internal("logical offset exhausted"))?,
+                ),
+            };
+            self.engine
+                .wait_for_durable_sink_checkpoint(target)
+                .map_err(engine_error)?;
         }
-        self.append_encoded(
-            &prepared.tenant,
-            prepared.record_count,
-            prepared.ingest_pack.payload,
-            prepared.ingest_pack.transient_context,
-            wait_for_index,
-        )
+        Ok(crate::NativePartitionAck {
+            topic_partition: partition.topic_partition,
+            first_offset: appended.first_offset.get(),
+            last_offset: appended.last_offset.get(),
+        })
     }
 
     /// Executes a native exact-label/token query directly against the bounded
@@ -623,84 +735,18 @@ impl DurableLokiStore {
         accepted.truncate(result_limit);
         Ok(accepted.into_iter().map(|(entry, _)| entry).collect())
     }
+}
 
-    fn append_encoded(
-        &self,
-        tenant: &str,
-        record_count: u32,
-        payload: Vec<u8>,
-        transient_context: Bytes,
-        wait_for_index: bool,
-    ) -> Result<NativeAppendAck, LokiApiError> {
-        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
-        let partition = self.write_partition(tenant, request_id);
-        let appended = self
-            .engine
-            .append_with_durable_sink_context(
-                AppendRequest {
-                    request_id: u128::from(request_id),
-                    topic_id: partition.topic_id,
-                    partition_id: partition.partition_id,
-                    record_count,
-                    payload: Bytes::from(payload),
-                    durability: Durability::Leader,
-                    producer: None,
-                    atomic_group: None,
-                    leader_epoch: None,
-                    extension_context: None,
-                },
-                transient_context,
-            )
-            .map_err(engine_error)?;
-        let target = DurableSinkCheckpoint {
-            topic_partition: partition,
-            next_placement_sequence: PlacementSequence::new(
-                appended
-                    .placement
-                    .sequence
-                    .get()
-                    .checked_add(1)
-                    .ok_or_else(|| LokiApiError::internal("placement sequence exhausted"))?,
-            ),
-            next_offset: LogicalOffset::new(
-                appended
-                    .last_offset
-                    .get()
-                    .checked_add(1)
-                    .ok_or_else(|| LokiApiError::internal("logical offset exhausted"))?,
-            ),
-        };
-        if wait_for_index
-            && let Err(wait_error) = self.engine.wait_for_durable_sink_checkpoint(target)
-        {
-            let checkpoint = self
-                .engine
-                .durable_sink_checkpoint(partition)
-                .map_err(engine_error)?
-                .ok_or_else(|| LokiApiError::internal("durable sink has no checkpoint"))?;
-            let stats = self.engine.durable_sink_stats();
-            return Err(LokiApiError::internal(format!(
-                "failed waiting for indexed partition {} through offset {}: {}; \
-                 checkpoint is {}, pending items {}, pending bytes {}, applied {}, \
-                 retries {}, failures {}, dirty partitions {}",
-                partition.partition_id.get(),
-                appended.last_offset.get(),
-                wait_error,
-                checkpoint.next_offset.get(),
-                stats.pending_items,
-                stats.pending_bytes,
-                stats.applied_appends,
-                stats.retry_attempts,
-                stats.failed_attempts,
-                stats.dirty_partitions,
-            )));
-        }
-        Ok(NativeAppendAck {
-            partition_id: partition.partition_id.get(),
-            first_offset: appended.first_offset.get(),
-            last_offset: appended.last_offset.get(),
-        })
-    }
+fn same_remote_write_sample(
+    left: &crate::DurableMetricPoint,
+    right: &crate::DurableMetricPoint,
+) -> bool {
+    left.series_fingerprint() == right.series_fingerprint()
+        && left.timestamp_unix_nanos == right.timestamp_unix_nanos
+        && left.start_time_unix_nanos == right.start_time_unix_nanos
+        && left.flags == right.flags
+        && left.value == right.value
+        && left.exemplars == right.exemplars
 }
 
 impl LokiStore for DurableLokiStore {
@@ -710,9 +756,17 @@ impl LokiStore for DurableLokiStore {
         }
         let record_count = u32::try_from(entries.len())
             .map_err(|_| LokiApiError::bad_request("push contains more than u32 entries"))?;
-        let payload = encode_native_log_batch(tenant, entries)
+        let routing_request = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let topic_partition = self.write_partition(tenant, routing_request);
+        let envelope = crate::prepare_loki_log_envelope(tenant, entries)
             .map_err(|error| LokiApiError::bad_request(error.to_string()))?;
-        let acknowledgement = self.append_native_batch(payload)?;
+        let acknowledgement = self.append_telemetry_partition(
+            &crate::NativePartitionAppend {
+                topic_partition,
+                envelope,
+            },
+            true,
+        )?;
         debug_assert_eq!(
             acknowledgement
                 .last_offset
@@ -991,12 +1045,142 @@ fn engine_error(error: EngineError) -> LokiApiError {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::num::NonZeroU16;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use opentelemetry_proto::tonic::{
+        collector::{
+            metrics::v1::ExportMetricsServiceRequest, trace::v1::ExportTraceServiceRequest,
+        },
+        metrics::v1::{
+            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric,
+            number_data_point,
+        },
+        trace::v1::{ResourceSpans, ScopeSpans, Span},
+    };
+    use prost::Message;
     use shard_stream_protocol::{FetchMode, FetchRequest};
 
     use super::*;
-    use crate::ingest_pack::{decode_ingest_pack, is_ingest_pack, validate_ingest_pack};
+    use crate::ingest_pack::{decode_ingest_pack, validate_ingest_pack};
+
+    #[test]
+    fn shared_durable_sink_indexes_trace_and_metric_partition_envelopes() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "shard-telemetry-signals-store-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = DurableLokiStore::open(DurableLokiConfig {
+            data_directory: directory.clone(),
+            object_store_directory: None,
+            recovery_journal: true,
+            retention: None,
+            shard_count: 2,
+            tenant_partitions: 8,
+            append_linger: Duration::ZERO,
+            stripe: StripeConfig::default(),
+            indexed_ack_timeout: Duration::from_secs(30),
+        })
+        .expect("store opens");
+        let decoder = crate::OtlpTelemetryDecoder;
+        let router = crate::TelemetryRouter::new(NonZeroU16::new(8).unwrap());
+
+        let trace_request = ExportTraceServiceRequest {
+            resource_spans: vec![ResourceSpans {
+                scope_spans: vec![ScopeSpans {
+                    spans: vec![Span {
+                        trace_id: vec![1; 16],
+                        span_id: vec![2; 8],
+                        name: "checkout".into(),
+                        start_time_unix_nano: 10,
+                        end_time_unix_nano: 20,
+                        ..Span::default()
+                    }],
+                    ..ScopeSpans::default()
+                }],
+                ..ResourceSpans::default()
+            }],
+        };
+        let mut trace_partitions = decoder.partition_traces(
+            &router,
+            decoder
+                .decode_traces("tenant-a", &trace_request.encode_to_vec())
+                .unwrap(),
+        );
+        let (trace_partition, trace_events) = trace_partitions.pop_first().unwrap();
+
+        let metric_request = ExportMetricsServiceRequest {
+            resource_metrics: vec![ResourceMetrics {
+                scope_metrics: vec![ScopeMetrics {
+                    metrics: vec![Metric {
+                        name: "requests".into(),
+                        data: Some(metric::Data::Gauge(Gauge {
+                            data_points: vec![NumberDataPoint {
+                                time_unix_nano: 30,
+                                value: Some(number_data_point::Value::AsInt(7)),
+                                ..NumberDataPoint::default()
+                            }],
+                        })),
+                        ..Metric::default()
+                    }],
+                    ..ScopeMetrics::default()
+                }],
+                ..ResourceMetrics::default()
+            }],
+        };
+        let mut metric_partitions = decoder.partition_metrics(
+            &router,
+            decoder
+                .decode_metrics("tenant-a", &metric_request.encode_to_vec())
+                .unwrap(),
+        );
+        let (metric_partition, metric_events) = metric_partitions.pop_first().unwrap();
+
+        let batch = crate::NativeTelemetryBatch {
+            partitions: vec![
+                crate::NativePartitionAppend {
+                    topic_partition: trace_partition,
+                    envelope: crate::prepare_trace_envelope(trace_partition, trace_events).unwrap(),
+                },
+                crate::NativePartitionAppend {
+                    topic_partition: metric_partition,
+                    envelope: crate::prepare_metric_envelope(metric_partition, metric_events)
+                        .unwrap(),
+                },
+            ],
+        };
+        let acknowledgement = store.append_telemetry_batch(&batch, true).unwrap();
+        assert_eq!(acknowledgement.partitions.len(), 2);
+        let spans = store
+            .query_traces(&crate::TraceQuery {
+                tenant: Arc::from("tenant-a"),
+                trace_id: Some(crate::TraceId::from_bytes([1; 16]).unwrap()),
+                limit: 10,
+                ..crate::TraceQuery::default()
+            })
+            .unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name.as_ref(), "checkout");
+        let points = store
+            .query_metrics(&crate::MetricQuery {
+                tenant: Arc::from("tenant-a"),
+                name: Some(Arc::from("requests")),
+                limit: 10,
+                ..crate::MetricQuery::default()
+            })
+            .unwrap();
+        assert_eq!(points.len(), 1);
+        assert_eq!(
+            points[0].value,
+            crate::MetricValue::Gauge(crate::NumberValue::Integer(7))
+        );
+        drop(store);
+        fs::remove_dir_all(directory).expect("remove test store");
+    }
 
     #[test]
     fn durable_store_acknowledges_and_queries_the_same_stripe_owned_record() {
@@ -1005,7 +1189,7 @@ mod tests {
             .expect("clock")
             .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "shard-log-loki-store-{}-{nonce}",
+            "shard-telemetry-loki-store-{}-{nonce}",
             std::process::id()
         ));
         let store = DurableLokiStore::open(DurableLokiConfig {
@@ -1069,7 +1253,7 @@ mod tests {
             .expect("clock")
             .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "shard-log-cold-recovery-{}-{nonce}",
+            "shard-telemetry-cold-recovery-{}-{nonce}",
             std::process::id()
         ));
         let object_directory = directory.join("objects");
@@ -1141,7 +1325,7 @@ mod tests {
             .expect("clock")
             .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "shard-log-delete-store-{}-{nonce}",
+            "shard-telemetry-delete-store-{}-{nonce}",
             std::process::id()
         ));
         let config = DurableLokiConfig {
@@ -1230,7 +1414,7 @@ mod tests {
             .expect("clock")
             .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "shard-log-retention-store-{}-{nonce}",
+            "shard-telemetry-retention-store-{}-{nonce}",
             std::process::id()
         ));
         let now = i64::try_from(nonce).expect("current timestamp fits i64");
@@ -1307,13 +1491,13 @@ mod tests {
     }
 
     #[test]
-    fn standalone_store_makes_the_compressed_ingest_pack_authoritative() {
+    fn standalone_store_makes_the_stel_envelope_authoritative() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "shard-log-ingest-pack-{}-{nonce}",
+            "shard-telemetry-ingest-pack-{}-{nonce}",
             std::process::id()
         ));
         let store = DurableLokiStore::open(DurableLokiConfig {
@@ -1334,26 +1518,26 @@ mod tests {
             line: "request completed".to_owned(),
             structured_metadata: BTreeMap::from([("trace_id".to_owned(), "abc".to_owned())]),
         };
-        let native = encode_native_log_batch("tenant-a", vec![entry]).expect("native batch");
-        let acknowledgement = store
-            .append_native_batch_durable(native)
-            .expect("durable native append succeeds");
+        store
+            .push("tenant-a", vec![entry])
+            .expect("Loki push succeeds");
         let batches = store
             .engine
             .fetch(FetchRequest {
                 request_id: 1,
                 topic_id: LOKI_TOPIC_ID,
-                partition_id: LogicalPartitionId::new(acknowledgement.partition_id),
-                start_offset: LogicalOffset::new(acknowledgement.first_offset),
+                partition_id: LogicalPartitionId::new(0),
+                start_offset: LogicalOffset::new(0),
                 max_bytes: 1024 * 1024,
                 mode: FetchMode::Ordered,
             })
             .expect("authoritative batch fetches");
         assert_eq!(batches.len(), 1);
-        assert!(is_ingest_pack(&batches[0].payload));
-        assert!(!crate::is_native_log_batch(&batches[0].payload));
-        validate_ingest_pack(&batches[0].payload, 1).expect("stored pack validates");
-        let decoded = decode_ingest_pack(&batches[0].payload).expect("stored pack decodes");
+        let envelope = crate::TelemetryEnvelope::decode(&batches[0].payload)
+            .expect("stored STEL envelope validates");
+        assert_eq!(envelope.signal, crate::TelemetrySignal::Logs);
+        validate_ingest_pack(&envelope.payload, 1).expect("stored pack validates");
+        let decoded = decode_ingest_pack(&envelope.payload).expect("stored pack decodes");
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].timestamp_unix_nanos, 123);
         assert_eq!(decoded[0].message.as_ref(), "request completed");
@@ -1371,7 +1555,7 @@ mod tests {
             .expect("clock")
             .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "shard-log-analytics-store-{}-{nonce}",
+            "shard-telemetry-analytics-store-{}-{nonce}",
             std::process::id()
         ));
         let store = DurableLokiStore::open(DurableLokiConfig {

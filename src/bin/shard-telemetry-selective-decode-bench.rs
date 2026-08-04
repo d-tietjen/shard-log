@@ -2,12 +2,12 @@ use std::error::Error;
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use shard_log::{
-    BlockQueryIndex, CompressionCohortId, DurableLogRecord, LogQuery, PersistentQueryIndex,
+use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicId, TopicPartition};
+use shard_telemetry::{
+    BlockQueryIndex, CompressionCohortId, DurableLog, LogQuery, PersistentQueryIndex,
     QueryBlockMetadata, decode_structural_block, decode_structural_records,
     encode_structural_block,
 };
-use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicId, TopicPartition};
 
 const RECORD_COUNT: usize = 60_000;
 const SELECTED_COUNT: usize = 100;
@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ),
     ];
 
-    println!("shard-log structural selective-decode benchmark");
+    println!("shard-telemetry structural selective-decode benchmark");
     println!("records: {RECORD_COUNT}");
     println!("structural bytes: {}", structural.len());
     println!("zstd-1 bytes: {}", compressed.len());
@@ -122,12 +122,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn build_records() -> Result<Vec<DurableLogRecord>, Box<dyn Error>> {
+fn build_records() -> Result<Vec<DurableLog>, Box<dyn Error>> {
     let partition = TopicPartition::new(TopicId::new(0), LogicalPartitionId::new(0));
     (0..RECORD_COUNT)
         .map(|ordinal| {
             let offset = u64::try_from(ordinal)?;
-            Ok(DurableLogRecord::new(
+            Ok(DurableLog::new(
                 ShardId::new(0),
                 partition,
                 LogicalOffset::new(offset),

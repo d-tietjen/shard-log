@@ -369,10 +369,10 @@ mod tests {
     use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicId, TopicPartition};
 
     use super::*;
-    use crate::{CompressionCohortId, DurableLogRecord, LogRegex};
+    use crate::{CompressionCohortId, DurableLog, LogRegex};
 
-    fn record(message: &str) -> DurableLogRecord {
-        DurableLogRecord::new(
+    fn record(message: &str) -> DurableLog {
+        DurableLog::new(
             ShardId::new(1),
             TopicPartition::new(TopicId::new(1), LogicalPartitionId::new(2)),
             LogicalOffset::new(7),
@@ -417,7 +417,7 @@ mod tests {
     fn invalid_regular_expressions_are_rejected_at_query_construction() {
         let error =
             LogRegex::new("(", CaseSensitivity::Sensitive).expect_err("invalid regex is rejected");
-        assert!(matches!(error, crate::LogDbError::InvalidQuery(_)));
+        assert!(matches!(error, crate::TelemetryError::InvalidQuery(_)));
     }
 
     #[test]

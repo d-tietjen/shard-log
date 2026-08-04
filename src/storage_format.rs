@@ -6,7 +6,7 @@ use fs2::FileExt;
 
 use crate::LokiApiError;
 
-const DATA_FORMAT_MARKER: &[u8] = b"shard-log-data-format=1\n";
+const DATA_FORMAT_MARKER: &[u8] = b"shard-telemetry-data-format=1\n";
 
 /// Exclusive process ownership and format validation for one data directory.
 #[derive(Debug)]
@@ -43,7 +43,7 @@ fn validate_or_create_marker(directory: &Path) -> Result<(), LokiApiError> {
         Ok(marker) => {
             let observed = String::from_utf8_lossy(&marker);
             return Err(LokiApiError::configuration(format!(
-                "unsupported ShardLog data format marker {observed:?}"
+                "unsupported ShardTelemetry data format marker {observed:?}"
             )));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -90,8 +90,10 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let directory =
-            std::env::temp_dir().join(format!("shard-log-format-{}-{nonce}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!(
+            "shard-telemetry-format-{}-{nonce}",
+            std::process::id()
+        ));
         let lease = DataDirectoryLease::acquire(&directory).expect("first lease");
         assert_eq!(
             fs::read(directory.join("FORMAT")).unwrap(),
@@ -99,8 +101,11 @@ mod tests {
         );
         assert!(DataDirectoryLease::acquire(&directory).is_err());
         drop(lease);
-        fs::write(directory.join("FORMAT"), b"shard-log-data-format=999\n")
-            .expect("replace marker");
+        fs::write(
+            directory.join("FORMAT"),
+            b"shard-telemetry-data-format=999\n",
+        )
+        .expect("replace marker");
         assert!(DataDirectoryLease::acquire(&directory).is_err());
         fs::remove_dir_all(directory).expect("cleanup");
     }

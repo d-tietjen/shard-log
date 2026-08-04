@@ -1,6 +1,6 @@
-# StorageShardLog adapter
+# StorageShardTelemetry adapter
 
-`StorageShardLog` is a narrow, pinned ClickHouse storage adapter. It subclasses
+`StorageShardTelemetry` is a narrow, pinned ClickHouse storage adapter. It subclasses
 ClickHouse's `StorageURL`, so the existing ClickHouse HTTP transport, Arrow
 reader, residual filters, and query evaluator remain authoritative. The
 adapter only adds scan parameters that are logically implied by the analyzed
@@ -15,9 +15,9 @@ and one registration patch.
 
 ```bash
 git clone --branch v26.3.17.56-lts --recurse-submodules \
-  https://github.com/ClickHouse/ClickHouse.git clickhouse-shardlog
+  https://github.com/ClickHouse/ClickHouse.git clickhouse-shardtelemetry
 
-CLICKHOUSE_SOURCE=$PWD/clickhouse-shardlog \
+CLICKHOUSE_SOURCE=$PWD/clickhouse-shardtelemetry \
   ./scripts/apply-clickhouse-adapter.sh
 ```
 
@@ -39,8 +39,8 @@ CREATE TABLE logs
     labels Map(String, String),
     metadata Map(String, String)
 )
-ENGINE = ShardLog(
-    'http://127.0.0.1:3100/shardlog/api/v1/clickhouse/scan',
+ENGINE = ShardTelemetry(
+    'http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan',
     'ArrowStream',
     headers(
         'Authorization' = 'Bearer REPLACE_FROM_SECRET_STORE',
@@ -74,11 +74,11 @@ Only top-level conjunctions are decomposed. Disjunctions, negation, message
 functions, regexes, casts that do not constant-fold, empty-string map equality,
 and unknown expressions remain residual ClickHouse work. Empty map equality is
 not pushed because ClickHouse treats a missing `Map(String, String)` key as the
-empty default string while ShardLog's field index distinguishes missing from
+empty default string while ShardTelemetry's field index distinguishes missing from
 stored empty. A hash, parser, or type mismatch can reduce
 pushdown efficiency, but cannot change query results: the original ClickHouse
 filter is retained and evaluated over every returned row.
 
 Run `scripts/run-clickhouse-adapter-compatibility.sh` with the custom binary or
-image. The same query corpus is evaluated over `StorageShardLog` and over a
+image. The same query corpus is evaluated over `StorageShardTelemetry` and over a
 ClickHouse `Memory` snapshot, with exact serialized-result comparison.

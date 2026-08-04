@@ -1,6 +1,6 @@
 # Loki compatibility
 
-ShardLog targets the stable Grafana Loki 3.7.2 HTTP contract. The differential
+ShardTelemetry targets the stable Grafana Loki 3.7.2 HTTP contract. The differential
 oracle is the immutable container image:
 
 ```text
@@ -39,8 +39,8 @@ distribution.
   `/ingester/prepare_shutdown`, `/ingester/shutdown`, and build information.
 - Deprecated `/api/prom` push, query, label, series, and tail aliases.
 
-The authenticated `GET /shardlog/api/v1/clickhouse/scan` Arrow source is a
-ShardLog extension, not a Loki route. It is absent unless explicitly enabled
+The authenticated `GET /shardtelemetry/api/v1/clickhouse/scan` Arrow source is a
+ShardTelemetry extension, not a Loki route. It is absent unless explicitly enabled
 with a bearer-token file. Its versioned schema and query contract are in
 `CLICKHOUSE_COMPATIBILITY.md`.
 
@@ -59,7 +59,7 @@ timestamp before Loki response formatting. Live tail subscribers register
 before their initial lookback to avoid an ingest race and receive bounded lag
 notifications.
 
-Accepted Loki pushes are encoded into ShardLog's stream-grouped native batch
+Accepted Loki pushes are encoded into ShardTelemetry's stream-grouped native batch
 before entering shard-stream. The sink therefore avoids an OTLP protobuf
 transcode while preserving the Loki wire contract. Native clients can bypass
 HTTP and JSON entirely on TCP port `3101`; that protocol is documented in
@@ -102,7 +102,7 @@ HTTP 400 instead of silently producing approximate results.
 - Compressed frames and independent query indexes are durably published and
   served cold from bounded object ranges. Until covered shard-stream source
   packs are reclaimed, storage accounting must continue to report those raw
-  authority bytes separately from ShardLog's compressed catalog.
+  authority bytes separately from ShardTelemetry's compressed catalog.
 
 ## Full Loki oracle measurement
 
@@ -119,7 +119,7 @@ Adam, CPUs `0-15`, 16 persistent HTTP connections, 1 MiB JSON pushes, the same
 
 | Engine | Source MiB/s | Records | Total disk bytes |
 | --- | ---: | ---: | ---: |
-| ShardLog durable API | 43.16 | 949,018 | 241,490,286 |
+| ShardTelemetry durable API | 43.16 | 949,018 | 241,490,286 |
 | Loki 3.7.2 | 57.63 | 949,018 | 120,076,424 |
 
 The result is a historical ablation, not the current storage path. It exposed

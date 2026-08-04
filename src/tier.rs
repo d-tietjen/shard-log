@@ -11,7 +11,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use shard_stream_core::{ShardId, TopicPartition};
 
-use crate::{BlockCatalog, BlockDescriptor, BlockId, CompressionCodec, LogDbError, LogDbResult};
+use crate::{
+    BlockCatalog, BlockDescriptor, BlockId, CompressionCodec, TelemetryError, TelemetryResult,
+};
 
 const TIER_FORMAT_VERSION: u8 = 1;
 const CHECKSUM_ALGORITHM: &str = "blake3";
@@ -35,26 +37,26 @@ pub struct ObjectMetadata {
     pub content_digest: String,
 }
 
-/// Minimal object-store contract needed by the ShardLog tier.
+/// Minimal object-store contract needed by the ShardTelemetry tier.
 ///
 /// Immutable data uses put-if-absent operations. Only the small `CURRENT`
 /// pointer is mutable, and it is replaced with an object-version
 /// compare-and-swap.
-pub trait LogObjectStore: Send + Sync {
+pub trait TelemetryObjectStore: Send + Sync {
     /// Creates an immutable object from bytes, or verifies an identical retry.
-    fn put_bytes_if_absent(&self, key: &str, bytes: &[u8]) -> LogDbResult<ObjectMetadata>;
+    fn put_bytes_if_absent(&self, key: &str, bytes: &[u8]) -> TelemetryResult<ObjectMetadata>;
 
     /// Creates an immutable object from a local file without buffering it all.
-    fn put_file_if_absent(&self, key: &str, source: &Path) -> LogDbResult<ObjectMetadata>;
+    fn put_file_if_absent(&self, key: &str, source: &Path) -> TelemetryResult<ObjectMetadata>;
 
     /// Reads an entire object subject to a caller-provided allocation limit.
-    fn get(&self, key: &str, max_bytes: u64) -> LogDbResult<Vec<u8>>;
+    fn get(&self, key: &str, max_bytes: u64) -> TelemetryResult<Vec<u8>>;
 
     /// Reads exactly one byte range from an object.
-    fn get_range(&self, key: &str, range: Range<u64>) -> LogDbResult<Vec<u8>>;
+    fn get_range(&self, key: &str, range: Range<u64>) -> TelemetryResult<Vec<u8>>;
 
     /// Returns object metadata, or `None` when the key is absent.
-    fn head(&self, key: &str) -> LogDbResult<Option<ObjectMetadata>>;
+    fn head(&self, key: &str) -> TelemetryResult<Option<ObjectMetadata>>;
 
     /// Conditionally replaces a small mutable object.
     fn compare_and_swap(
@@ -62,51 +64,51 @@ pub trait LogObjectStore: Send + Sync {
         key: &str,
         expected_version: Option<&str>,
         bytes: &[u8],
-    ) -> LogDbResult<ObjectMetadata>;
+    ) -> TelemetryResult<ObjectMetadata>;
 }
 
 /// Cloneable type-erased object-store handle used by production stripe owners.
 #[derive(Clone)]
-pub struct SharedLogObjectStore(Arc<dyn LogObjectStore>);
+pub struct SharedTelemetryObjectStore(Arc<dyn TelemetryObjectStore>);
 
-impl SharedLogObjectStore {
+impl SharedTelemetryObjectStore {
     /// Wraps an object-store adapter for use by independently owned stripes.
     #[must_use]
-    pub fn new(store: Arc<dyn LogObjectStore>) -> Self {
+    pub fn new(store: Arc<dyn TelemetryObjectStore>) -> Self {
         Self(store)
     }
 }
 
-impl std::fmt::Debug for SharedLogObjectStore {
+impl std::fmt::Debug for SharedTelemetryObjectStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("SharedLogObjectStore(..)")
+        formatter.write_str("SharedTelemetryObjectStore(..)")
     }
 }
 
-impl From<LocalObjectStore> for SharedLogObjectStore {
+impl From<LocalObjectStore> for SharedTelemetryObjectStore {
     fn from(store: LocalObjectStore) -> Self {
         Self(Arc::new(store))
     }
 }
 
-impl LogObjectStore for SharedLogObjectStore {
-    fn put_bytes_if_absent(&self, key: &str, bytes: &[u8]) -> LogDbResult<ObjectMetadata> {
+impl TelemetryObjectStore for SharedTelemetryObjectStore {
+    fn put_bytes_if_absent(&self, key: &str, bytes: &[u8]) -> TelemetryResult<ObjectMetadata> {
         self.0.put_bytes_if_absent(key, bytes)
     }
 
-    fn put_file_if_absent(&self, key: &str, source: &Path) -> LogDbResult<ObjectMetadata> {
+    fn put_file_if_absent(&self, key: &str, source: &Path) -> TelemetryResult<ObjectMetadata> {
         self.0.put_file_if_absent(key, source)
     }
 
-    fn get(&self, key: &str, max_bytes: u64) -> LogDbResult<Vec<u8>> {
+    fn get(&self, key: &str, max_bytes: u64) -> TelemetryResult<Vec<u8>> {
         self.0.get(key, max_bytes)
     }
 
-    fn get_range(&self, key: &str, range: Range<u64>) -> LogDbResult<Vec<u8>> {
+    fn get_range(&self, key: &str, range: Range<u64>) -> TelemetryResult<Vec<u8>> {
         self.0.get_range(key, range)
     }
 
-    fn head(&self, key: &str) -> LogDbResult<Option<ObjectMetadata>> {
+    fn head(&self, key: &str) -> TelemetryResult<Option<ObjectMetadata>> {
         self.0.head(key)
     }
 
@@ -115,12 +117,12 @@ impl LogObjectStore for SharedLogObjectStore {
         key: &str,
         expected_version: Option<&str>,
         bytes: &[u8],
-    ) -> LogDbResult<ObjectMetadata> {
+    ) -> TelemetryResult<ObjectMetadata> {
         self.0.compare_and_swap(key, expected_version, bytes)
     }
 }
 
-/// Filesystem implementation of [`LogObjectStore`] used for local operation
+/// Filesystem implementation of [`TelemetryObjectStore`] used for local operation
 /// and deterministic testing of S3-style immutable publication.
 #[derive(Debug, Clone)]
 pub struct LocalObjectStore {
@@ -129,7 +131,7 @@ pub struct LocalObjectStore {
 
 impl LocalObjectStore {
     /// Opens or creates a local object-store root.
-    pub fn open(root: impl AsRef<Path>) -> LogDbResult<Self> {
+    pub fn open(root: impl AsRef<Path>) -> TelemetryResult<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)
             .map_err(|error| storage_io("create local object-store root", error))?;
@@ -142,13 +144,13 @@ impl LocalObjectStore {
         &self.root
     }
 
-    fn object_path(&self, key: &str) -> LogDbResult<PathBuf> {
+    fn object_path(&self, key: &str) -> TelemetryResult<PathBuf> {
         validate_object_key(key)?;
         Ok(self.root.join(key))
     }
 
-    fn update_lock(&self) -> LogDbResult<File> {
-        let path = self.root.join(".shard-log-object-store.lock");
+    fn update_lock(&self) -> TelemetryResult<File> {
+        let path = self.root.join(".shard-telemetry-object-store.lock");
         let lock = OpenOptions::new()
             .create(true)
             .read(true)
@@ -162,8 +164,8 @@ impl LocalObjectStore {
     }
 }
 
-impl LogObjectStore for LocalObjectStore {
-    fn put_bytes_if_absent(&self, key: &str, bytes: &[u8]) -> LogDbResult<ObjectMetadata> {
+impl TelemetryObjectStore for LocalObjectStore {
+    fn put_bytes_if_absent(&self, key: &str, bytes: &[u8]) -> TelemetryResult<ObjectMetadata> {
         let path = self.object_path(key)?;
         let lock = self.update_lock()?;
         let expected = metadata_for_bytes(bytes);
@@ -172,7 +174,7 @@ impl LogObjectStore for LocalObjectStore {
             if observed == expected {
                 return Ok(observed);
             }
-            return Err(LogDbError::ObjectStore(format!(
+            return Err(TelemetryError::ObjectStore(format!(
                 "immutable object key {key} already contains different bytes"
             )));
         }
@@ -181,13 +183,13 @@ impl LogObjectStore for LocalObjectStore {
         Ok(expected)
     }
 
-    fn put_file_if_absent(&self, key: &str, source: &Path) -> LogDbResult<ObjectMetadata> {
+    fn put_file_if_absent(&self, key: &str, source: &Path) -> TelemetryResult<ObjectMetadata> {
         let path = self.object_path(key)?;
         let source_metadata = source
             .metadata()
             .map_err(|error| storage_io("inspect immutable object source", error))?;
         if !source_metadata.is_file() || source_metadata.len() == 0 {
-            return Err(LogDbError::ObjectStore(
+            return Err(TelemetryError::ObjectStore(
                 "immutable object source must be a nonempty regular file".into(),
             ));
         }
@@ -198,27 +200,27 @@ impl LogObjectStore for LocalObjectStore {
             if observed == expected {
                 return Ok(observed);
             }
-            return Err(LogDbError::ObjectStore(format!(
+            return Err(TelemetryError::ObjectStore(format!(
                 "immutable object key {key} already contains different bytes"
             )));
         }
         let copied = copy_file_atomically(source, &path)?;
         unlock_file(&lock)?;
         if copied != expected {
-            return Err(LogDbError::CorruptTier(
+            return Err(TelemetryError::CorruptTier(
                 "object source changed while it was copied".into(),
             ));
         }
         Ok(copied)
     }
 
-    fn get(&self, key: &str, max_bytes: u64) -> LogDbResult<Vec<u8>> {
+    fn get(&self, key: &str, max_bytes: u64) -> TelemetryResult<Vec<u8>> {
         let path = self.object_path(key)?;
         let metadata = path
             .metadata()
             .map_err(|error| object_io(key, "inspect", error))?;
         if metadata.len() > max_bytes {
-            return Err(LogDbError::ObjectStore(format!(
+            return Err(TelemetryError::ObjectStore(format!(
                 "object {key} is {} bytes, exceeding read limit {max_bytes}",
                 metadata.len()
             )));
@@ -226,9 +228,9 @@ impl LogObjectStore for LocalObjectStore {
         fs::read(path).map_err(|error| object_io(key, "read", error))
     }
 
-    fn get_range(&self, key: &str, range: Range<u64>) -> LogDbResult<Vec<u8>> {
+    fn get_range(&self, key: &str, range: Range<u64>) -> TelemetryResult<Vec<u8>> {
         if range.start > range.end {
-            return Err(LogDbError::ObjectStore(
+            return Err(TelemetryError::ObjectStore(
                 "object byte range starts after its end".into(),
             ));
         }
@@ -239,13 +241,13 @@ impl LogObjectStore for LocalObjectStore {
             .map_err(|error| object_io(key, "inspect", error))?
             .len();
         if range.end > object_bytes {
-            return Err(LogDbError::ObjectStore(format!(
+            return Err(TelemetryError::ObjectStore(format!(
                 "object range {}..{} exceeds {key} length {object_bytes}",
                 range.start, range.end
             )));
         }
         let bytes = usize::try_from(range.end - range.start).map_err(|_| {
-            LogDbError::ObjectStore("object byte range cannot fit in memory".into())
+            TelemetryError::ObjectStore("object byte range cannot fit in memory".into())
         })?;
         file.seek(SeekFrom::Start(range.start))
             .map_err(|error| object_io(key, "seek", error))?;
@@ -255,7 +257,7 @@ impl LogObjectStore for LocalObjectStore {
         Ok(output)
     }
 
-    fn head(&self, key: &str) -> LogDbResult<Option<ObjectMetadata>> {
+    fn head(&self, key: &str) -> TelemetryResult<Option<ObjectMetadata>> {
         let path = self.object_path(key)?;
         metadata_for_path_if_present(&path)
     }
@@ -265,7 +267,7 @@ impl LogObjectStore for LocalObjectStore {
         key: &str,
         expected_version: Option<&str>,
         bytes: &[u8],
-    ) -> LogDbResult<ObjectMetadata> {
+    ) -> TelemetryResult<ObjectMetadata> {
         let path = self.object_path(key)?;
         let lock = self.update_lock()?;
         let observed = metadata_for_path_if_present(&path)?;
@@ -275,7 +277,7 @@ impl LogObjectStore for LocalObjectStore {
             != expected_version
         {
             unlock_file(&lock)?;
-            return Err(LogDbError::StaleCatalog {
+            return Err(TelemetryError::StaleCatalog {
                 expected: expected_version.map(str::to_owned),
                 observed: observed.map(|metadata| metadata.version_token),
             });
@@ -437,7 +439,7 @@ impl TierBlockEntry {
         }
     }
 
-    fn validate(&self, payload_bytes: u64) -> LogDbResult<()> {
+    fn validate(&self, payload_bytes: u64) -> TelemetryResult<()> {
         if self.first_offset > self.last_offset
             || self.min_timestamp_unix_nanos > self.max_timestamp_unix_nanos
             || self.record_count == 0
@@ -454,7 +456,7 @@ impl TierBlockEntry {
                 .as_ref()
                 .is_some_and(|value| value.parse::<u128>().is_err())
         {
-            return Err(LogDbError::CorruptTier(
+            return Err(TelemetryError::CorruptTier(
                 "group contains invalid block metadata".into(),
             ));
         }
@@ -509,7 +511,7 @@ impl TierGroupManifest {
         partition: TopicPartition,
         max_blocks_per_group: usize,
         max_group_payload_bytes: u64,
-    ) -> LogDbResult<()> {
+    ) -> TelemetryResult<()> {
         if self.format_version != TIER_FORMAT_VERSION
             || self.shard_id != shard_id.get()
             || self.topic_id != partition.topic_id.get().to_string()
@@ -522,7 +524,7 @@ impl TierGroupManifest {
                 .iter()
                 .any(|block| block.last_offset >= self.checkpoint.next_offset)
         {
-            return Err(LogDbError::CorruptTier(
+            return Err(TelemetryError::CorruptTier(
                 "group manifest identity or cardinality is invalid".into(),
             ));
         }
@@ -537,7 +539,7 @@ impl TierGroupManifest {
             .filter(|artifact| artifact.kind == TierArtifactKind::QueryIndex)
             .count();
         if payloads != 1 || indexes != 1 {
-            return Err(LogDbError::CorruptTier(
+            return Err(TelemetryError::CorruptTier(
                 "group requires exactly one payload and one query-index artifact".into(),
             ));
         }
@@ -549,7 +551,7 @@ impl TierGroupManifest {
                 .iter()
                 .any(|other| artifact.kind == other.kind && artifact.name == other.name)
         }) {
-            return Err(LogDbError::CorruptTier(
+            return Err(TelemetryError::CorruptTier(
                 "group contains duplicate artifact names".into(),
             ));
         }
@@ -558,7 +560,7 @@ impl TierGroupManifest {
             .expect("payload cardinality was checked")
             .bytes;
         if payload_bytes > max_group_payload_bytes {
-            return Err(LogDbError::CorruptTier(format!(
+            return Err(TelemetryError::CorruptTier(format!(
                 "group payload is {payload_bytes} bytes, exceeding limit {max_group_payload_bytes}"
             )));
         }
@@ -569,7 +571,7 @@ impl TierGroupManifest {
             if previous_block.is_some_and(|previous| previous >= block.block_id)
                 || block.payload_offset < previous_payload_end
             {
-                return Err(LogDbError::CorruptTier(
+                return Err(TelemetryError::CorruptTier(
                     "group blocks are not strictly ordered".into(),
                 ));
             }
@@ -612,38 +614,38 @@ impl CatalogGroupEntry {
         manifest: &TierGroupManifest,
         manifest_key: String,
         metadata: &ObjectMetadata,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         let first_offset = manifest
             .blocks
             .iter()
             .map(|block| block.first_offset)
             .min()
-            .ok_or_else(|| LogDbError::CorruptTier("group has no block bounds".into()))?;
+            .ok_or_else(|| TelemetryError::CorruptTier("group has no block bounds".into()))?;
         let last_offset = manifest
             .blocks
             .iter()
             .map(|block| block.last_offset)
             .max()
-            .ok_or_else(|| LogDbError::CorruptTier("group has no block bounds".into()))?;
+            .ok_or_else(|| TelemetryError::CorruptTier("group has no block bounds".into()))?;
         let min_timestamp_unix_nanos = manifest
             .blocks
             .iter()
             .map(|block| block.min_timestamp_unix_nanos)
             .min()
-            .ok_or_else(|| LogDbError::CorruptTier("group has no time bounds".into()))?;
+            .ok_or_else(|| TelemetryError::CorruptTier("group has no time bounds".into()))?;
         let max_timestamp_unix_nanos = manifest
             .blocks
             .iter()
             .map(|block| block.max_timestamp_unix_nanos)
             .max()
-            .ok_or_else(|| LogDbError::CorruptTier("group has no time bounds".into()))?;
+            .ok_or_else(|| TelemetryError::CorruptTier("group has no time bounds".into()))?;
         let block_count = u32::try_from(manifest.blocks.len())
-            .map_err(|_| LogDbError::CorruptTier("group has too many blocks".into()))?;
+            .map_err(|_| TelemetryError::CorruptTier("group has too many blocks".into()))?;
         let payload_bytes = manifest
             .blocks
             .iter()
             .try_fold(0u64, |total, block| total.checked_add(block.payload_bytes))
-            .ok_or_else(|| LogDbError::CorruptTier("group payload bytes overflow".into()))?;
+            .ok_or_else(|| TelemetryError::CorruptTier("group payload bytes overflow".into()))?;
         Ok(Self {
             group_sequence: manifest.group_sequence,
             checkpoint: manifest.checkpoint,
@@ -659,7 +661,7 @@ impl CatalogGroupEntry {
         })
     }
 
-    fn validate(&self) -> LogDbResult<()> {
+    fn validate(&self) -> TelemetryResult<()> {
         validate_object_key(&self.manifest_key)?;
         if self.manifest_bytes == 0
             || !valid_checksum(&self.manifest_checksum)
@@ -669,7 +671,7 @@ impl CatalogGroupEntry {
             || self.payload_bytes == 0
             || self.last_offset >= self.checkpoint.next_offset
         {
-            return Err(LogDbError::CorruptTier(
+            return Err(TelemetryError::CorruptTier(
                 "catalog contains an invalid group entry".into(),
             ));
         }
@@ -700,7 +702,7 @@ impl CatalogPage {
         shard_id: ShardId,
         partition: TopicPartition,
         groups_per_page: usize,
-    ) -> LogDbResult<()> {
+    ) -> TelemetryResult<()> {
         if self.format_version != TIER_FORMAT_VERSION
             || self.shard_id != shard_id.get()
             || self.topic_id != partition.topic_id.get().to_string()
@@ -708,7 +710,7 @@ impl CatalogPage {
             || self.groups.is_empty()
             || self.groups.len() > groups_per_page
         {
-            return Err(LogDbError::CorruptTier(
+            return Err(TelemetryError::CorruptTier(
                 "catalog page identity or cardinality is invalid".into(),
             ));
         }
@@ -720,7 +722,7 @@ impl CatalogPage {
                 || previous_checkpoint
                     .is_some_and(|checkpoint: TierCheckpoint| !group.checkpoint.covers(checkpoint))
             {
-                return Err(LogDbError::CorruptTier(
+                return Err(TelemetryError::CorruptTier(
                     "catalog group sequences or checkpoints are not increasing".into(),
                 ));
             }
@@ -765,15 +767,15 @@ impl CatalogPageRef {
         page: &CatalogPage,
         page_key: String,
         metadata: &ObjectMetadata,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         let first = page
             .groups
             .first()
-            .ok_or_else(|| LogDbError::CorruptTier("catalog page is empty".into()))?;
+            .ok_or_else(|| TelemetryError::CorruptTier("catalog page is empty".into()))?;
         let last = page
             .groups
             .last()
-            .ok_or_else(|| LogDbError::CorruptTier("catalog page is empty".into()))?;
+            .ok_or_else(|| TelemetryError::CorruptTier("catalog page is empty".into()))?;
         Ok(Self {
             page_sequence: page.page_sequence,
             page_key,
@@ -783,7 +785,7 @@ impl CatalogPageRef {
             last_group_sequence: last.group_sequence,
             last_checkpoint: last.checkpoint,
             group_count: u32::try_from(page.groups.len())
-                .map_err(|_| LogDbError::CorruptTier("catalog page is too large".into()))?,
+                .map_err(|_| TelemetryError::CorruptTier("catalog page is too large".into()))?,
             first_offset: page
                 .groups
                 .iter()
@@ -811,7 +813,7 @@ impl CatalogPageRef {
         })
     }
 
-    fn validate(&self) -> LogDbResult<()> {
+    fn validate(&self) -> TelemetryResult<()> {
         validate_object_key(&self.page_key)?;
         if self.page_bytes == 0
             || !valid_checksum(&self.page_checksum)
@@ -821,7 +823,7 @@ impl CatalogPageRef {
             || self.min_timestamp_unix_nanos > self.max_timestamp_unix_nanos
             || self.last_offset >= self.last_checkpoint.next_offset
         {
-            return Err(LogDbError::CorruptTier(
+            return Err(TelemetryError::CorruptTier(
                 "catalog root contains an invalid page reference".into(),
             ));
         }
@@ -864,13 +866,13 @@ impl CatalogRoot {
         }
     }
 
-    fn validate(&self, shard_id: ShardId, partition: TopicPartition) -> LogDbResult<()> {
+    fn validate(&self, shard_id: ShardId, partition: TopicPartition) -> TelemetryResult<()> {
         if self.format_version != TIER_FORMAT_VERSION
             || self.shard_id != shard_id.get()
             || self.topic_id != partition.topic_id.get().to_string()
             || self.partition_id != partition.partition_id.get()
         {
-            return Err(LogDbError::CorruptTier(
+            return Err(TelemetryError::CorruptTier(
                 "catalog root belongs to a different namespace".into(),
             ));
         }
@@ -885,7 +887,7 @@ impl CatalogRoot {
                     !page.last_checkpoint.covers(checkpoint)
                 })
             {
-                return Err(LogDbError::CorruptTier(
+                return Err(TelemetryError::CorruptTier(
                     "catalog root pages or checkpoints are not strictly increasing".into(),
                 ));
             }
@@ -894,7 +896,7 @@ impl CatalogRoot {
             previous_checkpoint = Some(page.last_checkpoint);
         }
         if self.latest_checkpoint != previous_checkpoint {
-            return Err(LogDbError::CorruptTier(
+            return Err(TelemetryError::CorruptTier(
                 "catalog root latest checkpoint disagrees with its final page".into(),
             ));
         }
@@ -918,13 +920,13 @@ pub struct CatalogPointer {
 }
 
 impl CatalogPointer {
-    fn validate(&self) -> LogDbResult<()> {
+    fn validate(&self) -> TelemetryResult<()> {
         validate_object_key(&self.root_key)?;
         if self.format_version != TIER_FORMAT_VERSION
             || self.root_bytes == 0
             || !valid_checksum(&self.root_checksum)
         {
-            return Err(LogDbError::CorruptTier(
+            return Err(TelemetryError::CorruptTier(
                 "catalog CURRENT pointer is invalid".into(),
             ));
         }
@@ -946,7 +948,7 @@ pub struct TierQueryRange {
 }
 
 impl TierQueryRange {
-    fn validate(self) -> LogDbResult<()> {
+    fn validate(self) -> TelemetryResult<()> {
         if self
             .first_offset
             .zip(self.last_offset)
@@ -956,7 +958,7 @@ impl TierQueryRange {
                 .zip(self.max_timestamp_unix_nanos)
                 .is_some_and(|(first, last)| first > last)
         {
-            return Err(LogDbError::InvalidQuery(
+            return Err(TelemetryError::InvalidQuery(
                 "tier query range starts after its end".into(),
             ));
         }
@@ -1012,26 +1014,26 @@ impl Default for ObjectTierConfig {
 }
 
 impl ObjectTierConfig {
-    fn validate(self) -> LogDbResult<()> {
+    fn validate(self) -> TelemetryResult<()> {
         if self.target_group_payload_bytes == 0
             || self.max_group_payload_bytes < self.target_group_payload_bytes
         {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "object tier group payload limits are invalid",
             ));
         }
         if self.max_blocks_per_group == 0 {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "object tier max_blocks_per_group must be nonzero",
             ));
         }
         if self.groups_per_page == 0 {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "object tier groups_per_page must be nonzero",
             ));
         }
         if self.max_control_object_bytes < POINTER_READ_LIMIT {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "object tier control-object limit must be at least 64 KiB",
             ));
         }
@@ -1041,7 +1043,7 @@ impl ObjectTierConfig {
 
 /// Partition-scoped immutable object tier with a conditionally published root.
 #[derive(Debug)]
-pub struct LogObjectTier<S> {
+pub struct TelemetryObjectTier<S> {
     store: S,
     shard_id: ShardId,
     partition: TopicPartition,
@@ -1051,7 +1053,7 @@ pub struct LogObjectTier<S> {
     current_version: Option<String>,
 }
 
-impl<S: LogObjectStore> LogObjectTier<S> {
+impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
     /// Opens the current partition catalog without listing object storage.
     ///
     /// Startup validates only `CURRENT` and its root. Catalog pages, group
@@ -1061,7 +1063,7 @@ impl<S: LogObjectStore> LogObjectTier<S> {
         shard_id: ShardId,
         partition: TopicPartition,
         config: ObjectTierConfig,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         config.validate()?;
         let namespace = catalog_namespace(shard_id, partition);
         let current_key = format!("{namespace}/CURRENT");
@@ -1077,7 +1079,7 @@ impl<S: LogObjectStore> LogObjectTier<S> {
             });
         };
         if current_metadata.bytes > POINTER_READ_LIMIT {
-            return Err(LogDbError::CorruptTier(
+            return Err(TelemetryError::CorruptTier(
                 "catalog CURRENT pointer exceeds its read limit".into(),
             ));
         }
@@ -1095,7 +1097,7 @@ impl<S: LogObjectStore> LogObjectTier<S> {
         let root: CatalogRoot = decode_json(&root_bytes, "catalog root")?;
         root.validate(shard_id, partition)?;
         if root.generation != pointer.generation {
-            return Err(LogDbError::CorruptTier(
+            return Err(TelemetryError::CorruptTier(
                 "catalog CURRENT and root generations disagree".into(),
             ));
         }
@@ -1126,7 +1128,7 @@ impl<S: LogObjectStore> LogObjectTier<S> {
     ///
     /// Artifact, manifest, page, and root writes are idempotent. A competing
     /// writer can only cause the final compare-and-swap to fail.
-    pub fn publish_group(&mut self, source: TierGroupSource) -> LogDbResult<TierGroupManifest> {
+    pub fn publish_group(&mut self, source: TierGroupSource) -> TelemetryResult<TierGroupManifest> {
         validate_source(&source)?;
         let mut artifacts = Vec::with_capacity(source.artifacts.len());
         for artifact_source in &source.artifacts {
@@ -1145,7 +1147,7 @@ impl<S: LogObjectStore> LogObjectTier<S> {
             if stored.bytes != source_metadata.bytes
                 || stored.content_digest != source_metadata.content_digest
             {
-                return Err(LogDbError::CorruptTier(format!(
+                return Err(TelemetryError::CorruptTier(format!(
                     "object store changed artifact {}",
                     artifact_source.name
                 )));
@@ -1199,19 +1201,19 @@ impl<S: LogObjectStore> LogObjectTier<S> {
                 .expect("validated catalog pages are nonempty");
             if source.group_sequence == last_group.group_sequence {
                 if *last_group != entry {
-                    return Err(LogDbError::CorruptTier(
+                    return Err(TelemetryError::CorruptTier(
                         "group sequence was retried with different contents".into(),
                     ));
                 }
                 return Ok(manifest);
             }
             if source.group_sequence < last_group.group_sequence {
-                return Err(LogDbError::ObjectStore(
+                return Err(TelemetryError::ObjectStore(
                     "group sequences must be published in increasing order".into(),
                 ));
             }
             if !source.checkpoint.covers(last_group.checkpoint) {
-                return Err(LogDbError::ObjectStore(
+                return Err(TelemetryError::ObjectStore(
                     "group checkpoints must advance monotonically".into(),
                 ));
             }
@@ -1228,7 +1230,9 @@ impl<S: LogObjectStore> LogObjectTier<S> {
                         CatalogPage {
                             format_version: TIER_FORMAT_VERSION,
                             page_sequence: last.page_sequence.checked_add(1).ok_or_else(|| {
-                                LogDbError::ObjectStore("catalog page sequence exhausted".into())
+                                TelemetryError::ObjectStore(
+                                    "catalog page sequence exhausted".into(),
+                                )
                             })?,
                             shard_id: self.shard_id.get(),
                             topic_id: self.partition.topic_id.get().to_string(),
@@ -1270,7 +1274,7 @@ impl<S: LogObjectStore> LogObjectTier<S> {
         next_root.generation = next_root
             .generation
             .checked_add(1)
-            .ok_or_else(|| LogDbError::ObjectStore("catalog generation exhausted".into()))?;
+            .ok_or_else(|| TelemetryError::ObjectStore("catalog generation exhausted".into()))?;
         next_root.latest_checkpoint = Some(source.checkpoint);
         let first_block_id = manifest
             .blocks
@@ -1278,7 +1282,7 @@ impl<S: LogObjectStore> LogObjectTier<S> {
             .expect("validated group has blocks")
             .block_id;
         if first_block_id < self.root.next_block_id {
-            return Err(LogDbError::ObjectStore(
+            return Err(TelemetryError::ObjectStore(
                 "group block identifiers overlap an older group".into(),
             ));
         }
@@ -1288,7 +1292,7 @@ impl<S: LogObjectStore> LogObjectTier<S> {
             .expect("validated group has blocks")
             .block_id
             .checked_add(1)
-            .ok_or_else(|| LogDbError::ObjectStore("block identifier exhausted".into()))?;
+            .ok_or_else(|| TelemetryError::ObjectStore("block identifier exhausted".into()))?;
         if replace_last {
             *next_root
                 .pages
@@ -1319,7 +1323,7 @@ impl<S: LogObjectStore> LogObjectTier<S> {
         };
         let pointer_bytes = encode_json(&pointer, "catalog CURRENT")?;
         if u64::try_from(pointer_bytes.len()).unwrap_or(u64::MAX) > POINTER_READ_LIMIT {
-            return Err(LogDbError::CorruptTier(
+            return Err(TelemetryError::CorruptTier(
                 "catalog CURRENT pointer exceeds its read limit".into(),
             ));
         }
@@ -1337,7 +1341,10 @@ impl<S: LogObjectStore> LogObjectTier<S> {
     /// Returns group entries whose coarse bounds overlap the query.
     ///
     /// Only overlapping catalog pages are loaded. This never lists objects.
-    pub fn candidate_groups(&self, range: TierQueryRange) -> LogDbResult<Vec<CatalogGroupEntry>> {
+    pub fn candidate_groups(
+        &self,
+        range: TierQueryRange,
+    ) -> TelemetryResult<Vec<CatalogGroupEntry>> {
         let mut groups = Vec::new();
         self.for_each_candidate_group(range, |group| {
             groups.push(group.clone());
@@ -1355,8 +1362,8 @@ impl<S: LogObjectStore> LogObjectTier<S> {
     pub fn for_each_candidate_group(
         &self,
         range: TierQueryRange,
-        mut visit: impl FnMut(&CatalogGroupEntry) -> LogDbResult<bool>,
-    ) -> LogDbResult<()> {
+        mut visit: impl FnMut(&CatalogGroupEntry) -> TelemetryResult<bool>,
+    ) -> TelemetryResult<()> {
         range.validate()?;
         for page_ref in &self.root.pages {
             if !range.overlaps(
@@ -1384,7 +1391,7 @@ impl<S: LogObjectStore> LogObjectTier<S> {
     }
 
     /// Loads and validates one group manifest selected from a catalog page.
-    pub fn load_group(&self, entry: &CatalogGroupEntry) -> LogDbResult<TierGroupManifest> {
+    pub fn load_group(&self, entry: &CatalogGroupEntry) -> TelemetryResult<TierGroupManifest> {
         entry.validate()?;
         let bytes = self
             .store
@@ -1403,7 +1410,7 @@ impl<S: LogObjectStore> LogObjectTier<S> {
             self.config.max_group_payload_bytes,
         )?;
         if manifest.group_sequence != entry.group_sequence {
-            return Err(LogDbError::CorruptTier(
+            return Err(TelemetryError::CorruptTier(
                 "catalog group and manifest sequences disagree".into(),
             ));
         }
@@ -1411,10 +1418,14 @@ impl<S: LogObjectStore> LogObjectTier<S> {
     }
 
     /// Reads and verifies a complete immutable artifact on demand.
-    pub fn read_artifact(&self, artifact: &TierArtifact, max_bytes: u64) -> LogDbResult<Vec<u8>> {
+    pub fn read_artifact(
+        &self,
+        artifact: &TierArtifact,
+        max_bytes: u64,
+    ) -> TelemetryResult<Vec<u8>> {
         validate_artifact(artifact)?;
         if artifact.bytes > max_bytes {
-            return Err(LogDbError::ObjectStore(format!(
+            return Err(TelemetryError::ObjectStore(format!(
                 "artifact {} exceeds read limit {max_bytes}",
                 artifact.name
             )));
@@ -1424,7 +1435,7 @@ impl<S: LogObjectStore> LogObjectTier<S> {
         Ok(bytes)
     }
 
-    fn load_page(&self, reference: &CatalogPageRef) -> LogDbResult<CatalogPage> {
+    fn load_page(&self, reference: &CatalogPageRef) -> TelemetryResult<CatalogPage> {
         reference.validate()?;
         let bytes = self
             .store
@@ -1438,7 +1449,7 @@ impl<S: LogObjectStore> LogObjectTier<S> {
         let page: CatalogPage = decode_json(&bytes, "catalog page")?;
         page.validate(self.shard_id, self.partition, self.config.groups_per_page)?;
         if page.page_sequence != reference.page_sequence {
-            return Err(LogDbError::CorruptTier(
+            return Err(TelemetryError::CorruptTier(
                 "catalog root and page sequences disagree".into(),
             ));
         }
@@ -1468,14 +1479,14 @@ impl Default for SsdCacheConfig {
 }
 
 impl SsdCacheConfig {
-    fn validate(self) -> LogDbResult<()> {
+    fn validate(self) -> TelemetryResult<()> {
         if self.max_bytes == 0 || self.chunk_bytes == 0 || self.max_read_bytes == 0 {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "SSD cache byte limits must be nonzero",
             ));
         }
         if self.chunk_bytes > self.max_read_bytes {
-            return Err(LogDbError::InvalidConfig(
+            return Err(TelemetryError::InvalidConfig(
                 "SSD cache chunks cannot exceed the read limit",
             ));
         }
@@ -1510,7 +1521,7 @@ pub struct SsdObjectCache {
 
 impl SsdObjectCache {
     /// Opens an SSD cache and reconstructs its bounded local directory.
-    pub fn open(root: impl AsRef<Path>, config: SsdCacheConfig) -> LogDbResult<Self> {
+    pub fn open(root: impl AsRef<Path>, config: SsdCacheConfig) -> TelemetryResult<Self> {
         config.validate()?;
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root).map_err(|error| storage_io("create SSD cache", error))?;
@@ -1559,54 +1570,55 @@ impl SsdObjectCache {
     }
 
     /// Reads an object range, filling and reusing fixed immutable SSD chunks.
-    pub fn read_range<S: LogObjectStore>(
+    pub fn read_range<S: TelemetryObjectStore>(
         &self,
         store: &S,
         object_key: &str,
         range: Range<u64>,
-    ) -> LogDbResult<Vec<u8>> {
+    ) -> TelemetryResult<Vec<u8>> {
         if range.start > range.end || range.end - range.start > self.config.max_read_bytes {
-            return Err(LogDbError::ObjectStore(
+            return Err(TelemetryError::ObjectStore(
                 "SSD cache read range is invalid or exceeds its limit".into(),
             ));
         }
         let metadata = store.head(object_key)?.ok_or_else(|| {
-            LogDbError::ObjectStore(format!("object {object_key} does not exist"))
+            TelemetryError::ObjectStore(format!("object {object_key} does not exist"))
         })?;
         self.read_range_with_metadata(store, object_key, &metadata, range)
     }
 
     /// Reads an object range using immutable metadata already held in a
     /// manifest, avoiding a remote HEAD request on the query path.
-    pub fn read_range_with_metadata<S: LogObjectStore>(
+    pub fn read_range_with_metadata<S: TelemetryObjectStore>(
         &self,
         store: &S,
         object_key: &str,
         metadata: &ObjectMetadata,
         range: Range<u64>,
-    ) -> LogDbResult<Vec<u8>> {
+    ) -> TelemetryResult<Vec<u8>> {
         if range.start > range.end || range.end - range.start > self.config.max_read_bytes {
-            return Err(LogDbError::ObjectStore(
+            return Err(TelemetryError::ObjectStore(
                 "SSD cache read range is invalid or exceeds its limit".into(),
             ));
         }
         if range.end > metadata.bytes {
-            return Err(LogDbError::ObjectStore(format!(
+            return Err(TelemetryError::ObjectStore(format!(
                 "SSD cache range exceeds object {object_key}"
             )));
         }
         if range.is_empty() {
             return Ok(Vec::new());
         }
-        let output_bytes = usize::try_from(range.end - range.start)
-            .map_err(|_| LogDbError::ObjectStore("SSD cache read cannot fit in memory".into()))?;
+        let output_bytes = usize::try_from(range.end - range.start).map_err(|_| {
+            TelemetryError::ObjectStore("SSD cache read cannot fit in memory".into())
+        })?;
         let mut output = Vec::with_capacity(output_bytes);
         let first_chunk = range.start / self.config.chunk_bytes;
         let last_chunk = (range.end - 1) / self.config.chunk_bytes;
         for chunk_index in first_chunk..=last_chunk {
             let chunk_start = chunk_index
                 .checked_mul(self.config.chunk_bytes)
-                .ok_or_else(|| LogDbError::ObjectStore("cache chunk offset overflow".into()))?;
+                .ok_or_else(|| TelemetryError::ObjectStore("cache chunk offset overflow".into()))?;
             let chunk_end = chunk_start
                 .saturating_add(self.config.chunk_bytes)
                 .min(metadata.bytes);
@@ -1620,22 +1632,22 @@ impl SsdObjectCache {
             let copy_start = range.start.max(chunk_start) - chunk_start;
             let copy_end = range.end.min(chunk_end) - chunk_start;
             let copy_start = usize::try_from(copy_start)
-                .map_err(|_| LogDbError::ObjectStore("cache slice offset overflow".into()))?;
+                .map_err(|_| TelemetryError::ObjectStore("cache slice offset overflow".into()))?;
             let copy_end = usize::try_from(copy_end)
-                .map_err(|_| LogDbError::ObjectStore("cache slice offset overflow".into()))?;
+                .map_err(|_| TelemetryError::ObjectStore("cache slice offset overflow".into()))?;
             output.extend_from_slice(&chunk[copy_start..copy_end]);
         }
         Ok(output)
     }
 
-    fn load_or_fetch_chunk<S: LogObjectStore>(
+    fn load_or_fetch_chunk<S: TelemetryObjectStore>(
         &self,
         store: &S,
         object_key: &str,
         metadata: &ObjectMetadata,
         chunk_index: u64,
         range: Range<u64>,
-    ) -> LogDbResult<Vec<u8>> {
+    ) -> TelemetryResult<Vec<u8>> {
         let cache_key = checksum_bytes(
             format!("{object_key}\0{}\0{chunk_index}", metadata.version_token).as_bytes(),
         );
@@ -1655,11 +1667,11 @@ impl SsdObjectCache {
         Ok(bytes)
     }
 
-    fn cache_hit(&self, cache_key: &str) -> LogDbResult<Option<PathBuf>> {
+    fn cache_hit(&self, cache_key: &str) -> TelemetryResult<Option<PathBuf>> {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| LogDbError::StorageIo("SSD cache state is poisoned".into()))?;
+            .map_err(|_| TelemetryError::StorageIo("SSD cache state is poisoned".into()))?;
         state.clock = state.clock.wrapping_add(1);
         let stamp = state.clock;
         Ok(state.entries.get_mut(cache_key).map(|entry| {
@@ -1668,7 +1680,7 @@ impl SsdObjectCache {
         }))
     }
 
-    fn install_chunk(&self, cache_key: &str, bytes: &[u8]) -> LogDbResult<()> {
+    fn install_chunk(&self, cache_key: &str, bytes: &[u8]) -> TelemetryResult<()> {
         let framed_bytes = u64::try_from(bytes.len())
             .unwrap_or(u64::MAX)
             .saturating_add(CACHE_HEADER_BYTES as u64);
@@ -1680,7 +1692,7 @@ impl SsdObjectCache {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| LogDbError::StorageIo("SSD cache state is poisoned".into()))?;
+            .map_err(|_| TelemetryError::StorageIo("SSD cache state is poisoned".into()))?;
         state.clock = state.clock.wrapping_add(1);
         let stamp = state.clock;
         if let Some(previous) = state.entries.insert(
@@ -1697,11 +1709,11 @@ impl SsdObjectCache {
         evict_locked(&mut state, self.config.max_bytes)
     }
 
-    fn remove_entry(&self, cache_key: &str) -> LogDbResult<()> {
+    fn remove_entry(&self, cache_key: &str) -> TelemetryResult<()> {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| LogDbError::StorageIo("SSD cache state is poisoned".into()))?;
+            .map_err(|_| TelemetryError::StorageIo("SSD cache state is poisoned".into()))?;
         if let Some(entry) = state.entries.remove(cache_key) {
             state.used_bytes = state.used_bytes.saturating_sub(entry.bytes);
             remove_cache_file(&entry.path)?;
@@ -1709,11 +1721,11 @@ impl SsdObjectCache {
         Ok(())
     }
 
-    fn evict_to_budget(&self) -> LogDbResult<()> {
+    fn evict_to_budget(&self) -> TelemetryResult<()> {
         let mut state = self
             .state
             .lock()
-            .map_err(|_| LogDbError::StorageIo("SSD cache state is poisoned".into()))?;
+            .map_err(|_| TelemetryError::StorageIo("SSD cache state is poisoned".into()))?;
         evict_locked(&mut state, self.config.max_bytes)
     }
 }
@@ -1725,20 +1737,20 @@ pub fn write_staged_payload_pack(
     catalog: &BlockCatalog,
     block_ids: &[BlockId],
     destination: impl AsRef<Path>,
-) -> LogDbResult<Vec<TierBlockEntry>> {
+) -> TelemetryResult<Vec<TierBlockEntry>> {
     if block_ids.is_empty() {
-        return Err(LogDbError::ObjectStore(
+        return Err(TelemetryError::ObjectStore(
             "a payload pack requires at least one block".into(),
         ));
     }
     if block_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(LogDbError::ObjectStore(
+        return Err(TelemetryError::ObjectStore(
             "payload-pack block IDs must be strictly increasing".into(),
         ));
     }
     let first_descriptor = catalog
         .get(block_ids[0])
-        .ok_or_else(|| LogDbError::UnknownBlock(block_ids[0].get()))?;
+        .ok_or_else(|| TelemetryError::UnknownBlock(block_ids[0].get()))?;
     let destination = destination.as_ref();
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)
@@ -1754,19 +1766,19 @@ pub fn write_staged_payload_pack(
     for &block_id in block_ids {
         let descriptor = catalog
             .get(block_id)
-            .ok_or_else(|| LogDbError::UnknownBlock(block_id.get()))?;
+            .ok_or_else(|| TelemetryError::UnknownBlock(block_id.get()))?;
         if descriptor.stream_shard_id != first_descriptor.stream_shard_id
             || descriptor.topic_partition != first_descriptor.topic_partition
         {
-            return Err(LogDbError::ObjectStore(
+            return Err(TelemetryError::ObjectStore(
                 "one payload pack cannot cross a shard or logical partition".into(),
             ));
         }
         let payload = catalog
             .staged_payload(block_id)
-            .ok_or_else(|| LogDbError::MissingStagedPayload(block_id.get()))?;
+            .ok_or_else(|| TelemetryError::MissingStagedPayload(block_id.get()))?;
         if u64::try_from(payload.len()).unwrap_or(u64::MAX) != descriptor.stored_bytes {
-            return Err(LogDbError::CorruptTier(format!(
+            return Err(TelemetryError::CorruptTier(format!(
                 "staged block {} length differs from its descriptor",
                 block_id.get()
             )));
@@ -1780,7 +1792,7 @@ pub fn write_staged_payload_pack(
         ));
         offset = offset
             .checked_add(descriptor.stored_bytes)
-            .ok_or_else(|| LogDbError::ObjectStore("payload-pack length overflow".into()))?;
+            .ok_or_else(|| TelemetryError::ObjectStore("payload-pack length overflow".into()))?;
     }
     file.sync_all()
         .map_err(|error| storage_io("sync staged payload pack", error))?;
@@ -1792,23 +1804,23 @@ pub fn write_staged_payload_pack(
 pub fn mark_group_offloaded(
     catalog: &mut BlockCatalog,
     manifest: &TierGroupManifest,
-) -> LogDbResult<()> {
+) -> TelemetryResult<()> {
     let payload = manifest
         .artifact(TierArtifactKind::PayloadPack)
-        .ok_or_else(|| LogDbError::CorruptTier("group has no payload artifact".into()))?;
+        .ok_or_else(|| TelemetryError::CorruptTier("group has no payload artifact".into()))?;
 
     // Validate the complete transition before mutating any block. A corrupt
     // or stale manifest must not leave a partially offloaded local catalog.
     for block in &manifest.blocks {
         let descriptor = catalog
             .get(BlockId::new(block.block_id))
-            .ok_or(LogDbError::UnknownBlock(block.block_id))?;
+            .ok_or(TelemetryError::UnknownBlock(block.block_id))?;
         let range_end = block
             .payload_offset
             .checked_add(descriptor.stored_bytes)
-            .ok_or_else(|| LogDbError::CorruptTier("payload range overflow".into()))?;
+            .ok_or_else(|| TelemetryError::CorruptTier("payload range overflow".into()))?;
         if range_end > payload.bytes {
-            return Err(LogDbError::CorruptTier(format!(
+            return Err(TelemetryError::CorruptTier(format!(
                 "block {} exceeds payload artifact length",
                 block.block_id
             )));
@@ -1817,7 +1829,7 @@ pub fn mark_group_offloaded(
             || descriptor.topic_partition.topic_id.get().to_string() != manifest.topic_id
             || descriptor.topic_partition.partition_id.get() != manifest.partition_id
         {
-            return Err(LogDbError::CorruptTier(format!(
+            return Err(TelemetryError::CorruptTier(format!(
                 "block {} belongs to another catalog namespace",
                 block.block_id
             )));
@@ -1834,9 +1846,9 @@ pub fn mark_group_offloaded(
     Ok(())
 }
 
-fn validate_source(source: &TierGroupSource) -> LogDbResult<()> {
+fn validate_source(source: &TierGroupSource) -> TelemetryResult<()> {
     if source.blocks.is_empty() || source.artifacts.is_empty() {
-        return Err(LogDbError::ObjectStore(
+        return Err(TelemetryError::ObjectStore(
             "a tier group requires blocks and artifacts".into(),
         ));
     }
@@ -1845,7 +1857,7 @@ fn validate_source(source: &TierGroupSource) -> LogDbResult<()> {
         .windows(2)
         .any(|pair| pair[0].block_id >= pair[1].block_id)
     {
-        return Err(LogDbError::ObjectStore(
+        return Err(TelemetryError::ObjectStore(
             "tier group blocks must be strictly increasing".into(),
         ));
     }
@@ -1862,42 +1874,42 @@ fn validate_source(source: &TierGroupSource) -> LogDbResult<()> {
                 .any(|other| artifact.kind == other.kind && artifact.name == other.name)
         })
     {
-        return Err(LogDbError::ObjectStore(
+        return Err(TelemetryError::ObjectStore(
             "tier group artifact names must be unique per role".into(),
         ));
     }
     Ok(())
 }
 
-fn validate_artifact(artifact: &TierArtifact) -> LogDbResult<()> {
+fn validate_artifact(artifact: &TierArtifact) -> TelemetryResult<()> {
     validate_artifact_name(&artifact.name)?;
     validate_object_key(&artifact.object_key)?;
     if artifact.bytes == 0
         || artifact.checksum_algorithm != CHECKSUM_ALGORITHM
         || !valid_checksum(&artifact.checksum)
     {
-        return Err(LogDbError::CorruptTier(
+        return Err(TelemetryError::CorruptTier(
             "group artifact metadata is invalid".into(),
         ));
     }
     Ok(())
 }
 
-fn validate_artifact_name(name: &str) -> LogDbResult<()> {
+fn validate_artifact_name(name: &str) -> TelemetryResult<()> {
     if name.is_empty()
         || name.len() > 128
         || !name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
     {
-        return Err(LogDbError::ObjectStore(
+        return Err(TelemetryError::ObjectStore(
             "artifact names must be 1..=128 path-free ASCII characters".into(),
         ));
     }
     Ok(())
 }
 
-fn validate_object_key(key: &str) -> LogDbResult<()> {
+fn validate_object_key(key: &str) -> TelemetryResult<()> {
     let path = Path::new(key);
     if key.is_empty()
         || key.contains('\\')
@@ -1906,7 +1918,7 @@ fn validate_object_key(key: &str) -> LogDbResult<()> {
             .components()
             .any(|component| !matches!(component, Component::Normal(_)))
     {
-        return Err(LogDbError::ObjectStore(format!(
+        return Err(TelemetryError::ObjectStore(format!(
             "unsafe object key {key:?}"
         )));
     }
@@ -1922,19 +1934,19 @@ fn catalog_namespace(shard_id: ShardId, partition: TopicPartition) -> String {
     )
 }
 
-fn encode_json<T: Serialize>(value: &T, context: &str) -> LogDbResult<Vec<u8>> {
+fn encode_json<T: Serialize>(value: &T, context: &str) -> TelemetryResult<Vec<u8>> {
     serde_json::to_vec(value)
-        .map_err(|error| LogDbError::CorruptTier(format!("{context} encoding failed: {error}")))
+        .map_err(|error| TelemetryError::CorruptTier(format!("{context} encoding failed: {error}")))
 }
 
-fn decode_json<T: DeserializeOwned>(bytes: &[u8], context: &str) -> LogDbResult<T> {
+fn decode_json<T: DeserializeOwned>(bytes: &[u8], context: &str) -> TelemetryResult<T> {
     serde_json::from_slice(bytes)
-        .map_err(|error| LogDbError::CorruptTier(format!("{context} decoding failed: {error}")))
+        .map_err(|error| TelemetryError::CorruptTier(format!("{context} decoding failed: {error}")))
 }
 
-fn ensure_control_size(bytes: usize, limit: u64, context: &str) -> LogDbResult<()> {
+fn ensure_control_size(bytes: usize, limit: u64, context: &str) -> TelemetryResult<()> {
     if u64::try_from(bytes).unwrap_or(u64::MAX) > limit {
-        return Err(LogDbError::ObjectStore(format!(
+        return Err(TelemetryError::ObjectStore(format!(
             "{context} exceeds configured control-object limit {limit}"
         )));
     }
@@ -1945,7 +1957,7 @@ fn verify_bytes_metadata(
     bytes: &[u8],
     metadata: &ObjectMetadata,
     context: &str,
-) -> LogDbResult<()> {
+) -> TelemetryResult<()> {
     verify_expected_object(bytes, metadata.bytes, &metadata.content_digest, context)
 }
 
@@ -1954,11 +1966,11 @@ fn verify_expected_object(
     expected_bytes: u64,
     expected_checksum: &str,
     context: &str,
-) -> LogDbResult<()> {
+) -> TelemetryResult<()> {
     if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != expected_bytes
         || checksum_bytes(bytes) != expected_checksum
     {
-        return Err(LogDbError::CorruptTier(format!(
+        return Err(TelemetryError::CorruptTier(format!(
             "{context} failed length or BLAKE3 verification"
         )));
     }
@@ -1985,7 +1997,7 @@ fn checksum_bytes(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
-fn hash_file(path: &Path) -> LogDbResult<ObjectMetadata> {
+fn hash_file(path: &Path) -> TelemetryResult<ObjectMetadata> {
     let mut file =
         File::open(path).map_err(|error| storage_io("open file for BLAKE3 hashing", error))?;
     let mut hasher = blake3::Hasher::new();
@@ -2001,7 +2013,7 @@ fn hash_file(path: &Path) -> LogDbResult<ObjectMetadata> {
         hasher.update(&buffer[..read]);
         bytes = bytes
             .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
-            .ok_or_else(|| LogDbError::StorageIo("file length overflow".into()))?;
+            .ok_or_else(|| TelemetryError::StorageIo("file length overflow".into()))?;
     }
     Ok(ObjectMetadata {
         bytes,
@@ -2010,10 +2022,10 @@ fn hash_file(path: &Path) -> LogDbResult<ObjectMetadata> {
     })
 }
 
-fn metadata_for_path_if_present(path: &Path) -> LogDbResult<Option<ObjectMetadata>> {
+fn metadata_for_path_if_present(path: &Path) -> TelemetryResult<Option<ObjectMetadata>> {
     match path.metadata() {
         Ok(metadata) if metadata.is_file() => hash_file(path).map(Some),
-        Ok(_) => Err(LogDbError::ObjectStore(format!(
+        Ok(_) => Err(TelemetryError::ObjectStore(format!(
             "object path {} is not a regular file",
             path.display()
         ))),
@@ -2022,7 +2034,7 @@ fn metadata_for_path_if_present(path: &Path) -> LogDbResult<Option<ObjectMetadat
     }
 }
 
-fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> LogDbResult<()> {
+fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> TelemetryResult<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| storage_io("create object parent directory", error))?;
@@ -2048,7 +2060,7 @@ fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> LogDbResult<()> {
     result
 }
 
-fn copy_file_atomically(source: &Path, destination: &Path) -> LogDbResult<ObjectMetadata> {
+fn copy_file_atomically(source: &Path, destination: &Path) -> TelemetryResult<ObjectMetadata> {
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)
             .map_err(|error| storage_io("create object parent directory", error))?;
@@ -2077,7 +2089,7 @@ fn copy_file_atomically(source: &Path, destination: &Path) -> LogDbResult<Object
             hasher.update(&buffer[..read]);
             bytes = bytes
                 .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
-                .ok_or_else(|| LogDbError::StorageIo("object length overflow".into()))?;
+                .ok_or_else(|| TelemetryError::StorageIo("object length overflow".into()))?;
         }
         output
             .sync_all()
@@ -2102,7 +2114,7 @@ fn temporary_path(path: &Path) -> PathBuf {
     path.with_extension(format!("tmp-{}-{sequence}", std::process::id()))
 }
 
-fn sync_parent(path: &Path) -> LogDbResult<()> {
+fn sync_parent(path: &Path) -> TelemetryResult<()> {
     let Some(parent) = path.parent() else {
         return Ok(());
     };
@@ -2111,19 +2123,19 @@ fn sync_parent(path: &Path) -> LogDbResult<()> {
         .map_err(|error| storage_io("sync parent directory", error))
 }
 
-fn unlock_file(file: &File) -> LogDbResult<()> {
+fn unlock_file(file: &File) -> TelemetryResult<()> {
     FileExt::unlock(file).map_err(|error| storage_io("unlock object-store update lock", error))
 }
 
-fn storage_io(context: &str, error: std::io::Error) -> LogDbError {
-    LogDbError::StorageIo(format!("{context}: {error}"))
+fn storage_io(context: &str, error: std::io::Error) -> TelemetryError {
+    TelemetryError::StorageIo(format!("{context}: {error}"))
 }
 
-fn object_io(key: &str, operation: &str, error: std::io::Error) -> LogDbError {
-    LogDbError::ObjectStore(format!("{operation} object {key}: {error}"))
+fn object_io(key: &str, operation: &str, error: std::io::Error) -> TelemetryError {
+    TelemetryError::ObjectStore(format!("{operation} object {key}: {error}"))
 }
 
-fn write_cache_chunk_atomically(path: &Path, bytes: &[u8]) -> LogDbResult<()> {
+fn write_cache_chunk_atomically(path: &Path, bytes: &[u8]) -> TelemetryResult<()> {
     let mut framed = Vec::with_capacity(bytes.len().saturating_add(CACHE_HEADER_BYTES));
     framed.extend_from_slice(CACHE_HEADER_MAGIC);
     framed.extend_from_slice(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
@@ -2132,30 +2144,30 @@ fn write_cache_chunk_atomically(path: &Path, bytes: &[u8]) -> LogDbResult<()> {
     write_bytes_atomically(path, &framed)
 }
 
-fn read_cache_chunk(path: &Path) -> LogDbResult<Vec<u8>> {
+fn read_cache_chunk(path: &Path) -> TelemetryResult<Vec<u8>> {
     let framed = fs::read(path).map_err(|error| storage_io("read SSD cache chunk", error))?;
     if framed.len() < CACHE_HEADER_BYTES || &framed[..8] != CACHE_HEADER_MAGIC {
-        return Err(LogDbError::CorruptTier(
+        return Err(TelemetryError::CorruptTier(
             "SSD cache chunk header is invalid".into(),
         ));
     }
     let bytes = u64::from_le_bytes(
         framed[8..16]
             .try_into()
-            .map_err(|_| LogDbError::CorruptTier("SSD cache length is invalid".into()))?,
+            .map_err(|_| TelemetryError::CorruptTier("SSD cache length is invalid".into()))?,
     );
     let payload = &framed[CACHE_HEADER_BYTES..];
     if u64::try_from(payload.len()).unwrap_or(u64::MAX) != bytes
         || blake3::hash(payload).as_bytes() != &framed[16..48]
     {
-        return Err(LogDbError::CorruptTier(
+        return Err(TelemetryError::CorruptTier(
             "SSD cache chunk failed integrity verification".into(),
         ));
     }
     Ok(payload.to_vec())
 }
 
-fn evict_locked(state: &mut CacheState, max_bytes: u64) -> LogDbResult<()> {
+fn evict_locked(state: &mut CacheState, max_bytes: u64) -> TelemetryResult<()> {
     while state.used_bytes > max_bytes {
         let Some((key, _)) = state
             .entries
@@ -2176,7 +2188,7 @@ fn evict_locked(state: &mut CacheState, max_bytes: u64) -> LogDbResult<()> {
     Ok(())
 }
 
-fn remove_cache_file(path: &Path) -> LogDbResult<()> {
+fn remove_cache_file(path: &Path) -> TelemetryResult<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -2206,7 +2218,7 @@ mod tests {
         fn new(name: &str) -> Self {
             let sequence = TEST_SEQUENCE.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
-                "shard-log-{name}-{}-{sequence}",
+                "shard-telemetry-{name}-{}-{sequence}",
                 std::process::id()
             ));
             fs::create_dir_all(&path).expect("test directory is created");
@@ -2305,11 +2317,11 @@ mod tests {
         );
         assert!(matches!(
             store.put_bytes_if_absent("objects/one", b"different"),
-            Err(LogDbError::ObjectStore(_))
+            Err(TelemetryError::ObjectStore(_))
         ));
         assert!(matches!(
             store.put_bytes_if_absent("../escape", b"bad"),
-            Err(LogDbError::ObjectStore(_))
+            Err(TelemetryError::ObjectStore(_))
         ));
 
         let current = store
@@ -2317,7 +2329,7 @@ mod tests {
             .expect("missing pointer is created");
         assert!(matches!(
             store.compare_and_swap("catalog/CURRENT", None, b"two"),
-            Err(LogDbError::StaleCatalog { .. })
+            Err(TelemetryError::StaleCatalog { .. })
         ));
         let next = store
             .compare_and_swap("catalog/CURRENT", Some(&current.version_token), b"two")
@@ -2335,7 +2347,7 @@ mod tests {
         let store =
             LocalObjectStore::open(directory.path.join("objects")).expect("object store opens");
         let mut tier =
-            LogObjectTier::open(store.clone(), ShardId::new(4), partition(), tier_config(2))
+            TelemetryObjectTier::open(store.clone(), ShardId::new(4), partition(), tier_config(2))
                 .expect("empty tier opens");
         let source0 = group_source(&artifact_directory, 0, 0, 1_000);
         let manifest0 = tier
@@ -2388,22 +2400,22 @@ mod tests {
         );
 
         let reopened =
-            LogObjectTier::open(store.clone(), ShardId::new(4), partition(), tier_config(2))
+            TelemetryObjectTier::open(store.clone(), ShardId::new(4), partition(), tier_config(2))
                 .expect("published tier recovers");
         assert_eq!(reopened.root(), tier.root());
 
         let mut first_writer =
-            LogObjectTier::open(store.clone(), ShardId::new(4), partition(), tier_config(2))
+            TelemetryObjectTier::open(store.clone(), ShardId::new(4), partition(), tier_config(2))
                 .expect("first writer opens");
         let mut stale_writer =
-            LogObjectTier::open(store, ShardId::new(4), partition(), tier_config(2))
+            TelemetryObjectTier::open(store, ShardId::new(4), partition(), tier_config(2))
                 .expect("stale writer opens");
         first_writer
             .publish_group(group_source(&artifact_directory, 3, 30, 4_000))
             .expect("first writer advances catalog");
         assert!(matches!(
             stale_writer.publish_group(group_source(&artifact_directory, 4, 40, 5_000)),
-            Err(LogDbError::StaleCatalog { .. })
+            Err(TelemetryError::StaleCatalog { .. })
         ));
     }
 
@@ -2415,18 +2427,19 @@ mod tests {
         let store =
             LocalObjectStore::open(directory.path.join("objects")).expect("object store opens");
         let mut tier =
-            LogObjectTier::open(store.clone(), ShardId::new(2), partition(), tier_config(2))
+            TelemetryObjectTier::open(store.clone(), ShardId::new(2), partition(), tier_config(2))
                 .expect("tier opens");
         tier.publish_group(group_source(&artifacts, 0, 0, 100))
             .expect("group publishes");
         let page_key = tier.root().pages[0].page_key.clone();
         write_test_file(&store.root().join(page_key), b"corrupt");
 
-        let reopened = LogObjectTier::open(store, ShardId::new(2), partition(), tier_config(2))
-            .expect("startup does not scan every page or payload");
+        let reopened =
+            TelemetryObjectTier::open(store, ShardId::new(2), partition(), tier_config(2))
+                .expect("startup does not scan every page or payload");
         assert!(matches!(
             reopened.candidate_groups(TierQueryRange::default()),
-            Err(LogDbError::CorruptTier(_))
+            Err(TelemetryError::CorruptTier(_))
         ));
     }
 
@@ -2477,8 +2490,9 @@ mod tests {
         write_test_file(&query_path, b"index");
         let store =
             LocalObjectStore::open(directory.path.join("objects")).expect("object store opens");
-        let mut tier = LogObjectTier::open(store, ShardId::new(8), partition(), tier_config(2))
-            .expect("tier opens");
+        let mut tier =
+            TelemetryObjectTier::open(store, ShardId::new(8), partition(), tier_config(2))
+                .expect("tier opens");
         let manifest = tier
             .publish_group(TierGroupSource {
                 group_sequence: 0,
@@ -2535,8 +2549,9 @@ mod tests {
         write_test_file(&query_path, b"index");
         let store =
             LocalObjectStore::open(directory.path.join("objects")).expect("object store opens");
-        let mut tier = LogObjectTier::open(store, ShardId::new(8), partition(), tier_config(2))
-            .expect("tier opens");
+        let mut tier =
+            TelemetryObjectTier::open(store, ShardId::new(8), partition(), tier_config(2))
+                .expect("tier opens");
         let mut manifest = tier
             .publish_group(TierGroupSource {
                 group_sequence: 0,
@@ -2563,7 +2578,7 @@ mod tests {
 
         assert!(matches!(
             mark_group_offloaded(&mut catalog, &manifest),
-            Err(LogDbError::UnknownBlock(999))
+            Err(TelemetryError::UnknownBlock(999))
         ));
         for block_id in [first.block_id, second.block_id] {
             assert!(catalog.staged_payload(block_id).is_some());
@@ -2592,25 +2607,25 @@ mod tests {
         }
     }
 
-    impl LogObjectStore for CountingStore {
-        fn put_bytes_if_absent(&self, key: &str, bytes: &[u8]) -> LogDbResult<ObjectMetadata> {
+    impl TelemetryObjectStore for CountingStore {
+        fn put_bytes_if_absent(&self, key: &str, bytes: &[u8]) -> TelemetryResult<ObjectMetadata> {
             self.inner.put_bytes_if_absent(key, bytes)
         }
 
-        fn put_file_if_absent(&self, key: &str, source: &Path) -> LogDbResult<ObjectMetadata> {
+        fn put_file_if_absent(&self, key: &str, source: &Path) -> TelemetryResult<ObjectMetadata> {
             self.inner.put_file_if_absent(key, source)
         }
 
-        fn get(&self, key: &str, max_bytes: u64) -> LogDbResult<Vec<u8>> {
+        fn get(&self, key: &str, max_bytes: u64) -> TelemetryResult<Vec<u8>> {
             self.inner.get(key, max_bytes)
         }
 
-        fn get_range(&self, key: &str, range: Range<u64>) -> LogDbResult<Vec<u8>> {
+        fn get_range(&self, key: &str, range: Range<u64>) -> TelemetryResult<Vec<u8>> {
             self.range_reads.fetch_add(1, Ordering::Relaxed);
             self.inner.get_range(key, range)
         }
 
-        fn head(&self, key: &str) -> LogDbResult<Option<ObjectMetadata>> {
+        fn head(&self, key: &str) -> TelemetryResult<Option<ObjectMetadata>> {
             self.inner.head(key)
         }
 
@@ -2619,7 +2634,7 @@ mod tests {
             key: &str,
             expected_version: Option<&str>,
             bytes: &[u8],
-        ) -> LogDbResult<ObjectMetadata> {
+        ) -> TelemetryResult<ObjectMetadata> {
             self.inner.compare_and_swap(key, expected_version, bytes)
         }
     }

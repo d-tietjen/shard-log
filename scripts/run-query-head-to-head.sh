@@ -5,14 +5,14 @@ SOURCE=${SOURCE:-/home/dtietjen/log-compression-samples/clickhouse-docker-json-e
 EXPECTED_SHA256=${EXPECTED_SHA256:-4fd6379bd89fcb44688a3ebd611729416c82f110fbf49ffef905d9df0ebf0508}
 EXPECTED_FILE_BYTES=${EXPECTED_FILE_BYTES:-85899345920}
 SOURCE_LIMIT_BYTES=${SOURCE_LIMIT_BYTES:-1073741824}
-SHARD_LOG_BUILD_BIN=${SHARD_LOG_BUILD_BIN:-/home/dtietjen/shard-log-query-head-to-head-20260730-v7/shard-log/target/release/shard-log-structural-bench}
-SHARD_LOG_QUERY_BIN=${SHARD_LOG_QUERY_BIN:-/home/dtietjen/shard-log-query-head-to-head-20260730-v7/shard-log/target/release/shard-log-pack-query-bench}
-SOURCE_ARCHIVE=${SOURCE_ARCHIVE:-/home/dtietjen/shard-log-query-head-to-head-20260730-v7.tar.gz}
-SHARD_STREAM_SOURCE=${SHARD_STREAM_SOURCE:-/home/dtietjen/shard-log-query-head-to-head-20260730-v7/shard-stream}
+SHARD_TELEMETRY_BUILD_BIN=${SHARD_TELEMETRY_BUILD_BIN:-/home/dtietjen/shard-telemetry-query-head-to-head-20260730-v7/shard-telemetry/target/release/shard-telemetry-structural-bench}
+SHARD_TELEMETRY_QUERY_BIN=${SHARD_TELEMETRY_QUERY_BIN:-/home/dtietjen/shard-telemetry-query-head-to-head-20260730-v7/shard-telemetry/target/release/shard-telemetry-pack-query-bench}
+SOURCE_ARCHIVE=${SOURCE_ARCHIVE:-/home/dtietjen/shard-telemetry-query-head-to-head-20260730-v7.tar.gz}
+SHARD_STREAM_SOURCE=${SHARD_STREAM_SOURCE:-/home/dtietjen/shard-telemetry-query-head-to-head-20260730-v7/shard-stream}
 SHARD_STREAM_REVISION=${SHARD_STREAM_REVISION:-13ee7903d42cabe9bd5c0df0fa8e4a4fdc660ea7}
 EXPECTED_SHARD_STREAM_SOURCE_TREE_SHA256=${EXPECTED_SHARD_STREAM_SOURCE_TREE_SHA256:-ad9fdfd9b13fb9635d40a5df6308cdecca7de81a5e3ebfe45db8b5e47f229308}
 EXPECTED_REJECTED_RECORDS=${EXPECTED_REJECTED_RECORDS:-0}
-RESULT_ROOT=${RESULT_ROOT:-/home/dtietjen/shard-log-query-head-to-head}
+RESULT_ROOT=${RESULT_ROOT:-/home/dtietjen/shard-telemetry-query-head-to-head}
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}
 CORE_COUNT=${CORE_COUNT:-16}
 BLOCK_BYTES=${BLOCK_BYTES:-8MiB}
@@ -34,8 +34,8 @@ for command in awk cmp cp dd docker find lscpu sha256sum sort stat taskset wc xa
 done
 for path in \
     "$SOURCE" \
-    "$SHARD_LOG_BUILD_BIN" \
-    "$SHARD_LOG_QUERY_BIN" \
+    "$SHARD_TELEMETRY_BUILD_BIN" \
+    "$SHARD_TELEMETRY_QUERY_BIN" \
     "$SOURCE_ARCHIVE" \
     "$SHARD_STREAM_SOURCE" \
     "$CLICKHOUSE_CONFIG" \
@@ -76,7 +76,7 @@ RUN_DIR=$RESULT_ROOT/$RUN_ID
 mkdir -p "$RUN_DIR"
 exec > >(tee "$RUN_DIR/harness.log") 2>&1
 
-CH_CONTAINER="shard-log-query-ch-${RUN_ID//[^a-zA-Z0-9_.-]/-}"
+CH_CONTAINER="shard-telemetry-query-ch-${RUN_ID//[^a-zA-Z0-9_.-]/-}"
 CH_STARTED=0
 cleanup() {
     if [[ $CH_STARTED -eq 1 ]]; then
@@ -106,7 +106,7 @@ SHARD_STREAM_SOURCE_TREE_SHA256=$(
         crates/shard-stream-core \
         crates/shard-stream-engine \
         crates/shard-stream-protocol \
-        crates/shardlog \
+        crates/shardtelemetry \
         -type f -print0 |
         sort -z |
         xargs -0 sha256sum |
@@ -130,10 +130,10 @@ SHARD_STREAM_SOURCE_TREE_SHA256=$(
     echo "block_bytes=$BLOCK_BYTES"
     echo "query_iterations=$QUERY_ITERATIONS"
     echo "expected_rejected_records=$EXPECTED_REJECTED_RECORDS"
-    echo "shard_log_build_binary=$SHARD_LOG_BUILD_BIN"
-    echo "shard_log_build_sha256=$(sha256sum "$SHARD_LOG_BUILD_BIN" | awk '{ print $1 }')"
-    echo "shard_log_query_binary=$SHARD_LOG_QUERY_BIN"
-    echo "shard_log_query_sha256=$(sha256sum "$SHARD_LOG_QUERY_BIN" | awk '{ print $1 }')"
+    echo "shard_telemetry_build_binary=$SHARD_TELEMETRY_BUILD_BIN"
+    echo "shard_telemetry_build_sha256=$(sha256sum "$SHARD_TELEMETRY_BUILD_BIN" | awk '{ print $1 }')"
+    echo "shard_telemetry_query_binary=$SHARD_TELEMETRY_QUERY_BIN"
+    echo "shard_telemetry_query_sha256=$(sha256sum "$SHARD_TELEMETRY_QUERY_BIN" | awk '{ print $1 }')"
     echo "source_archive=$SOURCE_ARCHIVE"
     echo "source_archive_sha256=$(sha256sum "$SOURCE_ARCHIVE" | awk '{ print $1 }')"
     echo "shard_stream_source=$SHARD_STREAM_SOURCE"
@@ -164,13 +164,13 @@ prewarm_range() {
         'BEGIN { printf "%s prewarm seconds: %.6f\n", label, elapsed_ns / 1000000000 }'
 }
 
-SHARD_PACKS=$RUN_DIR/shard-log-packs
-echo "ShardLog: prewarming requested source prefix"
-prewarm_range ShardLog 0 "$SOURCE_LIMIT_BYTES"
-echo "ShardLog: building persistent query index on CPUs $CPU_SET"
+SHARD_PACKS=$RUN_DIR/shard-telemetry-packs
+echo "ShardTelemetry: prewarming requested source prefix"
+prewarm_range ShardTelemetry 0 "$SOURCE_LIMIT_BYTES"
+echo "ShardTelemetry: building persistent query index on CPUs $CPU_SET"
 /usr/bin/time -f 'wall_seconds=%e\nuser_seconds=%U\nsystem_seconds=%S\nmax_rss_kib=%M' \
-    -o "$RUN_DIR/shard-log-ingest-time.txt" \
-    taskset -c "$CPU_SET" "$SHARD_LOG_BUILD_BIN" "$SOURCE" \
+    -o "$RUN_DIR/shard-telemetry-ingest-time.txt" \
+    taskset -c "$CPU_SET" "$SHARD_TELEMETRY_BUILD_BIN" "$SOURCE" \
     --limit-bytes "$SOURCE_LIMIT_BYTES" \
     --block-bytes "$BLOCK_BYTES" \
     --workers "$CORE_COUNT" \
@@ -178,19 +178,19 @@ echo "ShardLog: building persistent query index on CPUs $CPU_SET"
     --dictionary disabled \
     --index persistent \
     --output-dir "$SHARD_PACKS" \
-    --report "$RUN_DIR/shard-log-report.txt"
+    --report "$RUN_DIR/shard-telemetry-report.txt"
 
-SOURCE_SKIP_BYTES=$(awk -F': ' '$1 == "leading partial bytes discarded" { print $2 }' "$RUN_DIR/shard-log-report.txt")
-COMPLETE_LINE_SOURCE_BYTES=$(awk -F': ' '$1 == "complete-line input bytes" { print $2 }' "$RUN_DIR/shard-log-report.txt")
-SHARD_ACCEPTED_SOURCE_BYTES=$(awk -F': ' '$1 == "source bytes" { print $2 }' "$RUN_DIR/shard-log-report.txt")
-SHARD_RECORDS=$(awk -F': ' '$1 == "records" { print $2 }' "$RUN_DIR/shard-log-report.txt")
-SHARD_REJECTED=$(awk -F': ' '$1 == "rejected complete records" { print $2 }' "$RUN_DIR/shard-log-report.txt")
+SOURCE_SKIP_BYTES=$(awk -F': ' '$1 == "leading partial bytes discarded" { print $2 }' "$RUN_DIR/shard-telemetry-report.txt")
+COMPLETE_LINE_SOURCE_BYTES=$(awk -F': ' '$1 == "complete-line input bytes" { print $2 }' "$RUN_DIR/shard-telemetry-report.txt")
+SHARD_ACCEPTED_SOURCE_BYTES=$(awk -F': ' '$1 == "source bytes" { print $2 }' "$RUN_DIR/shard-telemetry-report.txt")
+SHARD_RECORDS=$(awk -F': ' '$1 == "records" { print $2 }' "$RUN_DIR/shard-telemetry-report.txt")
+SHARD_REJECTED=$(awk -F': ' '$1 == "rejected complete records" { print $2 }' "$RUN_DIR/shard-telemetry-report.txt")
 [[ $SHARD_REJECTED -eq $EXPECTED_REJECTED_RECORDS ]] || {
-    echo "ShardLog rejected $SHARD_REJECTED complete records, expected $EXPECTED_REJECTED_RECORDS" >&2
+    echo "ShardTelemetry rejected $SHARD_REJECTED complete records, expected $EXPECTED_REJECTED_RECORDS" >&2
     exit 1
 }
-[[ $((SHARD_ACCEPTED_SOURCE_BYTES + $(awk -F': ' '$1 == "rejected complete-record bytes" { print $2 }' "$RUN_DIR/shard-log-report.txt"))) -eq $COMPLETE_LINE_SOURCE_BYTES ]] || {
-    echo "ShardLog accepted plus rejected bytes do not cover the complete-line source range" >&2
+[[ $((SHARD_ACCEPTED_SOURCE_BYTES + $(awk -F': ' '$1 == "rejected complete-record bytes" { print $2 }' "$RUN_DIR/shard-telemetry-report.txt"))) -eq $COMPLETE_LINE_SOURCE_BYTES ]] || {
+    echo "ShardTelemetry accepted plus rejected bytes do not cover the complete-line source range" >&2
     exit 1
 }
 
@@ -274,7 +274,7 @@ SELECT count() FROM benchmark.logs
 " >"$RUN_DIR/clickhouse-row-count.txt"
 CH_RECORDS=$(tr -d '[:space:]' <"$RUN_DIR/clickhouse-row-count.txt")
 [[ $CH_RECORDS -eq $SHARD_RECORDS ]] || {
-    echo "record-count mismatch: ShardLog=$SHARD_RECORDS ClickHouse=$CH_RECORDS" >&2
+    echo "record-count mismatch: ShardTelemetry=$SHARD_RECORDS ClickHouse=$CH_RECORDS" >&2
     exit 1
 }
 docker exec "$CH_CONTAINER" clickhouse-client --query "
@@ -303,7 +303,7 @@ FORMAT TSVWithNames
 run_shard_query() {
     local name=$1
     shift
-    taskset -c "$CPU_SET" "$SHARD_LOG_QUERY_BIN" "$SHARD_PACKS" \
+    taskset -c "$CPU_SET" "$SHARD_TELEMETRY_QUERY_BIN" "$SHARD_PACKS" \
         --limit 100 \
         --iterations "$QUERY_ITERATIONS" \
         --emit-results "$RUN_DIR/shard-${name}-results.tsv" \
@@ -378,12 +378,12 @@ run_clickhouse_query \
     "SELECT toUnixTimestamp64Nano(time),hex(stream),hex(log) FROM benchmark.logs WHERE hasTokenCaseInsensitive(log, 'cannot') AND hasTokenCaseInsensitive(log, 'exception') AND hasTokenCaseInsensitive(log, 'file') AND hasTokenCaseInsensitive(log, 'access') AND hasTokenCaseInsensitive(log, 'error') ORDER BY time DESC LIMIT 100" \
     "SELECT toUnixTimestamp64Nano(time),hex(stream),hex(log) FROM benchmark.logs WHERE hasAllTokens(log, 'cannot exception file access error') ORDER BY time DESC LIMIT 100"
 
-run_shard_query miss --term shardlogtermthatdoesnotexist
+run_shard_query miss --term shardtelemetrytermthatdoesnotexist
 run_clickhouse_query \
     miss \
-    "SELECT toUnixTimestamp64Nano(time),hex(stream),hex(log) FROM benchmark.logs WHERE hasToken(log, 'shardlogtermthatdoesnotexist') ORDER BY time DESC LIMIT 100" \
-    "SELECT toUnixTimestamp64Nano(time),hex(stream),hex(log) FROM benchmark.logs WHERE hasTokenCaseInsensitive(log, 'shardlogtermthatdoesnotexist') ORDER BY time DESC LIMIT 100" \
-    "SELECT toUnixTimestamp64Nano(time),hex(stream),hex(log) FROM benchmark.logs WHERE hasToken(log, 'shardlogtermthatdoesnotexist') ORDER BY time DESC LIMIT 100"
+    "SELECT toUnixTimestamp64Nano(time),hex(stream),hex(log) FROM benchmark.logs WHERE hasToken(log, 'shardtelemetrytermthatdoesnotexist') ORDER BY time DESC LIMIT 100" \
+    "SELECT toUnixTimestamp64Nano(time),hex(stream),hex(log) FROM benchmark.logs WHERE hasTokenCaseInsensitive(log, 'shardtelemetrytermthatdoesnotexist') ORDER BY time DESC LIMIT 100" \
+    "SELECT toUnixTimestamp64Nano(time),hex(stream),hex(log) FROM benchmark.logs WHERE hasToken(log, 'shardtelemetrytermthatdoesnotexist') ORDER BY time DESC LIMIT 100"
 
 docker exec "$CH_CONTAINER" clickhouse-client --query 'SYSTEM FLUSH LOGS'
 docker exec "$CH_CONTAINER" clickhouse-client --query "
@@ -404,14 +404,14 @@ FORMAT TSVWithNames
 
 {
     printf 'engine\trecords\tcomplete_line_source_bytes\taccepted_source_bytes\trejected_records\tstored_bytes\tingest_seconds\tingest_mib_s\n'
-    SHARD_STORED=$(awk -F': ' '$1 == "durable pack plus manifest" { split($2, value, " "); print value[1] }' "$RUN_DIR/shard-log-report.txt")
-    SHARD_SECONDS=$(awk -F= '$1 == "wall_seconds" { print $2 }' "$RUN_DIR/shard-log-ingest-time.txt")
+    SHARD_STORED=$(awk -F': ' '$1 == "durable pack plus manifest" { split($2, value, " "); print value[1] }' "$RUN_DIR/shard-telemetry-report.txt")
+    SHARD_SECONDS=$(awk -F= '$1 == "wall_seconds" { print $2 }' "$RUN_DIR/shard-telemetry-ingest-time.txt")
     CH_STORED=$(awk -F'\t' 'NR == 2 { print $2 }' "$RUN_DIR/clickhouse-parts.tsv")
     CH_SECONDS=$(awk -F= '$1 == "wall_seconds" { print $2 }' "$RUN_DIR/clickhouse-ingest-time.txt")
     awk -v records="$SHARD_RECORDS" -v source="$COMPLETE_LINE_SOURCE_BYTES" \
         -v accepted="$SHARD_ACCEPTED_SOURCE_BYTES" -v rejected="$SHARD_REJECTED" \
         -v stored="$SHARD_STORED" -v seconds="$SHARD_SECONDS" \
-        'BEGIN { printf "ShardLog\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.6f\t%.2f\n", records, source, accepted, rejected, stored, seconds, source / 1048576 / seconds }'
+        'BEGIN { printf "ShardTelemetry\t%.0f\t%.0f\t%.0f\t%.0f\t%.0f\t%.6f\t%.2f\n", records, source, accepted, rejected, stored, seconds, source / 1048576 / seconds }'
     awk -v records="$CH_RECORDS" -v source="$COMPLETE_LINE_SOURCE_BYTES" \
         -v accepted="$SHARD_ACCEPTED_SOURCE_BYTES" -v rejected="$SHARD_REJECTED" \
         -v stored="$CH_STORED" -v seconds="$CH_SECONDS" \

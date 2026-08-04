@@ -5,18 +5,18 @@
 namespace DB
 {
 
-/// ClickHouse storage adapter for ShardLog's authenticated Arrow scan API.
+/// ClickHouse storage adapter for ShardTelemetry's authenticated Arrow scan API.
 ///
 /// The adapter deliberately inherits StorageURL so ClickHouse remains
 /// responsible for Arrow decoding and all residual query evaluation. The only
 /// specialization is translating proven-safe parts of the analyzed filter DAG
-/// into ShardLog scan parameters.
-class StorageShardLog final : public StorageURL
+/// into ShardTelemetry scan parameters.
+class StorageShardTelemetry final : public StorageURL
 {
 public:
     using StorageURL::StorageURL;
 
-    String getName() const override { return "ShardLog"; }
+    String getName() const override { return "ShardTelemetry"; }
 
 protected:
     std::vector<std::pair<std::string, std::string>> getReadURIParams(
@@ -28,6 +28,6 @@ protected:
         size_t max_block_size) const override;
 };
 
-void registerStorageShardLog(StorageFactory & factory);
+void registerStorageShardTelemetry(StorageFactory & factory);
 
 }

@@ -1,0 +1,874 @@
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use promql_parser::label::{MatchOp, Matcher};
+use promql_parser::parser::{
+    AggregateExpr, AtModifier, BinaryExpr, Call, Expr, LabelModifier, MatrixSelector, Offset,
+    VectorSelector, parse,
+};
+
+use crate::{
+    DurableLokiStore, DurableMetricPoint, MetricQuery, MetricValue, NumberValue,
+    prometheus_string_labels,
+};
+
+const DEFAULT_LOOKBACK: Duration = Duration::from_secs(5 * 60);
+const PROMETHEUS_STALE_NAN_BITS: u64 = 0x7ff0_0000_0000_0002;
+
+/// Limits for one native PromQL evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromqlLimits {
+    /// Maximum raw points materialized from storage.
+    pub max_points: usize,
+    /// Maximum output series.
+    pub max_series: usize,
+    /// Maximum range-query steps.
+    pub max_steps: usize,
+    /// Selector lookback used when a query does not specify a range.
+    pub lookback: Duration,
+}
+
+impl Default for PromqlLimits {
+    fn default() -> Self {
+        Self {
+            max_points: 1_000_000,
+            max_series: 100_000,
+            max_steps: 11_000,
+            lookback: DEFAULT_LOOKBACK,
+        }
+    }
+}
+
+/// One Prometheus float sample with its complete label set.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromqlSample {
+    /// Prometheus-visible labels, including `__name__` when retained.
+    pub labels: BTreeMap<String, String>,
+    /// Evaluation timestamp in milliseconds since the Unix epoch.
+    pub timestamp_ms: i64,
+    /// Floating-point sample value.
+    pub value: f64,
+}
+
+/// One matrix series returned by a range query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PromqlSeries {
+    /// Prometheus-visible labels.
+    pub labels: BTreeMap<String, String>,
+    /// Timestamp/value pairs in evaluation order.
+    pub samples: Vec<(i64, f64)>,
+}
+
+/// Native PromQL result value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PromqlValue {
+    /// Scalar at an evaluation timestamp.
+    Scalar {
+        /// Evaluation timestamp.
+        timestamp_ms: i64,
+        /// Scalar value.
+        value: f64,
+    },
+    /// String at an evaluation timestamp.
+    String {
+        /// Evaluation timestamp.
+        timestamp_ms: i64,
+        /// String value.
+        value: String,
+    },
+    /// Instant vector.
+    Vector(Vec<PromqlSample>),
+    /// Range vector or range-query output.
+    Matrix(Vec<PromqlSeries>),
+}
+
+/// Parse or evaluation error returned through the Prometheus API envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromqlError(String);
+
+impl PromqlError {
+    fn new(message: impl Into<String>) -> Self {
+        Self(message.into())
+    }
+}
+
+impl fmt::Display for PromqlError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for PromqlError {}
+
+/// Rust PromQL evaluator backed by ShardTelemetry metric stripes.
+#[derive(Clone)]
+pub struct PromqlEngine {
+    store: Arc<DurableLokiStore>,
+    tenant: Arc<str>,
+    limits: PromqlLimits,
+}
+
+impl fmt::Debug for PromqlEngine {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PromqlEngine")
+            .field("tenant", &self.tenant)
+            .field("limits", &self.limits)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PromqlEngine {
+    /// Creates a bounded single-tenant evaluator.
+    #[must_use]
+    pub fn new(store: Arc<DurableLokiStore>, tenant: Arc<str>, limits: PromqlLimits) -> Self {
+        Self {
+            store,
+            tenant,
+            limits,
+        }
+    }
+
+    /// Evaluates one PromQL expression at one instant.
+    pub fn query(&self, expression: &str, time_ms: i64) -> Result<PromqlValue, PromqlError> {
+        let expr = parse(expression).map_err(PromqlError::new)?;
+        let context = EvalContext {
+            eval_ms: time_ms,
+            start_ms: time_ms,
+            end_ms: time_ms,
+            lookback: self.limits.lookback,
+        };
+        self.eval(&expr, &context)
+    }
+
+    /// Evaluates one PromQL expression over an inclusive stepped range.
+    pub fn query_range(
+        &self,
+        expression: &str,
+        start_ms: i64,
+        end_ms: i64,
+        step_ms: i64,
+    ) -> Result<PromqlValue, PromqlError> {
+        if step_ms <= 0 || start_ms > end_ms {
+            return Err(PromqlError::new("invalid PromQL query range"));
+        }
+        let steps = ((end_ms - start_ms) / step_ms) as usize + 1;
+        if steps > self.limits.max_steps {
+            return Err(PromqlError::new("PromQL range exceeds the step limit"));
+        }
+        let expr = parse(expression).map_err(PromqlError::new)?;
+        let mut series = BTreeMap::<BTreeMap<String, String>, Vec<(i64, f64)>>::new();
+        for ordinal in 0..steps {
+            let eval_ms = start_ms + i64::try_from(ordinal).unwrap_or(i64::MAX) * step_ms;
+            let value = self.eval(
+                &expr,
+                &EvalContext {
+                    eval_ms,
+                    start_ms,
+                    end_ms,
+                    lookback: self.limits.lookback,
+                },
+            )?;
+            match value {
+                PromqlValue::Scalar { value, .. } => {
+                    series
+                        .entry(BTreeMap::new())
+                        .or_default()
+                        .push((eval_ms, value));
+                }
+                PromqlValue::Vector(samples) => {
+                    for sample in samples {
+                        series
+                            .entry(sample.labels)
+                            .or_default()
+                            .push((eval_ms, sample.value));
+                    }
+                }
+                PromqlValue::Matrix(_) | PromqlValue::String { .. } => {
+                    return Err(PromqlError::new(
+                        "range query expression must return a scalar or instant vector",
+                    ));
+                }
+            }
+        }
+        Ok(PromqlValue::Matrix(
+            series
+                .into_iter()
+                .map(|(labels, samples)| PromqlSeries { labels, samples })
+                .collect(),
+        ))
+    }
+
+    fn eval(&self, expr: &Expr, context: &EvalContext) -> Result<PromqlValue, PromqlError> {
+        match expr {
+            Expr::NumberLiteral(value) => Ok(PromqlValue::Scalar {
+                timestamp_ms: context.eval_ms,
+                value: value.val,
+            }),
+            Expr::StringLiteral(value) => Ok(PromqlValue::String {
+                timestamp_ms: context.eval_ms,
+                value: value.val.clone(),
+            }),
+            Expr::VectorSelector(selector) => self.select_vector(selector, context),
+            Expr::MatrixSelector(selector) => self.select_matrix(selector, context),
+            Expr::Paren(paren) => self.eval(&paren.expr, context),
+            Expr::Unary(unary) => negate(self.eval(&unary.expr, context)?),
+            Expr::Aggregate(aggregate) => self.aggregate(aggregate, context),
+            Expr::Binary(binary) => self.binary(binary, context),
+            Expr::Call(call) => self.call(call, context),
+            Expr::Subquery(_) => Err(PromqlError::new(
+                "subquery execution is not enabled until its compatibility gate passes",
+            )),
+            Expr::Extension(_) => Err(PromqlError::new("unsupported PromQL extension node")),
+        }
+    }
+
+    fn select_vector(
+        &self,
+        selector: &VectorSelector,
+        context: &EvalContext,
+    ) -> Result<PromqlValue, PromqlError> {
+        let eval_ms = selector_time(selector, context)?;
+        let lookback_ms = i64::try_from(context.lookback.as_millis()).unwrap_or(i64::MAX);
+        let points = self.scan_selector(selector, eval_ms.saturating_sub(lookback_ms), eval_ms)?;
+        let mut latest = BTreeMap::<BTreeMap<String, String>, DurableMetricPoint>::new();
+        for point in points {
+            let labels = point_labels(&point);
+            if !selector_matches(selector, &labels) {
+                continue;
+            }
+            let replace = latest.get(&labels).is_none_or(|prior| {
+                (point.timestamp_unix_nanos, point.record_ref.offset)
+                    > (prior.timestamp_unix_nanos, prior.record_ref.offset)
+            });
+            if replace {
+                latest.insert(labels, point);
+            }
+        }
+        let mut samples = Vec::with_capacity(latest.len());
+        for (labels, point) in latest {
+            if let Some(value) = point_float(&point) {
+                if value.to_bits() == PROMETHEUS_STALE_NAN_BITS {
+                    continue;
+                }
+                samples.push(PromqlSample {
+                    labels,
+                    timestamp_ms: eval_ms,
+                    value,
+                });
+            }
+        }
+        self.bound_vector(samples).map(PromqlValue::Vector)
+    }
+
+    fn select_matrix(
+        &self,
+        selector: &MatrixSelector,
+        context: &EvalContext,
+    ) -> Result<PromqlValue, PromqlError> {
+        let eval_ms = selector_time(&selector.vs, context)?;
+        let range_ms = i64::try_from(selector.range.as_millis()).unwrap_or(i64::MAX);
+        let start_ms = eval_ms.saturating_sub(range_ms);
+        let points = self.scan_selector(&selector.vs, start_ms, eval_ms)?;
+        let mut series = BTreeMap::<BTreeMap<String, String>, Vec<(i64, f64)>>::new();
+        for point in points {
+            let labels = point_labels(&point);
+            let timestamp_ms = nanos_to_millis(point.timestamp_unix_nanos)?;
+            if timestamp_ms <= start_ms || !selector_matches(&selector.vs, &labels) {
+                continue;
+            }
+            if let Some(value) = point_float(&point)
+                && value.to_bits() != PROMETHEUS_STALE_NAN_BITS
+            {
+                series
+                    .entry(labels)
+                    .or_default()
+                    .push((timestamp_ms, value));
+            }
+        }
+        if series.len() > self.limits.max_series {
+            return Err(PromqlError::new("PromQL series limit exceeded"));
+        }
+        Ok(PromqlValue::Matrix(
+            series
+                .into_iter()
+                .map(|(labels, mut samples)| {
+                    samples.sort_unstable_by_key(|(timestamp, _)| *timestamp);
+                    PromqlSeries { labels, samples }
+                })
+                .collect(),
+        ))
+    }
+
+    fn scan_selector(
+        &self,
+        selector: &VectorSelector,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<DurableMetricPoint>, PromqlError> {
+        if start_ms < 0 || end_ms < 0 {
+            return Err(PromqlError::new(
+                "pre-epoch metric timestamps are outside the current storage epoch",
+            ));
+        }
+        let name = selector_name(selector);
+        let exact_labels = selector
+            .matchers
+            .matchers
+            .iter()
+            .filter_map(|matcher| match matcher.op {
+                MatchOp::Equal if matcher.name != "__name__" => Some((
+                    Arc::<str>::from(matcher.name.as_str()),
+                    Arc::<str>::from(matcher.value.as_str()),
+                )),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        self.store
+            .query_metrics(&MetricQuery {
+                tenant: Arc::clone(&self.tenant),
+                series: None,
+                name: name.map(Arc::from),
+                exact_labels: Arc::new(exact_labels),
+                start_time_unix_nanos: Some(millis_to_nanos(start_ms)?),
+                end_time_unix_nanos: Some(millis_to_nanos(end_ms)?),
+                limit: self.limits.max_points,
+            })
+            .map_err(|error| PromqlError::new(error.to_string()))
+    }
+
+    fn aggregate(
+        &self,
+        aggregate: &AggregateExpr,
+        context: &EvalContext,
+    ) -> Result<PromqlValue, PromqlError> {
+        let PromqlValue::Vector(samples) = self.eval(&aggregate.expr, context)? else {
+            return Err(PromqlError::new("aggregation requires an instant vector"));
+        };
+        let mut groups = BTreeMap::<BTreeMap<String, String>, Vec<f64>>::new();
+        for sample in samples {
+            let labels = grouped_labels(sample.labels, aggregate.modifier.as_ref());
+            groups.entry(labels).or_default().push(sample.value);
+        }
+        let operation = aggregate.op.to_string();
+        let mut output = Vec::with_capacity(groups.len());
+        for (labels, values) in groups {
+            let value = match operation.as_str() {
+                "sum" => values.iter().sum(),
+                "avg" => values.iter().sum::<f64>() / values.len() as f64,
+                "count" => values.len() as f64,
+                "group" => 1.0,
+                "min" => values.iter().copied().reduce(f64::min).unwrap_or(f64::NAN),
+                "max" => values.iter().copied().reduce(f64::max).unwrap_or(f64::NAN),
+                "stddev" => variance(&values).sqrt(),
+                "stdvar" => variance(&values),
+                _ => {
+                    return Err(PromqlError::new(format!(
+                        "PromQL aggregator {operation} is not enabled"
+                    )));
+                }
+            };
+            output.push(PromqlSample {
+                labels,
+                timestamp_ms: context.eval_ms,
+                value,
+            });
+        }
+        self.bound_vector(output).map(PromqlValue::Vector)
+    }
+
+    fn binary(
+        &self,
+        binary: &BinaryExpr,
+        context: &EvalContext,
+    ) -> Result<PromqlValue, PromqlError> {
+        let left = self.eval(&binary.lhs, context)?;
+        let right = self.eval(&binary.rhs, context)?;
+        let op = binary.op.to_string();
+        match (left, right) {
+            (
+                PromqlValue::Scalar {
+                    timestamp_ms,
+                    value: left,
+                },
+                PromqlValue::Scalar { value: right, .. },
+            ) => Ok(PromqlValue::Scalar {
+                timestamp_ms,
+                value: binary_float(&op, left, right, binary.return_bool())?.unwrap_or(f64::NAN),
+            }),
+            (PromqlValue::Vector(samples), PromqlValue::Scalar { value, .. }) => self
+                .bound_vector(binary_vector_scalar(
+                    samples,
+                    value,
+                    &op,
+                    false,
+                    binary.return_bool(),
+                )?)
+                .map(PromqlValue::Vector),
+            (PromqlValue::Scalar { value, .. }, PromqlValue::Vector(samples)) => self
+                .bound_vector(binary_vector_scalar(
+                    samples,
+                    value,
+                    &op,
+                    true,
+                    binary.return_bool(),
+                )?)
+                .map(PromqlValue::Vector),
+            (PromqlValue::Vector(left), PromqlValue::Vector(right)) => {
+                let mut right_by_key = HashMap::new();
+                for sample in right {
+                    right_by_key.insert(match_key(&sample.labels, binary), sample.value);
+                }
+                let mut output = Vec::new();
+                for mut sample in left {
+                    if let Some(right) = right_by_key.get(&match_key(&sample.labels, binary))
+                        && let Some(value) =
+                            binary_float(&op, sample.value, *right, binary.return_bool())?
+                    {
+                        sample.value = value;
+                        if !binary.op.is_comparison_operator() {
+                            sample.labels.remove("__name__");
+                        }
+                        output.push(sample);
+                    }
+                }
+                self.bound_vector(output).map(PromqlValue::Vector)
+            }
+            _ => Err(PromqlError::new("unsupported PromQL binary operand types")),
+        }
+    }
+
+    fn call(&self, call: &Call, context: &EvalContext) -> Result<PromqlValue, PromqlError> {
+        match call.func.name {
+            "time" => Ok(PromqlValue::Scalar {
+                timestamp_ms: context.eval_ms,
+                value: context.eval_ms as f64 / 1_000.0,
+            }),
+            "vector" => {
+                let value = self.eval(call_arg(call, 0)?, context)?;
+                let PromqlValue::Scalar { value, .. } = value else {
+                    return Err(PromqlError::new("vector() requires a scalar"));
+                };
+                Ok(PromqlValue::Vector(vec![PromqlSample {
+                    labels: BTreeMap::new(),
+                    timestamp_ms: context.eval_ms,
+                    value,
+                }]))
+            }
+            "scalar" => {
+                let value = self.eval(call_arg(call, 0)?, context)?;
+                let PromqlValue::Vector(samples) = value else {
+                    return Err(PromqlError::new("scalar() requires an instant vector"));
+                };
+                Ok(PromqlValue::Scalar {
+                    timestamp_ms: context.eval_ms,
+                    value: if samples.len() == 1 {
+                        samples[0].value
+                    } else {
+                        f64::NAN
+                    },
+                })
+            }
+            "rate" | "irate" | "increase" | "delta" | "idelta" | "changes" | "resets"
+            | "sum_over_time" | "avg_over_time" | "min_over_time" | "max_over_time"
+            | "count_over_time" | "last_over_time" | "present_over_time" => {
+                let value = self.eval(call_arg(call, 0)?, context)?;
+                let PromqlValue::Matrix(series) = value else {
+                    return Err(PromqlError::new(format!(
+                        "{}() requires a range vector",
+                        call.func.name
+                    )));
+                };
+                self.range_function(call.func.name, series, context)
+            }
+            name if is_unary_math(name) => {
+                let value = self.eval(call_arg(call, 0)?, context)?;
+                map_vector(value, context.eval_ms, |value| unary_math(name, value))
+            }
+            name => Err(PromqlError::new(format!(
+                "PromQL function {name} is not enabled"
+            ))),
+        }
+    }
+
+    fn range_function(
+        &self,
+        function: &str,
+        series: Vec<PromqlSeries>,
+        context: &EvalContext,
+    ) -> Result<PromqlValue, PromqlError> {
+        let mut output = Vec::new();
+        for series in series {
+            let values = series
+                .samples
+                .iter()
+                .map(|(_, value)| *value)
+                .collect::<Vec<_>>();
+            let value = match function {
+                "sum_over_time" => values.iter().sum(),
+                "avg_over_time" => values.iter().sum::<f64>() / values.len() as f64,
+                "min_over_time" => values.iter().copied().reduce(f64::min).unwrap_or(f64::NAN),
+                "max_over_time" => values.iter().copied().reduce(f64::max).unwrap_or(f64::NAN),
+                "count_over_time" => values.len() as f64,
+                "last_over_time" => *values.last().unwrap_or(&f64::NAN),
+                "present_over_time" => f64::from(!values.is_empty()),
+                "changes" => values.windows(2).filter(|pair| pair[0] != pair[1]).count() as f64,
+                "resets" => values.windows(2).filter(|pair| pair[1] < pair[0]).count() as f64,
+                "delta" => delta(&series.samples, false),
+                "idelta" => delta(&series.samples, true),
+                "rate" => counter_rate(&series.samples, false),
+                "irate" => counter_rate(&series.samples, true),
+                "increase" => {
+                    let duration = series
+                        .samples
+                        .last()
+                        .zip(series.samples.first())
+                        .map_or(0.0, |(last, first)| (last.0 - first.0) as f64 / 1_000.0);
+                    counter_rate(&series.samples, false) * duration
+                }
+                _ => unreachable!("range function was matched by caller"),
+            };
+            output.push(PromqlSample {
+                labels: series.labels,
+                timestamp_ms: context.eval_ms,
+                value,
+            });
+        }
+        self.bound_vector(output).map(PromqlValue::Vector)
+    }
+
+    fn bound_vector(&self, samples: Vec<PromqlSample>) -> Result<Vec<PromqlSample>, PromqlError> {
+        if samples.len() > self.limits.max_series {
+            Err(PromqlError::new("PromQL series limit exceeded"))
+        } else {
+            Ok(samples)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EvalContext {
+    eval_ms: i64,
+    start_ms: i64,
+    end_ms: i64,
+    lookback: Duration,
+}
+
+fn selector_name(selector: &VectorSelector) -> Option<&str> {
+    selector.name.as_deref().or_else(|| {
+        selector
+            .matchers
+            .matchers
+            .iter()
+            .find(|matcher| matcher.name == "__name__" && matches!(matcher.op, MatchOp::Equal))
+            .map(|matcher| matcher.value.as_str())
+    })
+}
+
+fn selector_matches(selector: &VectorSelector, labels: &BTreeMap<String, String>) -> bool {
+    let base = matcher_group_matches(&selector.matchers.matchers, labels);
+    if selector.matchers.or_matchers.is_empty() {
+        base
+    } else {
+        base && selector
+            .matchers
+            .or_matchers
+            .iter()
+            .any(|group| matcher_group_matches(group, labels))
+    }
+}
+
+fn matcher_group_matches(matchers: &[Matcher], labels: &BTreeMap<String, String>) -> bool {
+    matchers
+        .iter()
+        .all(|matcher| matcher.is_match(labels.get(&matcher.name).map_or("", String::as_str)))
+}
+
+fn selector_time(selector: &VectorSelector, context: &EvalContext) -> Result<i64, PromqlError> {
+    let at = match selector.at.as_ref() {
+        None => context.eval_ms,
+        Some(AtModifier::Start) => context.start_ms,
+        Some(AtModifier::End) => context.end_ms,
+        Some(AtModifier::At(time)) => system_time_millis(*time)?,
+    };
+    let offset = match selector.offset.as_ref() {
+        None => 0,
+        Some(Offset::Pos(duration)) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
+        Some(Offset::Neg(duration)) => -i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
+    };
+    at.checked_sub(offset)
+        .ok_or_else(|| PromqlError::new("PromQL selector timestamp overflow"))
+}
+
+fn system_time_millis(time: SystemTime) -> Result<i64, PromqlError> {
+    match time.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_millis())
+            .map_err(|_| PromqlError::new("PromQL @ timestamp exceeds i64")),
+        Err(error) => i64::try_from(error.duration().as_millis())
+            .map(|value| -value)
+            .map_err(|_| PromqlError::new("PromQL @ timestamp precedes i64")),
+    }
+}
+
+fn point_labels(point: &DurableMetricPoint) -> BTreeMap<String, String> {
+    let mut labels = prometheus_string_labels(&point.identity)
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect::<BTreeMap<_, _>>();
+    labels.insert("__name__".into(), point.identity.name.to_string());
+    labels
+}
+
+fn point_float(point: &DurableMetricPoint) -> Option<f64> {
+    let value = match point.value {
+        MetricValue::Gauge(value) | MetricValue::Sum(value) => value,
+        MetricValue::ExplicitHistogram(_)
+        | MetricValue::ExponentialHistogram(_)
+        | MetricValue::Summary(_) => return None,
+    };
+    Some(match value {
+        NumberValue::Integer(value) => value as f64,
+        NumberValue::DoubleBits(bits) => f64::from_bits(bits),
+    })
+}
+
+fn grouped_labels(
+    mut labels: BTreeMap<String, String>,
+    modifier: Option<&LabelModifier>,
+) -> BTreeMap<String, String> {
+    labels.remove("__name__");
+    match modifier {
+        None => BTreeMap::new(),
+        Some(LabelModifier::Include(included)) => labels
+            .into_iter()
+            .filter(|(name, _)| included.labels.contains(name))
+            .collect(),
+        Some(LabelModifier::Exclude(excluded)) => labels
+            .into_iter()
+            .filter(|(name, _)| !excluded.labels.contains(name))
+            .collect(),
+    }
+}
+
+fn match_key(labels: &BTreeMap<String, String>, binary: &BinaryExpr) -> Vec<(String, String)> {
+    let mut labels = labels
+        .iter()
+        .filter(|(name, _)| name.as_str() != "__name__")
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Vec<_>>();
+    if let Some(modifier) = &binary.modifier
+        && let Some(matching) = &modifier.matching
+    {
+        match matching {
+            LabelModifier::Include(included) => {
+                labels.retain(|(name, _)| included.labels.contains(name));
+            }
+            LabelModifier::Exclude(excluded) => {
+                labels.retain(|(name, _)| !excluded.labels.contains(name));
+            }
+        }
+    }
+    labels
+}
+
+fn binary_vector_scalar(
+    samples: Vec<PromqlSample>,
+    scalar: f64,
+    operation: &str,
+    scalar_left: bool,
+    return_bool: bool,
+) -> Result<Vec<PromqlSample>, PromqlError> {
+    let mut output = Vec::new();
+    for mut sample in samples {
+        let (left, right) = if scalar_left {
+            (scalar, sample.value)
+        } else {
+            (sample.value, scalar)
+        };
+        if let Some(value) = binary_float(operation, left, right, return_bool)? {
+            sample.value = value;
+            output.push(sample);
+        }
+    }
+    Ok(output)
+}
+
+fn binary_float(
+    operation: &str,
+    left: f64,
+    right: f64,
+    return_bool: bool,
+) -> Result<Option<f64>, PromqlError> {
+    let comparison = match operation {
+        "==" => Some(left == right),
+        "!=" => Some(left != right),
+        ">" => Some(left > right),
+        ">=" => Some(left >= right),
+        "<" => Some(left < right),
+        "<=" => Some(left <= right),
+        _ => None,
+    };
+    if let Some(matches) = comparison {
+        return Ok(if return_bool {
+            Some(f64::from(matches))
+        } else if matches {
+            Some(left)
+        } else {
+            None
+        });
+    }
+    Ok(Some(match operation {
+        "+" => left + right,
+        "-" => left - right,
+        "*" => left * right,
+        "/" => left / right,
+        "%" => left % right,
+        "^" => left.powf(right),
+        "atan2" => left.atan2(right),
+        _ => {
+            return Err(PromqlError::new(format!(
+                "unsupported binary operator {operation}"
+            )));
+        }
+    }))
+}
+
+fn negate(value: PromqlValue) -> Result<PromqlValue, PromqlError> {
+    map_vector(value, 0, |value| -value)
+}
+
+fn map_vector(
+    value: PromqlValue,
+    timestamp_ms: i64,
+    function: impl Fn(f64) -> f64,
+) -> Result<PromqlValue, PromqlError> {
+    match value {
+        PromqlValue::Scalar {
+            timestamp_ms: observed,
+            value,
+        } => Ok(PromqlValue::Scalar {
+            timestamp_ms: observed,
+            value: function(value),
+        }),
+        PromqlValue::Vector(mut samples) => {
+            for sample in &mut samples {
+                sample.timestamp_ms = if timestamp_ms == 0 {
+                    sample.timestamp_ms
+                } else {
+                    timestamp_ms
+                };
+                sample.value = function(sample.value);
+            }
+            Ok(PromqlValue::Vector(samples))
+        }
+        _ => Err(PromqlError::new(
+            "function requires a scalar or instant vector",
+        )),
+    }
+}
+
+fn is_unary_math(name: &str) -> bool {
+    matches!(
+        name,
+        "abs" | "ceil" | "floor" | "exp" | "ln" | "log2" | "log10" | "sqrt" | "sgn"
+    )
+}
+
+fn unary_math(name: &str, value: f64) -> f64 {
+    match name {
+        "abs" => value.abs(),
+        "ceil" => value.ceil(),
+        "floor" => value.floor(),
+        "exp" => value.exp(),
+        "ln" => value.ln(),
+        "log2" => value.log2(),
+        "log10" => value.log10(),
+        "sqrt" => value.sqrt(),
+        "sgn" => value.signum(),
+        _ => unreachable!("name was checked by is_unary_math"),
+    }
+}
+
+fn call_arg(call: &Call, index: usize) -> Result<&Expr, PromqlError> {
+    call.args.args.get(index).map(Box::as_ref).ok_or_else(|| {
+        PromqlError::new(format!("{}() is missing argument {index}", call.func.name))
+    })
+}
+
+fn variance(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    values
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / values.len() as f64
+}
+
+fn delta(samples: &[(i64, f64)], instant: bool) -> f64 {
+    let samples = if instant && samples.len() > 2 {
+        &samples[samples.len() - 2..]
+    } else {
+        samples
+    };
+    samples
+        .last()
+        .zip(samples.first())
+        .map_or(f64::NAN, |(last, first)| last.1 - first.1)
+}
+
+fn counter_rate(samples: &[(i64, f64)], instant: bool) -> f64 {
+    let samples = if instant && samples.len() > 2 {
+        &samples[samples.len() - 2..]
+    } else {
+        samples
+    };
+    if samples.len() < 2 {
+        return f64::NAN;
+    }
+    let mut increase = 0.0;
+    for pair in samples.windows(2) {
+        increase += if pair[1].1 < pair[0].1 {
+            pair[1].1
+        } else {
+            pair[1].1 - pair[0].1
+        };
+    }
+    let seconds = (samples.last().unwrap().0 - samples.first().unwrap().0) as f64 / 1_000.0;
+    increase / seconds
+}
+
+fn millis_to_nanos(milliseconds: i64) -> Result<u64, PromqlError> {
+    u64::try_from(milliseconds)
+        .ok()
+        .and_then(|value| value.checked_mul(1_000_000))
+        .ok_or_else(|| PromqlError::new("PromQL timestamp is outside the storage range"))
+}
+
+fn nanos_to_millis(nanoseconds: u64) -> Result<i64, PromqlError> {
+    i64::try_from(nanoseconds / 1_000_000)
+        .map_err(|_| PromqlError::new("metric timestamp exceeds PromQL range"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn comparisons_filter_unless_bool_is_requested() {
+        assert_eq!(binary_float(">", 2.0, 1.0, false).unwrap(), Some(2.0));
+        assert_eq!(binary_float(">", 0.0, 1.0, false).unwrap(), None);
+        assert_eq!(binary_float(">", 0.0, 1.0, true).unwrap(), Some(0.0));
+    }
+
+    #[test]
+    fn counter_rate_accounts_for_resets() {
+        let samples = vec![(0, 8.0), (1_000, 10.0), (2_000, 2.0), (3_000, 4.0)];
+        assert_eq!(counter_rate(&samples, false), 2.0);
+        assert_eq!(counter_rate(&samples, true), 2.0);
+    }
+}

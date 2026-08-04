@@ -4,12 +4,12 @@ use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use shard_log::{
-    CompressionBlockCollator, CompressionCohortId, CompressionLocalityConfig,
-    CompressionLocalityRecord, CompressionPlacementId, DurableLogRecord, LogStripe,
-    MessageFingerprint, StripeConfig, fingerprint_message,
-};
 use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicId, TopicPartition};
+use shard_telemetry::{
+    CompressionBlockCollator, CompressionCohortId, CompressionLocalityConfig,
+    CompressionLocalityRecord, CompressionPlacementId, DurableLog, LogStripe, MessageFingerprint,
+    StripeConfig, fingerprint_message,
+};
 
 const DEFAULT_ITERATIONS: usize = 1_000_000;
 const DEFAULT_SEAL_RECORDS: usize = 50_000;
@@ -22,7 +22,7 @@ struct Settings {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let settings = parse_settings()?;
-    println!("shard-log compression-locality microbenchmark");
+    println!("shard-telemetry compression-locality microbenchmark");
     println!("iterations: {}", settings.iterations);
     benchmark_fingerprints(settings.iterations);
     benchmark_routes(settings.iterations);
@@ -230,7 +230,7 @@ fn benchmark_seals(record_count: usize) -> Result<(), Box<dyn Error>> {
             stripe.begin_append_batch()?;
         }
         let apply_started = Instant::now();
-        let receipt = stripe.apply_durable(DurableLogRecord::new(
+        let receipt = stripe.apply_durable(DurableLog::new(
             ShardId::new(0),
             topic_partition,
             LogicalOffset::new(u64::try_from(index)?),

@@ -4,9 +4,9 @@ set -euo pipefail
 SOURCE=${SOURCE:-/home/dtietjen/log-compression-samples/clickhouse-docker-json-error-loop-tail-80g-20260729.log}
 EXPECTED_SHA256=${EXPECTED_SHA256:-4fd6379bd89fcb44688a3ebd611729416c82f110fbf49ffef905d9df0ebf0508}
 EXPECTED_FILE_BYTES=${EXPECTED_FILE_BYTES:-85899345920}
-SHARD_LOG_BIN=${SHARD_LOG_BIN:-/home/dtietjen/shard-log-target-20260729/release/shard-log-structural-bench}
-SHARD_LOG_VARIANTS_FILE=${SHARD_LOG_VARIANTS_FILE:-}
-RESULT_ROOT=${RESULT_ROOT:-/home/dtietjen/shard-log-head-to-head}
+SHARD_TELEMETRY_BIN=${SHARD_TELEMETRY_BIN:-/home/dtietjen/shard-telemetry-target-20260729/release/shard-telemetry-structural-bench}
+SHARD_TELEMETRY_VARIANTS_FILE=${SHARD_TELEMETRY_VARIANTS_FILE:-}
+RESULT_ROOT=${RESULT_ROOT:-/home/dtietjen/shard-telemetry-head-to-head}
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}
 CORE_COUNT=${CORE_COUNT:-16}
 BLOCK_BYTES=${BLOCK_BYTES:-8MiB}
@@ -42,7 +42,7 @@ add_variant() {
         exit 2
     }
     [[ -x $binary ]] || {
-        echo "ShardLog variant binary is not executable: $binary" >&2
+        echo "ShardTelemetry variant binary is not executable: $binary" >&2
         exit 2
     }
     SEEN_VARIANT_SLUGS[$slug]=1
@@ -52,9 +52,9 @@ add_variant() {
     VARIANT_MODES+=("$mode")
 }
 
-if [[ -n $SHARD_LOG_VARIANTS_FILE ]]; then
-    [[ -f $SHARD_LOG_VARIANTS_FILE ]] || {
-        echo "variant manifest does not exist: $SHARD_LOG_VARIANTS_FILE" >&2
+if [[ -n $SHARD_TELEMETRY_VARIANTS_FILE ]]; then
+    [[ -f $SHARD_TELEMETRY_VARIANTS_FILE ]] || {
+        echo "variant manifest does not exist: $SHARD_TELEMETRY_VARIANTS_FILE" >&2
         exit 2
     }
     while IFS=$'\t' read -r label slug binary mode extra; do
@@ -64,10 +64,10 @@ if [[ -n $SHARD_LOG_VARIANTS_FILE ]]; then
             exit 2
         }
         add_variant "$label" "$slug" "$binary" "$mode"
-    done <"$SHARD_LOG_VARIANTS_FILE"
+    done <"$SHARD_TELEMETRY_VARIANTS_FILE"
 else
-    add_variant ShardLog-disabled disabled "$SHARD_LOG_BIN" disabled
-    add_variant ShardLog-enabled enabled "$SHARD_LOG_BIN" enabled
+    add_variant ShardTelemetry-disabled disabled "$SHARD_TELEMETRY_BIN" disabled
+    add_variant ShardTelemetry-enabled enabled "$SHARD_TELEMETRY_BIN" enabled
 fi
 [[ ${#VARIANT_LABELS[@]} -gt 0 ]] || {
     echo "variant manifest contains no benchmark variants" >&2
@@ -114,7 +114,7 @@ RUN_DIR=$RESULT_ROOT/$RUN_ID
 mkdir -p "$RUN_DIR"
 exec > >(tee "$RUN_DIR/harness.log") 2>&1
 
-CH_CONTAINER="shard-log-ch-${RUN_ID//[^a-zA-Z0-9_.-]/-}"
+CH_CONTAINER="shard-telemetry-ch-${RUN_ID//[^a-zA-Z0-9_.-]/-}"
 CH_STARTED=0
 cleanup() {
     if [[ $CH_STARTED -eq 1 ]]; then
@@ -151,7 +151,7 @@ fi
     echo "clickhouse_container_uid_gid=$CONTAINER_UID:$CONTAINER_GID"
     echo "core_count=$CORE_COUNT"
     echo "block_bytes=$BLOCK_BYTES"
-    echo "shard_log_variant_count=${#VARIANT_LABELS[@]}"
+    echo "shard_telemetry_variant_count=${#VARIANT_LABELS[@]}"
     for index in "${!VARIANT_LABELS[@]}"; do
         echo "variant_${index}_label=${VARIANT_LABELS[$index]}"
         echo "variant_${index}_slug=${VARIANT_SLUGS[$index]}"
@@ -177,7 +177,7 @@ prewarm_source() {
         'BEGIN { printf "%s source prewarm: %.6f seconds\n", engine, elapsed_ns / 1000000000 }'
 }
 
-run_shard_log() {
+run_shard_telemetry() {
     local mode=$1
     local label=$2
     local slug=$3
@@ -186,34 +186,34 @@ run_shard_log() {
     prewarm_source "$label"
     echo "$label: ingesting on CPUs $CPU_SET"
     /usr/bin/time -f 'wall_seconds=%e\nuser_seconds=%U\nsystem_seconds=%S\nmax_rss_kib=%M' \
-        -o "$RUN_DIR/shard-log-${slug}-time.txt" \
+        -o "$RUN_DIR/shard-telemetry-${slug}-time.txt" \
         taskset -c "$CPU_SET" "$binary" "$SOURCE" \
         --limit-bytes "$SOURCE_BYTES" \
         --block-bytes "$BLOCK_BYTES" \
         --workers "$CORE_COUNT" \
         --locality "$mode" \
-        --output-dir "$RUN_DIR/shard-log-${slug}-packs" \
-        --report "$RUN_DIR/shard-log-${slug}-report.txt"
+        --output-dir "$RUN_DIR/shard-telemetry-${slug}-packs" \
+        --report "$RUN_DIR/shard-telemetry-${slug}-report.txt"
 }
 
 for index in "${!VARIANT_LABELS[@]}"; do
-    run_shard_log \
+    run_shard_telemetry \
         "${VARIANT_MODES[$index]}" \
         "${VARIANT_LABELS[$index]}" \
         "${VARIANT_SLUGS[$index]}" \
         "${VARIANT_BINS[$index]}"
 done
 
-REFERENCE_REPORT=$RUN_DIR/shard-log-${VARIANT_SLUGS[0]}-report.txt
+REFERENCE_REPORT=$RUN_DIR/shard-telemetry-${VARIANT_SLUGS[0]}-report.txt
 SHARD_RECORDS=$(awk -F': ' '$1 == "records" { print $2 }' "$REFERENCE_REPORT")
 SHARD_REJECTED_RECORDS=$(awk -F': ' '$1 == "rejected complete records" { print $2 }' "$REFERENCE_REPORT")
 SHARD_SOURCE_BYTES=$(awk -F': ' '$1 == "source bytes" { print $2 }' "$REFERENCE_REPORT")
 for index in "${!VARIANT_LABELS[@]}"; do
-    report=$RUN_DIR/shard-log-${VARIANT_SLUGS[$index]}-report.txt
+    report=$RUN_DIR/shard-telemetry-${VARIANT_SLUGS[$index]}-report.txt
     variant_records=$(awk -F': ' '$1 == "records" { print $2 }' "$report")
     variant_source_bytes=$(awk -F': ' '$1 == "source bytes" { print $2 }' "$report")
     if [[ $variant_records -ne $SHARD_RECORDS || $variant_source_bytes -ne $SHARD_SOURCE_BYTES ]]; then
-        echo "ShardLog version mismatch: reference=$SHARD_RECORDS/$SHARD_SOURCE_BYTES ${VARIANT_LABELS[$index]}=$variant_records/$variant_source_bytes" >&2
+        echo "ShardTelemetry version mismatch: reference=$SHARD_RECORDS/$SHARD_SOURCE_BYTES ${VARIANT_LABELS[$index]}=$variant_records/$variant_source_bytes" >&2
         exit 1
     fi
 done
@@ -292,14 +292,14 @@ CH_STORED_BYTES=$(awk -F'\t' 'NR == 2 { print $2 }' "$RUN_DIR/clickhouse-parts.t
 CH_ELAPSED=$(awk -F= '$1 == "wall_seconds" { print $2 }' "$RUN_DIR/clickhouse-time.txt")
 
 if [[ $SHARD_RECORDS -ne $CH_RECORDS ]]; then
-    echo "record-count mismatch: ShardLog=$SHARD_RECORDS ClickHouse=$CH_RECORDS" >&2
+    echo "record-count mismatch: ShardTelemetry=$SHARD_RECORDS ClickHouse=$CH_RECORDS" >&2
     exit 1
 fi
 
 {
     printf 'engine\tsource_bytes\trecords\tstored_bytes\telapsed_seconds\tthroughput_mib_s\tcompression_ratio\n'
     for index in "${!VARIANT_LABELS[@]}"; do
-        report=$RUN_DIR/shard-log-${VARIANT_SLUGS[$index]}-report.txt
+        report=$RUN_DIR/shard-telemetry-${VARIANT_SLUGS[$index]}-report.txt
         variant_stored_bytes=$(awk -F': ' '$1 == "durable pack plus manifest" {
             split($2, value, " "); print value[1]
         }' "$report")

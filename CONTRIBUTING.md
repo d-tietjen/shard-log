@@ -1,10 +1,10 @@
-# Contributing to ShardLog
+# Contributing to ShardTelemetry
 
-Thank you for helping improve ShardLog.
+Thank you for helping improve ShardTelemetry.
 
 ## Development
 
-ShardLog uses the Rust toolchain pinned in `rust-toolchain.toml`. A change is
+ShardTelemetry uses the Rust toolchain pinned in `rust-toolchain.toml`. A change is
 ready for review when these commands pass:
 
 ```sh
