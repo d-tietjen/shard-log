@@ -43,6 +43,8 @@ pub struct TraceqlTrace {
     pub root_service_name: Option<Arc<str>>,
     /// Number of error spans.
     pub error_count: u32,
+    /// Fields requested by the final `select(...)` pipeline stage.
+    pub selected_fields: Arc<Vec<String>>,
 }
 
 /// TraceQL parse or execution error.
@@ -100,8 +102,8 @@ impl TraceqlEngine {
         end_time_unix_nanos: Option<u64>,
         limit: usize,
     ) -> Result<Vec<TraceqlTrace>, TraceqlError> {
-        let expression = SpansetExpr::parse(expression)?;
-        let pushed_trace_id = expression.exact_trace_id();
+        let query = TraceqlQuery::parse(expression)?;
+        let pushed_trace_id = query.exact_trace_id();
         let spans = self
             .store
             .query_traces(&TraceQuery {
@@ -118,19 +120,20 @@ impl TraceqlEngine {
             traces.entry(span.trace_id).or_default().push(span);
         }
         let result_limit = limit.max(1).min(self.limits.max_traces);
+        let selected_fields = query.selected_fields();
         let mut results = traces
             .into_iter()
             .filter_map(|(trace_id, mut spans)| {
                 spans.sort_unstable_by_key(|span| {
                     (span.start_time_unix_nanos, span.record_ref.offset)
                 });
-                let selected = expression.evaluate(&spans);
+                let selected = query.evaluate(&spans);
                 (!selected.is_empty()).then(|| {
                     let spans = selected
                         .into_iter()
                         .map(|index| spans[index].clone())
                         .collect();
-                    summarize(trace_id, spans)
+                    summarize(trace_id, spans, Arc::clone(&selected_fields))
                 })
             })
             .collect::<Vec<_>>();
@@ -155,11 +158,15 @@ impl TraceqlEngine {
                 ..TraceQuery::default()
             })
             .map_err(|error| TraceqlError::new(error.to_string()))?;
-        Ok((!spans.is_empty()).then(|| summarize(trace_id, spans)))
+        Ok((!spans.is_empty()).then(|| summarize(trace_id, spans, Arc::default())))
     }
 }
 
-fn summarize(trace_id: TraceId, spans: Vec<DurableSpan>) -> TraceqlTrace {
+fn summarize(
+    trace_id: TraceId,
+    spans: Vec<DurableSpan>,
+    selected_fields: Arc<Vec<String>>,
+) -> TraceqlTrace {
     let start_time_unix_nanos = spans
         .iter()
         .map(|span| span.start_time_unix_nanos)
@@ -188,7 +195,282 @@ fn summarize(trace_id: TraceId, spans: Vec<DurableSpan>) -> TraceqlTrace {
         root_name,
         root_service_name,
         error_count,
+        selected_fields,
     }
+}
+
+#[derive(Debug, Clone)]
+struct TraceqlQuery {
+    spanset: SpansetExpr,
+    pipeline: Vec<PipelineStage>,
+}
+
+impl TraceqlQuery {
+    fn parse(input: &str) -> Result<Self, TraceqlError> {
+        let parts = split_traceql_pipeline(input);
+        let Some((spanset, pipeline)) = parts.split_first() else {
+            return Ok(Self {
+                spanset: SpansetExpr::Selector(TraceFilter::True),
+                pipeline: Vec::new(),
+            });
+        };
+        Ok(Self {
+            spanset: SpansetExpr::parse(spanset)?,
+            pipeline: pipeline
+                .iter()
+                .map(|stage| PipelineStage::parse(stage))
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+
+    fn evaluate(&self, spans: &[DurableSpan]) -> Vec<usize> {
+        let selected = self.spanset.evaluate(spans);
+        if selected.is_empty() {
+            return selected;
+        }
+        let mut groups = vec![selected];
+        for stage in &self.pipeline {
+            groups = stage.apply(groups, spans);
+            if groups.is_empty() {
+                break;
+            }
+        }
+        sorted_unique(groups.into_iter().flatten().collect())
+    }
+
+    fn exact_trace_id(&self) -> Option<TraceId> {
+        self.spanset.exact_trace_id()
+    }
+
+    fn selected_fields(&self) -> Arc<Vec<String>> {
+        Arc::new(
+            self.pipeline
+                .iter()
+                .rev()
+                .find_map(|stage| match stage {
+                    PipelineStage::Select(fields) => Some(fields.clone()),
+                    PipelineStage::By(_) | PipelineStage::Aggregate { .. } => None,
+                })
+                .unwrap_or_default(),
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+enum PipelineStage {
+    By(String),
+    Select(Vec<String>),
+    Aggregate {
+        operation: TraceAggregate,
+        field: Option<String>,
+        comparison: Comparison,
+        expected: Literal,
+    },
+}
+
+impl PipelineStage {
+    fn parse(input: &str) -> Result<Self, TraceqlError> {
+        let input = input.trim();
+        if let Some(field) = input
+            .strip_prefix("by(")
+            .and_then(|value| value.strip_suffix(')'))
+        {
+            let field = field.trim().trim_start_matches('.');
+            if field.is_empty() {
+                return Err(TraceqlError::new("TraceQL by() has an empty field"));
+            }
+            return Ok(Self::By(field.to_owned()));
+        }
+        if let Some(fields) = input
+            .strip_prefix("select(")
+            .and_then(|value| value.strip_suffix(')'))
+        {
+            let fields = split_quoted(fields, ",")
+                .into_iter()
+                .map(|field| field.trim().trim_start_matches('.').to_owned())
+                .filter(|field| !field.is_empty())
+                .collect::<Vec<_>>();
+            if fields.is_empty() {
+                return Err(TraceqlError::new("TraceQL select() has no fields"));
+            }
+            return Ok(Self::Select(fields));
+        }
+        for (token, comparison) in comparison_tokens() {
+            if let Some(index) = find_unquoted(input, token) {
+                let aggregate = input[..index].trim();
+                let open = aggregate
+                    .find('(')
+                    .ok_or_else(|| TraceqlError::new("TraceQL aggregate is missing '('"))?;
+                let field = aggregate[open + 1..]
+                    .strip_suffix(')')
+                    .ok_or_else(|| TraceqlError::new("TraceQL aggregate is missing ')'"))?
+                    .trim()
+                    .trim_start_matches('.');
+                let operation = TraceAggregate::parse(aggregate[..open].trim())?;
+                if operation != TraceAggregate::Count && field.is_empty() {
+                    return Err(TraceqlError::new(
+                        "TraceQL numeric aggregate requires a field",
+                    ));
+                }
+                if operation == TraceAggregate::Count && !field.is_empty() {
+                    return Err(TraceqlError::new("TraceQL count() takes no field"));
+                }
+                return Ok(Self::Aggregate {
+                    operation,
+                    field: (!field.is_empty()).then(|| field.to_owned()),
+                    comparison,
+                    expected: Literal::parse(input[index + token.len()..].trim())?,
+                });
+            }
+        }
+        Err(TraceqlError::new(format!(
+            "unsupported TraceQL pipeline stage {input:?}"
+        )))
+    }
+
+    fn apply(&self, groups: Vec<Vec<usize>>, spans: &[DurableSpan]) -> Vec<Vec<usize>> {
+        match self {
+            Self::By(field) => groups
+                .into_iter()
+                .flat_map(|group| group_by_field(group, spans, field))
+                .collect(),
+            Self::Select(fields) => {
+                let _ = fields;
+                groups
+            }
+            Self::Aggregate {
+                operation,
+                field,
+                comparison,
+                expected,
+            } => groups
+                .into_iter()
+                .filter(|group| {
+                    aggregate_group(*operation, field.as_deref(), group, spans).is_some_and(
+                        |value| compare(&[ObservedValue::Float(value)], expected, *comparison),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraceAggregate {
+    Count,
+    Sum,
+    Average,
+    Minimum,
+    Maximum,
+}
+
+impl TraceAggregate {
+    fn parse(input: &str) -> Result<Self, TraceqlError> {
+        match input {
+            "count" => Ok(Self::Count),
+            "sum" => Ok(Self::Sum),
+            "avg" => Ok(Self::Average),
+            "min" => Ok(Self::Minimum),
+            "max" => Ok(Self::Maximum),
+            _ => Err(TraceqlError::new(format!(
+                "unsupported TraceQL aggregate {input:?}"
+            ))),
+        }
+    }
+}
+
+fn group_by_field(group: Vec<usize>, spans: &[DurableSpan], field: &str) -> Vec<Vec<usize>> {
+    let mut grouped = BTreeMap::<String, Vec<usize>>::new();
+    for index in group {
+        let values = field_values(&spans[index], spans, field);
+        for value in values {
+            grouped
+                .entry(observed_string(&value))
+                .or_default()
+                .push(index);
+        }
+    }
+    grouped
+        .into_values()
+        .map(sorted_unique)
+        .filter(|group| !group.is_empty())
+        .collect()
+}
+
+fn aggregate_group(
+    operation: TraceAggregate,
+    field: Option<&str>,
+    group: &[usize],
+    spans: &[DurableSpan],
+) -> Option<f64> {
+    if operation == TraceAggregate::Count {
+        return Some(group.len() as f64);
+    }
+    let field = field?;
+    let values = group
+        .iter()
+        .flat_map(|index| field_values(&spans[*index], spans, field))
+        .filter_map(|value| numeric_observed(&value))
+        .collect::<Vec<_>>();
+    match operation {
+        TraceAggregate::Count => unreachable!("count returned before field collection"),
+        TraceAggregate::Sum => Some(values.iter().sum()),
+        TraceAggregate::Average => {
+            (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+        }
+        TraceAggregate::Minimum => values.into_iter().reduce(f64::min),
+        TraceAggregate::Maximum => values.into_iter().reduce(f64::max),
+    }
+}
+
+fn split_traceql_pipeline(input: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut braces = 0_u32;
+    let mut parentheses = 0_u32;
+    let bytes = input.as_bytes();
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if quoted && byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            quoted = !quoted;
+        } else if !quoted {
+            match byte {
+                b'{' => braces = braces.saturating_add(1),
+                b'}' => braces = braces.saturating_sub(1),
+                b'(' => parentheses = parentheses.saturating_add(1),
+                b')' => parentheses = parentheses.saturating_sub(1),
+                b'|' if braces == 0
+                    && parentheses == 0
+                    && bytes.get(index.wrapping_sub(1)) != Some(&b'|')
+                    && bytes.get(index + 1) != Some(&b'|') =>
+                {
+                    parts.push(input[start..index].trim());
+                    start = index + 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    parts.push(input[start..].trim());
+    parts
+}
+
+fn comparison_tokens() -> [(&'static str, Comparison); 8] {
+    [
+        ("=~", Comparison::Regex),
+        ("!~", Comparison::NotRegex),
+        (">=", Comparison::GreaterOrEqual),
+        ("<=", Comparison::LessOrEqual),
+        ("!=", Comparison::NotEqual),
+        ("=", Comparison::Equal),
+        (">", Comparison::Greater),
+        ("<", Comparison::Less),
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1083,6 +1365,37 @@ mod tests {
                 .evaluate(&spans)
                 .is_empty(),
             "TraceQL regexes are anchored"
+        );
+    }
+
+    #[test]
+    fn pipeline_groups_and_filters_spansets_with_typed_aggregates() {
+        let spans = vec![
+            span(1, None, "root"),
+            span(2, Some(1), "worker"),
+            span(3, Some(1), "worker"),
+        ];
+        assert_eq!(
+            TraceqlQuery::parse("{} | count() >= 3")
+                .unwrap()
+                .evaluate(&spans),
+            vec![0, 1, 2]
+        );
+        assert!(
+            TraceqlQuery::parse("{} | count() > 3")
+                .unwrap()
+                .evaluate(&spans)
+                .is_empty()
+        );
+        let selected =
+            TraceqlQuery::parse("{} | by(name) | count() >= 2 | select(name, duration)").unwrap();
+        assert_eq!(selected.evaluate(&spans), vec![1, 2]);
+        assert_eq!(selected.selected_fields().as_ref(), &["name", "duration"]);
+        assert_eq!(
+            TraceqlQuery::parse("{} | sum(duration) >= 3ns")
+                .unwrap()
+                .evaluate(&spans),
+            vec![0, 1, 2]
         );
     }
 }

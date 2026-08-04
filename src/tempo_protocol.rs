@@ -214,6 +214,7 @@ mod tests {
             root_name: Some(Arc::from("root")),
             root_service_name: None,
             error_count: 0,
+            selected_fields: Arc::default(),
         });
         let span = &response.trace.unwrap().batches[0].scope_spans[0].spans[0];
         assert_eq!(span.trace_id, [1; 16]);

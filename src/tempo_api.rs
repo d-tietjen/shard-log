@@ -365,7 +365,13 @@ fn tempo_search_success(traces: Vec<TraceqlTrace>) -> Response {
                         "spanID": span.span_id.to_string(),
                         "startTimeUnixNano": span.start_time_unix_nanos.to_string(),
                         "durationNanos": span.duration_nanos.to_string(),
-                        "name": span.name
+                        "name": span.name,
+                        "attributes": trace.selected_fields.iter().filter_map(|field| {
+                            trace_tag_value(span, field).map(|value| json!({
+                                "key": field,
+                                "value": {"stringValue": value}
+                            }))
+                        }).collect::<Vec<_>>()
                     })).collect::<Vec<_>>(),
                     "matched": trace.spans.len()
                 }
