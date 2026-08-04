@@ -226,6 +226,43 @@ pub(crate) mod v1 {
         #[prost(message, repeated, tag = "1")]
         pub timeseries: Vec<TimeSeries>,
     }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub(crate) struct ChunkedReadResponse {
+        #[prost(message, repeated, tag = "1")]
+        pub chunked_series: Vec<ChunkedSeries>,
+        #[prost(int64, tag = "2")]
+        pub query_index: i64,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub(crate) struct ChunkedSeries {
+        #[prost(message, repeated, tag = "1")]
+        pub labels: Vec<Label>,
+        #[prost(message, repeated, tag = "2")]
+        pub chunks: Vec<Chunk>,
+    }
+
+    #[derive(Clone, PartialEq, Message)]
+    pub(crate) struct Chunk {
+        #[prost(int64, tag = "1")]
+        pub min_time_ms: i64,
+        #[prost(int64, tag = "2")]
+        pub max_time_ms: i64,
+        #[prost(enumeration = "ChunkEncoding", tag = "3")]
+        pub r#type: i32,
+        #[prost(bytes = "vec", tag = "4")]
+        pub data: Vec<u8>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Enumeration)]
+    #[repr(i32)]
+    pub(crate) enum ChunkEncoding {
+        Unknown = 0,
+        Xor = 1,
+        Histogram = 2,
+        FloatHistogram = 3,
+    }
 }
 
 pub(crate) mod v2 {

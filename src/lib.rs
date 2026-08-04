@@ -27,6 +27,7 @@ mod otlp_signal;
 mod production;
 mod prometheus_api;
 mod prometheus_protocol;
+mod prometheus_xor;
 mod promql;
 mod query;
 mod query_index;

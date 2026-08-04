@@ -13,6 +13,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::prometheus_protocol::v1 as prometheus_v1;
+use crate::prometheus_xor::encode_xor_chunk;
 use crate::{
     DurableLokiStore, MetricKind, MetricValue, NumberValue, ProductionRuntime, PromqlEngine,
     PromqlLimits, PromqlValue, RemoteWriteDecoder, RemoteWriteStats, RemoteWriteVersion,
@@ -750,15 +751,22 @@ async fn remote_read(
         Ok(request) => request,
         Err(error) => return write_error(StatusCode::BAD_REQUEST, &error.to_string()),
     };
-    let accepts_samples = request.accepted_response_types.is_empty()
-        || request.accepted_response_types.iter().any(|response_type| {
-            *response_type == prometheus_v1::ReadRequestResponseType::Samples as i32
-        });
-    if !accepts_samples {
+    let response_type = if request.accepted_response_types.is_empty() {
+        Some(prometheus_v1::ReadRequestResponseType::Samples)
+    } else {
+        request
+            .accepted_response_types
+            .iter()
+            .find_map(|value| prometheus_v1::ReadRequestResponseType::try_from(*value).ok())
+    };
+    let Some(response_type) = response_type else {
         return write_error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "streamed XOR Remote Read is not enabled until its conformance gate passes",
+            "Remote Read requested no supported response type",
         );
+    };
+    if response_type == prometheus_v1::ReadRequestResponseType::StreamedXorChunks {
+        return remote_read_streamed(service, request).await;
     }
     let engine = PromqlEngine::new(
         Arc::clone(&service.store),
@@ -842,6 +850,152 @@ async fn remote_read(
         compressed,
     )
         .into_response()
+}
+
+async fn remote_read_streamed(
+    service: PrometheusService,
+    request: prometheus_v1::ReadRequest,
+) -> Response {
+    const XOR_SAMPLES_PER_CHUNK: usize = 120;
+    const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+    let engine = PromqlEngine::new(
+        Arc::clone(&service.store),
+        Arc::clone(&service.config.tenant),
+        PromqlLimits::default(),
+    );
+    let result = tokio::task::spawn_blocking(move || {
+        let mut stream = Vec::new();
+        for (query_index, query) in request.queries.into_iter().enumerate() {
+            let selector = remote_read_selector(&query.matchers)?;
+            let points = engine.raw_points(
+                &[selector],
+                query.start_timestamp_ms,
+                query.end_timestamp_ms,
+            )?;
+            let mut series = BTreeMap::<
+                BTreeMap<String, String>,
+                BTreeMap<i64, (shard_stream_core::LogicalOffset, f64)>,
+            >::new();
+            for point in points {
+                let Some(value) = remote_read_float(&point.value) else {
+                    continue;
+                };
+                let timestamp =
+                    i64::try_from(point.timestamp_unix_nanos / 1_000_000).unwrap_or(i64::MAX);
+                let samples = series.entry(metric_labels(&point)).or_default();
+                if samples
+                    .get(&timestamp)
+                    .is_none_or(|(offset, _)| *offset < point.record_ref.offset)
+                {
+                    samples.insert(timestamp, (point.record_ref.offset, value));
+                }
+            }
+            for (labels, samples) in series {
+                let labels = labels
+                    .into_iter()
+                    .map(|(name, value)| prometheus_v1::Label { name, value })
+                    .collect::<Vec<_>>();
+                let samples = samples
+                    .into_iter()
+                    .map(|(timestamp, (_, value))| (timestamp, value))
+                    .collect::<Vec<_>>();
+                let mut chunks = Vec::new();
+                for samples in samples.chunks(XOR_SAMPLES_PER_CHUNK) {
+                    chunks.push(prometheus_v1::Chunk {
+                        min_time_ms: samples.first().expect("chunk is nonempty").0,
+                        max_time_ms: samples.last().expect("chunk is nonempty").0,
+                        r#type: prometheus_v1::ChunkEncoding::Xor as i32,
+                        data: encode_xor_chunk(samples)
+                            .map_err(|error| crate::PromqlError::new(error.to_string()))?,
+                    });
+                }
+                append_chunked_series_frames(
+                    &mut stream,
+                    i64::try_from(query_index).unwrap_or(i64::MAX),
+                    &labels,
+                    chunks,
+                    MAX_FRAME_BYTES,
+                )?;
+            }
+        }
+        Ok::<_, crate::PromqlError>(stream)
+    })
+    .await;
+    match result {
+        Ok(Ok(stream)) => (
+            StatusCode::OK,
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static(
+                    "application/x-streamed-protobuf; proto=prometheus.ChunkedReadResponse",
+                ),
+            )],
+            stream,
+        )
+            .into_response(),
+        Ok(Err(error)) => query_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "execution",
+            &error.to_string(),
+        ),
+        Err(error) => query_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &format!("streamed Remote Read worker failed: {error}"),
+        ),
+    }
+}
+
+fn append_chunked_series_frames(
+    stream: &mut Vec<u8>,
+    query_index: i64,
+    labels: &[prometheus_v1::Label],
+    chunks: Vec<prometheus_v1::Chunk>,
+    max_frame_bytes: usize,
+) -> Result<(), crate::PromqlError> {
+    const CHUNKS_PER_FRAME: usize = 256;
+    for frame_chunks in chunks.chunks(CHUNKS_PER_FRAME) {
+        let protobuf = prometheus_v1::ChunkedReadResponse {
+            chunked_series: vec![prometheus_v1::ChunkedSeries {
+                labels: labels.to_vec(),
+                chunks: frame_chunks.to_vec(),
+            }],
+            query_index,
+        }
+        .encode_to_vec();
+        if protobuf.len() > max_frame_bytes {
+            return Err(crate::PromqlError::new(
+                "one streamed Remote Read series frame exceeds 1 MiB",
+            ));
+        }
+        append_stream_frame(stream, &protobuf)?;
+    }
+    Ok(())
+}
+
+fn append_stream_frame(stream: &mut Vec<u8>, protobuf: &[u8]) -> Result<(), crate::PromqlError> {
+    if protobuf.len() > 1024 * 1024 {
+        return Err(crate::PromqlError::new(
+            "one streamed Remote Read frame exceeds 1 MiB",
+        ));
+    }
+    append_uvarint(
+        stream,
+        u64::try_from(protobuf.len())
+            .map_err(|_| crate::PromqlError::new("Remote Read frame is too large"))?,
+    );
+    stream.extend_from_slice(&crc32c::crc32c(protobuf).to_be_bytes());
+    stream.extend_from_slice(protobuf);
+    Ok(())
+}
+
+fn append_uvarint(output: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        output.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    output.push(value as u8);
 }
 
 #[allow(clippy::result_large_err)]
@@ -1297,5 +1451,137 @@ mod tests {
 
         drop(service);
         fs::remove_dir_all(directory).expect("remove test store");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streamed_remote_read_returns_crc_framed_prometheus_xor_chunks() {
+        let (service, directory) = test_service();
+        let app = prometheus_router(service.clone());
+        let write = prometheus_v1::WriteRequest {
+            timeseries: vec![prometheus_v1::TimeSeries {
+                labels: vec![
+                    prometheus_v1::Label {
+                        name: "job".into(),
+                        value: "api".into(),
+                    },
+                    prometheus_v1::Label {
+                        name: "__name__".into(),
+                        value: "requests_total".into(),
+                    },
+                ],
+                samples: vec![
+                    prometheus_v1::Sample {
+                        value: 1.0,
+                        timestamp: 1_000,
+                    },
+                    prometheus_v1::Sample {
+                        value: 2.0,
+                        timestamp: 2_000,
+                    },
+                ],
+                exemplars: Vec::new(),
+                histograms: Vec::new(),
+            }],
+            metadata: Vec::new(),
+        };
+        let compressed = snap::raw::Encoder::new()
+            .compress_vec(&write.encode_to_vec())
+            .expect("Snappy write request");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/write")
+                    .header(header::CONTENT_TYPE, "application/x-protobuf")
+                    .header(header::CONTENT_ENCODING, "snappy")
+                    .header("x-prometheus-remote-write-version", "1.0.0")
+                    .body(Body::from(compressed))
+                    .unwrap(),
+            )
+            .await
+            .expect("write response");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let request = prometheus_v1::ReadRequest {
+            queries: vec![prometheus_v1::Query {
+                start_timestamp_ms: 0,
+                end_timestamp_ms: 3_000,
+                matchers: vec![prometheus_v1::LabelMatcher {
+                    r#type: prometheus_v1::LabelMatcherType::Equal as i32,
+                    name: "__name__".into(),
+                    value: "requests_total".into(),
+                }],
+                hints: None,
+            }],
+            accepted_response_types: vec![
+                prometheus_v1::ReadRequestResponseType::StreamedXorChunks as i32,
+                prometheus_v1::ReadRequestResponseType::Samples as i32,
+            ],
+        };
+        let compressed = snap::raw::Encoder::new()
+            .compress_vec(&request.encode_to_vec())
+            .expect("Snappy read request");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/read")
+                    .header(header::CONTENT_ENCODING, "snappy")
+                    .body(Body::from(compressed))
+                    .unwrap(),
+            )
+            .await
+            .expect("streamed read response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/x-streamed-protobuf; proto=prometheus.ChunkedReadResponse"
+        );
+        assert!(!response.headers().contains_key(header::CONTENT_ENCODING));
+        let body = to_bytes(response.into_body(), 2 * 1024 * 1024)
+            .await
+            .expect("stream body");
+        let (frame_bytes, delimiter_bytes) = decode_test_uvarint(&body);
+        let checksum_start = delimiter_bytes;
+        let protobuf_start = checksum_start + 4;
+        let protobuf_end = protobuf_start + usize::try_from(frame_bytes).unwrap();
+        assert_eq!(protobuf_end, body.len());
+        assert_eq!(
+            u32::from_be_bytes(body[checksum_start..protobuf_start].try_into().unwrap()),
+            crc32c::crc32c(&body[protobuf_start..protobuf_end])
+        );
+        let frame = prometheus_v1::ChunkedReadResponse::decode(&body[protobuf_start..protobuf_end])
+            .expect("chunked response protobuf");
+        assert_eq!(frame.query_index, 0);
+        assert_eq!(frame.chunked_series.len(), 1);
+        assert_eq!(
+            frame.chunked_series[0]
+                .labels
+                .iter()
+                .map(|label| label.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["__name__", "job"]
+        );
+        assert_eq!(frame.chunked_series[0].chunks.len(), 1);
+        let chunk = &frame.chunked_series[0].chunks[0];
+        assert_eq!(chunk.min_time_ms, 1_000);
+        assert_eq!(chunk.max_time_ms, 2_000);
+        assert_eq!(chunk.r#type, prometheus_v1::ChunkEncoding::Xor as i32);
+        assert_eq!(u16::from_be_bytes(chunk.data[..2].try_into().unwrap()), 2);
+
+        drop(service);
+        fs::remove_dir_all(directory).expect("remove test store");
+    }
+
+    fn decode_test_uvarint(bytes: &[u8]) -> (u64, usize) {
+        let mut value = 0_u64;
+        for (index, byte) in bytes.iter().copied().enumerate().take(10) {
+            value |= u64::from(byte & 0x7f) << (index * 7);
+            if byte & 0x80 == 0 {
+                return (value, index + 1);
+            }
+        }
+        panic!("invalid test frame delimiter")
     }
 }
