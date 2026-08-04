@@ -41,6 +41,33 @@ capture or competitor claims. The existing 80 GiB Adam log result below remains
 the authoritative real-log gate. Retained 16 GiB trace and metric captures are
 still required before publishing Tempo and Prometheus head-to-head claims.
 
+### Adam single-core synthetic lookup and storage codec
+
+The exact public commit `bdcb1c84e37fa3d9d24f097106bbb002a850c0c2`
+was prewarmed once and measured three times on physical CPU 0 of Adam's AMD
+Ryzen 9 3950X. The table reports the median of the three runs; every run used
+32,768 records per signal and 2,000 lookup iterations.
+
+| Signal | Stored bytes | Ratio | Encode | Decode | Lookups/s | p50 / p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Logs | 1,188,990 | 25.04x | 88.37 MiB/s | 173.39 MiB/s | 23,757 | 41.74 / 48.11 us |
+| Traces | 195,125 | 68.53x | 286.48 MiB/s | 1,091.95 MiB/s | 17,608 | 57.06 / 66.06 us |
+| Metrics | 317,492 | 46.64x | 707.65 MiB/s | 1,632.68 MiB/s | 1,683 | 591.87 / 627.48 us |
+| Resource + typed-label correlation | — | — | — | — | 1,765 | 558.85 / 699.02 us |
+
+The process consumed one CPU and had a median peak RSS of 191,992 KiB. This
+path intentionally includes rich typed metadata, index construction, and cold
+filters; it does not meet the separate 1 GiB/s-per-core target for logs or
+traces. Metrics exceed 1 GiB/s on the Apple development host but reach 707.65
+MiB/s on Adam. These measurements identify CPU work rather than hiding it
+behind aggregate multi-core throughput.
+
+Retained evidence:
+
+```text
+/home/dtietjen/shard-telemetry-evidence-bdcb1c8/signal-run-{1,2,3}.txt
+```
+
 Reproduce locally with:
 
 ```bash
@@ -51,7 +78,7 @@ cargo run --release --bin shard-telemetry-signal-bench -- \
 ## Current single-format 80 GiB acceptance — 2026-08-04
 
 This is the current pre-release result for commit
-`e5e3c368ef50762f791daf8fa963cf4a216c4f7a`. It measures the only supported
+`bdcb1c84e37fa3d9d24f097106bbb002a850c0c2`. It measures the only supported
 `STEL` structural format; there are no legacy readers, compatibility formats,
 or alternate ShardTelemetry implementations in this comparison.
 
@@ -77,8 +104,8 @@ second persistent term/field sidecar.
 | Manifest bytes | 819,217 |
 | Durable total | **620,912,446** |
 | Raw-source compression ratio | **138.34x** |
-| Wall time | **22.613 s** |
-| End-to-end throughput | **3,622.67 MiB/s** |
+| Ingest wall time | **17.883 s** |
+| End-to-end throughput | **4,580.79 MiB/s** |
 
 All 10,240 payload checksums passed. The verifier also reconstructed the first,
 middle, and final blocks exactly. Compared with the accepted historical Pco-8
@@ -103,26 +130,27 @@ same-protocol claim.
 
 | Engine | Settled durable bytes | Ratio | Wall time | Throughput |
 | --- | ---: | ---: | ---: | ---: |
-| ShardTelemetry `e5e3c36` | **620,912,446** | **138.34x** | **22.613 s** | **3,622.67 MiB/s** |
+| ShardTelemetry `bdcb1c8` | **620,912,446** | **138.34x** | **17.883 s** | **4,580.79 MiB/s** |
 | ClickHouse 26.5.1.882 | 1,175,650,470 | 73.07x | 89.46 s | 915.72 MiB/s |
 | Loki 3.7.2 | 4,905,868,184 | 17.51x | 1,010.043 s | 81.11 MiB/s |
 
-On this corpus ShardTelemetry is 3.96x faster than ClickHouse and uses 47.2%
-fewer durable bytes. It is 44.7x faster than the Loki compatibility run and
+On this corpus ShardTelemetry is 5.00x faster than ClickHouse and uses 47.2%
+fewer durable bytes. It is 56.5x faster than the Loki compatibility run and
 uses 7.90x less settled storage. These results do not establish the separate
 1 GiB/s-per-core or 80%-scaling-through-16-cores gates: the measured aggregate
-rate is 3.54 GiB/s, or about 226 MiB/s per assigned core if divided naively.
+rate is 4.47 GiB/s, or about 286 MiB/s per assigned core if divided naively.
 
 Retained Adam evidence:
 
 ```text
-/home/dtietjen/shard-telemetry-validation-suite-20260803/shard-telemetry-e5e3c36-full80-20260804
+/home/dtietjen/shard-telemetry-evidence-bdcb1c8/full80-{report,stdout,time}.txt
+/home/dtietjen/shard-telemetry-evidence-bdcb1c8/full80-output
 /home/dtietjen/shard-telemetry-validation-suite-20260803/head-to-head/stel-current-ca5-20260803
 /home/dtietjen/shard-telemetry-validation-suite-20260803/loki/loki-3.7.2-e004916-20260803
 ```
 
 The current ShardTelemetry report and stdout both have SHA-256
-`37dfda750bc715518f23ddb61d814a02eede28acc24adde9b3e9fe3c14185757`.
+`ee6909d1a2ed54b423e7d454e36162782708c1ba3a90961d6df0102b930b7bc8`.
 The settled Loki correction summary has SHA-256
 `c6a8f6918dc792fa7003a771c0f26268630430f5f012b14af43d5e411e7949c1`.
 
