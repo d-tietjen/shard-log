@@ -21,6 +21,8 @@ const CHECKSUM_ALGORITHM: &str = "blake3";
 const COPY_BUFFER_BYTES: usize = 1024 * 1024;
 const POINTER_READ_LIMIT: u64 = 64 * 1024;
 const CACHE_HEADER_MAGIC: &[u8; 8] = b"SLCACHE1";
+const SIGNAL_INDEX_MAGIC: &[u8; 4] = b"STSI";
+const SIGNAL_INDEX_HEADER_BYTES: usize = 16;
 const CACHE_HEADER_BYTES: usize = 8 + 8 + 32;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -568,6 +570,7 @@ pub fn stage_signal_group(
     first_block_id: u64,
     checkpoint: TierCheckpoint,
     payloads: &[SignalTierPayload],
+    recovery_state: &[u8],
 ) -> TelemetryResult<TierGroupSource> {
     if payloads.is_empty() || !matches!(signal, TelemetrySignal::Traces | TelemetrySignal::Metrics)
     {
@@ -618,7 +621,7 @@ pub fn stage_signal_group(
             checksum_bytes(&payload.payload),
         )?);
     }
-    let index = encode_json(&blocks, "signal group index")?;
+    let index = encode_signal_index(signal, recovery_state)?;
     write_bytes_atomically(&payload_path, &payload_pack)?;
     write_bytes_atomically(&index_path, &index)?;
     Ok(TierGroupSource {
@@ -638,6 +641,65 @@ pub fn stage_signal_group(
             },
         ],
     })
+}
+
+fn encode_signal_index(signal: TelemetrySignal, recovery_state: &[u8]) -> TelemetryResult<Vec<u8>> {
+    if !matches!(signal, TelemetrySignal::Traces | TelemetrySignal::Metrics) {
+        return Err(TelemetryError::ObjectStore(
+            "signal index requires traces or metrics".into(),
+        ));
+    }
+    let recovery_bytes =
+        u64::try_from(recovery_state.len()).map_err(|_| TelemetryError::RecordTooLarge)?;
+    let mut encoded = Vec::with_capacity(
+        SIGNAL_INDEX_HEADER_BYTES
+            .saturating_add(recovery_state.len())
+            .saturating_add(32),
+    );
+    encoded.extend_from_slice(SIGNAL_INDEX_MAGIC);
+    encoded.push(signal as u8);
+    encoded.extend_from_slice(&[0; 3]);
+    encoded.extend_from_slice(&recovery_bytes.to_le_bytes());
+    encoded.extend_from_slice(recovery_state);
+    encoded.extend_from_slice(blake3::hash(&encoded).as_bytes());
+    Ok(encoded)
+}
+
+/// Decodes the signal-local recovery snapshot from the current pre-release index format.
+pub fn decode_signal_recovery_state(
+    encoded: &[u8],
+    expected_signal: TelemetrySignal,
+) -> TelemetryResult<Vec<u8>> {
+    if encoded.len() < SIGNAL_INDEX_HEADER_BYTES + 32
+        || &encoded[..4] != SIGNAL_INDEX_MAGIC
+        || encoded[4] != expected_signal as u8
+        || encoded[5..8] != [0; 3]
+    {
+        return Err(TelemetryError::CorruptTier(
+            "invalid signal recovery index header".into(),
+        ));
+    }
+    let payload_end = encoded.len() - 32;
+    if blake3::hash(&encoded[..payload_end]).as_bytes() != &encoded[payload_end..] {
+        return Err(TelemetryError::CorruptTier(
+            "signal recovery index checksum failed".into(),
+        ));
+    }
+    let recovery_bytes = usize::try_from(u64::from_le_bytes(
+        encoded[8..16]
+            .try_into()
+            .expect("fixed signal index length"),
+    ))
+    .map_err(|_| TelemetryError::CorruptTier("signal recovery index is too large".into()))?;
+    if SIGNAL_INDEX_HEADER_BYTES
+        .checked_add(recovery_bytes)
+        .is_none_or(|end| end != payload_end)
+    {
+        return Err(TelemetryError::CorruptTier(
+            "signal recovery index length mismatch".into(),
+        ));
+    }
+    Ok(encoded[SIGNAL_INDEX_HEADER_BYTES..payload_end].to_vec())
 }
 
 /// Immutable manifest for one independently queryable block group.
@@ -1563,6 +1625,14 @@ impl<S: TelemetryObjectStore> TelemetryObjectTier<S> {
             Ok(true)
         })?;
         Ok(groups)
+    }
+
+    /// Loads only the final catalog page and returns its newest group entry.
+    pub fn latest_group(&self) -> TelemetryResult<Option<CatalogGroupEntry>> {
+        let Some(reference) = self.root.pages.last() else {
+            return Ok(None);
+        };
+        Ok(self.load_page(reference)?.groups.last().cloned())
     }
 
     /// Visits overlapping groups one at a time without materializing a

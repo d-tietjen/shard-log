@@ -25,7 +25,7 @@ use crate::{
     SharedTelemetryObjectStore, SsdCacheConfig, SsdObjectCache, StripeConfig, TelemetryEnvelope,
     TelemetryError, TelemetryObjectTier, TelemetryResult, TelemetryRouter, TelemetrySignal,
     TierArtifactKind, TierCheckpoint, TierQueryRange, TraceQuery, TraceStripe, decode_metric_chunk,
-    decode_trace_block, stage_signal_group,
+    decode_signal_recovery_state, decode_trace_block, stage_signal_group,
 };
 
 /// Immutable object-tier and bounded SSD-cache settings shared by sink stripes.
@@ -163,6 +163,12 @@ struct SignalTierState {
     config: ObjectTierConfig,
 }
 
+struct OpenedSignalTier {
+    state: SignalTierState,
+    checkpoints: Vec<DurableSinkCheckpoint>,
+    recovery_states: Vec<Vec<u8>>,
+}
+
 impl SignalTierState {
     fn open(
         signal: TelemetrySignal,
@@ -172,12 +178,13 @@ impl SignalTierState {
         cache: Arc<SsdObjectCache>,
         partitions: Vec<TopicPartition>,
         config: ObjectTierConfig,
-    ) -> TelemetryResult<Option<(Self, Vec<DurableSinkCheckpoint>)>> {
+    ) -> TelemetryResult<Option<OpenedSignalTier>> {
         if partitions.is_empty() {
             return Ok(None);
         }
         let mut tiers = HashMap::with_capacity(partitions.len());
         let mut checkpoints = Vec::new();
+        let mut recovery_states = Vec::new();
         for partition in partitions {
             if partition.topic_id != signal.topic_id() {
                 return Err(TelemetryError::InvalidConfig(
@@ -194,6 +201,22 @@ impl SignalTierState {
                     next_offset: shard_stream_core::LogicalOffset::new(checkpoint.next_offset),
                 });
             }
+            if signal == TelemetrySignal::Metrics
+                && let Some(entry) = tier.latest_group()?
+            {
+                let manifest = tier.load_group(&entry)?;
+                let artifact =
+                    manifest
+                        .artifact(TierArtifactKind::QueryIndex)
+                        .ok_or_else(|| {
+                            TelemetryError::CorruptTier("metric group has no recovery index".into())
+                        })?;
+                let encoded = tier.read_artifact(artifact, config.max_group_payload_bytes)?;
+                recovery_states.push(decode_signal_recovery_state(
+                    &encoded,
+                    TelemetrySignal::Metrics,
+                )?);
+            }
             if tiers.insert(partition, tier).is_some() {
                 return Err(TelemetryError::InvalidConfig(
                     "signal object tier contains a duplicate partition",
@@ -209,8 +232,8 @@ impl SignalTierState {
                 ));
             }
         };
-        Ok(Some((
-            Self {
+        Ok(Some(OpenedSignalTier {
+            state: Self {
                 signal,
                 tiers,
                 spool_directory: spool_directory
@@ -220,7 +243,8 @@ impl SignalTierState {
                 config,
             },
             checkpoints,
-        )))
+            recovery_states,
+        }))
     }
 }
 
@@ -321,6 +345,7 @@ impl TelemetrySinkFactory {
                 journals.insert(shard_id, Arc::new(journal));
             }
             let mut signal_tiers = HashMap::new();
+            let mut metric_recovery_states = Vec::new();
             if let (Some(tier), Some(cache)) = (&config.object_tier, &tier_cache) {
                 for signal in [TelemetrySignal::Traces, TelemetrySignal::Metrics] {
                     let partitions = tier
@@ -329,7 +354,7 @@ impl TelemetrySinkFactory {
                         .copied()
                         .filter(|partition| partition.topic_id == signal.topic_id())
                         .collect::<Vec<_>>();
-                    if let Some((state, checkpoints)) = SignalTierState::open(
+                    if let Some(opened) = SignalTierState::open(
                         signal,
                         shard_id,
                         tier.store.clone(),
@@ -338,18 +363,24 @@ impl TelemetrySinkFactory {
                         partitions,
                         tier.tier,
                     )? {
-                        for checkpoint in checkpoints {
+                        for checkpoint in opened.checkpoints {
                             merge_recovered_checkpoint(&mut recovered_checkpoints, checkpoint)?;
                         }
-                        signal_tiers.insert(signal, state);
+                        metric_recovery_states.extend(opened.recovery_states);
+                        signal_tiers.insert(signal, opened.state);
                     }
                 }
+            }
+            let mut metrics =
+                MetricStripe::new(config.signals.metrics.head_memory_bytes_per_stripe)?;
+            for recovery_state in metric_recovery_states {
+                metrics.restore_accumulator_checkpoints(&recovery_state)?;
             }
             let stripe = TelemetryStripeState {
                 stream_shard_id: shard_id,
                 logs,
                 traces: TraceStripe::new(config.signals.traces.head_memory_bytes_per_stripe)?,
-                metrics: MetricStripe::new(config.signals.metrics.head_memory_bytes_per_stripe)?,
+                metrics,
                 signal_tiers,
                 router: TelemetryRouter::from_config(&config.signals),
             };
@@ -1107,6 +1138,13 @@ fn offload_signal_partition(
             )
             .ok_or(TelemetryError::RecordTooLarge)
     })?;
+    let recovery_state = match signal {
+        TelemetrySignal::Metrics => stripe
+            .metrics
+            .accumulator_checkpoints_for_partition(partition)?,
+        TelemetrySignal::Traces => Vec::new(),
+        TelemetrySignal::Logs => unreachable!("signal was selected above"),
+    };
     let state = stripe
         .signal_tiers
         .get_mut(&signal)
@@ -1145,6 +1183,7 @@ fn offload_signal_partition(
             next_offset: checkpoint.next_offset.get(),
         },
         &payloads,
+        &recovery_state,
     )?;
     let staged_paths = source
         .artifacts

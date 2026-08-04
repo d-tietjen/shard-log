@@ -814,6 +814,8 @@ pub enum MetricApplyOutcome {
 pub struct SeriesAccumulatorCheckpoint {
     /// Canonical series fingerprint.
     pub series: SeriesFingerprint,
+    /// Logical partition that owns the complete series.
+    pub topic_partition: TopicPartition,
     /// Reset generation.
     pub reset_generation: u64,
     /// Latest raw timestamp.
@@ -847,6 +849,7 @@ pub struct MetricStripe {
     chunks: HashMap<SeriesFingerprint, Vec<SealedMetricChunk>>,
     pending_chunks: Vec<SignalTierPayload>,
     next_chunk_id: u64,
+    recovered_accumulators: HashMap<SeriesFingerprint, SeriesAccumulatorCheckpoint>,
     name_index: HashMap<Arc<str>, HashSet<SeriesFingerprint>>,
     label_index: HashMap<(Arc<str>, Arc<str>), HashSet<SeriesFingerprint>>,
 }
@@ -876,6 +879,7 @@ impl MetricStripe {
             chunks: HashMap::new(),
             pending_chunks: Vec::new(),
             next_chunk_id: 1,
+            recovered_accumulators: HashMap::new(),
             name_index: HashMap::new(),
             label_index: HashMap::new(),
         })
@@ -925,6 +929,15 @@ impl MetricStripe {
                 "metric head memory budget exhausted",
             ));
         }
+        let recovered = self.recovered_accumulators.get(&fingerprint).cloned();
+        if recovered.as_ref().is_some_and(|checkpoint| {
+            checkpoint.topic_partition != point.record_ref.topic_partition
+        }) {
+            return Err(TelemetryError::InvalidBlockEncoding(
+                "recovered metric accumulator belongs to another partition",
+            ));
+        }
+        self.recovered_accumulators.remove(&fingerprint);
         let (outcome, should_seal) = {
             let head = self
                 .series
@@ -933,10 +946,14 @@ impl MetricStripe {
                     topic_partition: point.record_ref.topic_partition,
                     identity: Arc::clone(&point.identity),
                     points: BTreeMap::new(),
-                    latest_timestamp: point.timestamp_unix_nanos,
+                    latest_timestamp: recovered
+                        .as_ref()
+                        .map_or(point.timestamp_unix_nanos, |value| {
+                            value.latest_timestamp_unix_nanos
+                        }),
                     bytes: 0,
-                    reset_generation: 0,
-                    cumulative: None,
+                    reset_generation: recovered.as_ref().map_or(0, |value| value.reset_generation),
+                    cumulative: recovered.as_ref().and_then(|value| value.cumulative),
                     conflicts: 0,
                 });
             if point
@@ -1020,16 +1037,47 @@ impl MetricStripe {
 
     /// Serializes exact accumulator checkpoints for restart recovery.
     pub fn accumulator_checkpoints(&self) -> TelemetryResult<Vec<u8>> {
-        let checkpoints = self
-            .series
-            .iter()
-            .map(|(series, head)| SeriesAccumulatorCheckpoint {
+        let mut checkpoints = self
+            .recovered_accumulators
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        checkpoints.extend(
+            self.series
+                .iter()
+                .map(|(series, head)| SeriesAccumulatorCheckpoint {
+                    series: *series,
+                    topic_partition: head.topic_partition,
+                    reset_generation: head.reset_generation,
+                    latest_timestamp_unix_nanos: head.latest_timestamp,
+                    cumulative: head.cumulative,
+                }),
+        );
+        checkpoints.sort_unstable_by_key(|checkpoint| checkpoint.series);
+        rmp_serde::to_vec_named(&checkpoints)
+            .map_err(|error| TelemetryError::StorageIo(error.to_string()))
+    }
+
+    pub(crate) fn accumulator_checkpoints_for_partition(
+        &self,
+        partition: TopicPartition,
+    ) -> TelemetryResult<Vec<u8>> {
+        let mut checkpoints = self
+            .recovered_accumulators
+            .values()
+            .filter(|checkpoint| checkpoint.topic_partition == partition)
+            .cloned()
+            .collect::<Vec<_>>();
+        checkpoints.extend(self.series.iter().filter_map(|(series, head)| {
+            (head.topic_partition == partition).then_some(SeriesAccumulatorCheckpoint {
                 series: *series,
+                topic_partition: head.topic_partition,
                 reset_generation: head.reset_generation,
                 latest_timestamp_unix_nanos: head.latest_timestamp,
                 cumulative: head.cumulative,
             })
-            .collect::<Vec<_>>();
+        }));
+        checkpoints.sort_unstable_by_key(|checkpoint| checkpoint.series);
         rmp_serde::to_vec_named(&checkpoints)
             .map_err(|error| TelemetryError::StorageIo(error.to_string()))
     }
@@ -1039,10 +1087,28 @@ impl MetricStripe {
         let checkpoints: Vec<SeriesAccumulatorCheckpoint> = rmp_serde::from_slice(encoded)
             .map_err(|error| TelemetryError::StorageIo(error.to_string()))?;
         for checkpoint in checkpoints {
+            if checkpoint.topic_partition.topic_id != TelemetrySignal::Metrics.topic_id() {
+                return Err(TelemetryError::InvalidBlockEncoding(
+                    "metric accumulator checkpoint uses the wrong signal topic",
+                ));
+            }
             if let Some(head) = self.series.get_mut(&checkpoint.series) {
+                if head.topic_partition != checkpoint.topic_partition {
+                    return Err(TelemetryError::InvalidBlockEncoding(
+                        "metric accumulator checkpoint changed partitions",
+                    ));
+                }
                 head.reset_generation = checkpoint.reset_generation;
                 head.latest_timestamp = checkpoint.latest_timestamp_unix_nanos;
                 head.cumulative = checkpoint.cumulative;
+            } else if self
+                .recovered_accumulators
+                .insert(checkpoint.series, checkpoint)
+                .is_some()
+            {
+                return Err(TelemetryError::InvalidBlockEncoding(
+                    "duplicate metric accumulator checkpoint",
+                ));
             }
         }
         Ok(())
@@ -1426,5 +1492,38 @@ mod tests {
             decode_timestamp_delta_of_delta(&encoded, timestamps.len()).unwrap(),
             timestamps
         );
+    }
+
+    #[test]
+    fn delta_accumulator_restarts_before_accepting_the_next_point() {
+        let mut first = point(1, 100, NumberValue::Integer(5));
+        first.identity = Arc::new(MetricIdentity {
+            kind: MetricKind::Sum {
+                temporality: 1,
+                monotonic: true,
+            },
+            ..first.identity.as_ref().clone()
+        });
+        first.value = MetricValue::Sum(NumberValue::Integer(5));
+        let mut stripe = MetricStripe::new(1024 * 1024).unwrap();
+        stripe
+            .apply(first.clone(), MetricIngestProtocol::Otlp)
+            .unwrap();
+        let checkpoint = stripe.accumulator_checkpoints().unwrap();
+
+        let mut recovered = MetricStripe::new(1024 * 1024).unwrap();
+        recovered
+            .restore_accumulator_checkpoints(&checkpoint)
+            .unwrap();
+        let mut second = first;
+        second.record_ref.offset = LogicalOffset::new(2);
+        second.timestamp_unix_nanos = 200;
+        second.value = MetricValue::Sum(NumberValue::Integer(7));
+        recovered.apply(second, MetricIngestProtocol::Otlp).unwrap();
+        let checkpoints: Vec<SeriesAccumulatorCheckpoint> =
+            rmp_serde::from_slice(&recovered.accumulator_checkpoints().unwrap()).unwrap();
+        assert_eq!(checkpoints.len(), 1);
+        assert_eq!(checkpoints[0].cumulative, Some(NumberValue::Integer(12)));
+        assert_eq!(checkpoints[0].reset_generation, 0);
     }
 }
