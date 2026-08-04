@@ -562,20 +562,41 @@ impl CorrelationIndex {
         let Some(first) = lists.first() else {
             return Vec::new();
         };
-        let mut selected = first.to_vec();
-        for incoming in &lists[1..] {
-            intersect_sorted(&mut selected, incoming);
-            if selected.is_empty() {
-                return selected;
+        let start = query
+            .after
+            .map_or(0, |after| first.partition_point(|record| *record <= after));
+        let mut selected = Vec::with_capacity(query.limit.min(first.len().saturating_sub(start)));
+        let mut cursors = lists[1..]
+            .iter()
+            .map(|incoming| {
+                query.after.map_or(0, |after| {
+                    incoming.partition_point(|record| *record <= after)
+                })
+            })
+            .collect::<Vec<_>>();
+        'candidate: for &record in &first[start..] {
+            if query.signal.is_some_and(|signal| record.signal != signal) {
+                continue;
+            }
+            for (incoming, cursor) in lists[1..].iter().zip(&mut cursors) {
+                while incoming
+                    .get(*cursor)
+                    .is_some_and(|current| *current < record)
+                {
+                    *cursor += 1;
+                }
+                let Some(current) = incoming.get(*cursor) else {
+                    return selected;
+                };
+                if *current != record {
+                    continue 'candidate;
+                }
+            }
+            selected.push(record);
+            if selected.len() == query.limit {
+                break;
             }
         }
-        if let Some(signal) = query.signal {
-            selected.retain(|record| record.signal == signal);
-        }
-        if let Some(after) = query.after {
-            selected.retain(|record| *record > after);
-        }
-        selected.truncate(query.limit);
         selected
     }
 
@@ -639,25 +660,6 @@ impl CorrelationIndex {
         }
         self.refs += 1;
     }
-}
-
-fn intersect_sorted(current: &mut Vec<TelemetryRecordRef>, incoming: &[TelemetryRecordRef]) {
-    let mut left = 0;
-    let mut right = 0;
-    let mut write = 0;
-    while left < current.len() && right < incoming.len() {
-        match current[left].cmp(&incoming[right]) {
-            std::cmp::Ordering::Less => left += 1,
-            std::cmp::Ordering::Greater => right += 1,
-            std::cmp::Ordering::Equal => {
-                current[write] = current[left];
-                write += 1;
-                left += 1;
-                right += 1;
-            }
-        }
-    }
-    current.truncate(write);
 }
 
 #[cfg(test)]
@@ -725,5 +727,56 @@ mod tests {
         }
         assert_eq!(index.stats().refs, 1);
         assert!(index.stats().dropped_postings > 0);
+    }
+
+    #[test]
+    fn bounded_intersection_preserves_order_filters_and_pagination() {
+        let first = TelemetryAttribute::new("shared", TelemetryValue::String(Arc::from("yes")));
+        let second = TelemetryAttribute::new("region", TelemetryValue::String(Arc::from("east")));
+        let partition = TopicPartition::new(LOGS_TOPIC_ID, LogicalPartitionId::new(1));
+        let mut index = CorrelationIndex::new(CorrelationConfig {
+            max_keys: 2,
+            max_refs_per_key: 20_000,
+            max_total_refs: 40_000,
+        });
+        for offset in 0..10_000 {
+            let record = TelemetryRecordRef::for_signal(
+                TelemetrySignal::Logs,
+                partition,
+                LogicalOffset::new(offset),
+            );
+            index.insert(
+                "tenant-a",
+                CorrelationKey::Attribute(first.fingerprint()),
+                record,
+            );
+            if offset % 2 == 0 {
+                index.insert(
+                    "tenant-a",
+                    CorrelationKey::Attribute(second.fingerprint()),
+                    record,
+                );
+            }
+        }
+        let after = TelemetryRecordRef::for_signal(
+            TelemetrySignal::Logs,
+            partition,
+            LogicalOffset::new(4_990),
+        );
+        let result = index.query(
+            &CorrelationQuery::new("tenant-a")
+                .with_attribute(&first)
+                .with_attribute(&second)
+                .for_signal(TelemetrySignal::Logs)
+                .after(after)
+                .with_limit(3),
+        );
+        assert_eq!(
+            result
+                .iter()
+                .map(|record| record.offset.get())
+                .collect::<Vec<_>>(),
+            vec![4_992, 4_994, 4_996]
+        );
     }
 }

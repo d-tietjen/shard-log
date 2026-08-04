@@ -1339,6 +1339,33 @@ struct SealedMetricChunk {
     payload: Arc<[u8]>,
 }
 
+enum ExactMetricSource<'a> {
+    Head(&'a SeriesHead),
+    Chunk(&'a SealedMetricChunk),
+}
+
+impl ExactMetricSource<'_> {
+    fn min_timestamp_unix_nanos(&self) -> u64 {
+        match self {
+            Self::Head(head) => head
+                .points
+                .first_key_value()
+                .map_or(u64::MAX, |((timestamp, _), _)| *timestamp),
+            Self::Chunk(chunk) => chunk.min_timestamp_unix_nanos,
+        }
+    }
+
+    fn max_timestamp_unix_nanos(&self) -> u64 {
+        match self {
+            Self::Head(head) => head
+                .points
+                .last_key_value()
+                .map_or(0, |((timestamp, _), _)| *timestamp),
+            Self::Chunk(chunk) => chunk.max_timestamp_unix_nanos,
+        }
+    }
+}
+
 impl MetricStripe {
     /// Creates a bounded metric stripe using production chunk and OOO limits.
     pub fn new(head_budget_bytes: usize) -> TelemetryResult<Self> {
@@ -1621,6 +1648,9 @@ impl MetricStripe {
     /// Queries exact raw hot and immutable-chunk points with index pushdown.
     pub fn query(&self, query: &MetricQuery) -> TelemetryResult<Vec<DurableMetricPoint>> {
         let limit = query.limit.max(1);
+        if let Some(series) = query.series {
+            return self.query_exact_series(query, series, limit);
+        }
         let mut winners = BTreeMap::<(SeriesFingerprint, u64), DurableMetricPoint>::new();
         let candidates = self.query_candidates(query);
         for (series, head) in &self.series {
@@ -1641,7 +1671,7 @@ impl MetricStripe {
                 .values()
                 .filter(|point| metric_query_matches(query, point))
             {
-                retain_metric_winner(&mut winners, point.clone());
+                retain_metric_winner(&mut winners, *series, point.clone());
             }
         }
         for (series, chunks) in &self.chunks {
@@ -1657,7 +1687,7 @@ impl MetricStripe {
                     .into_iter()
                     .filter(|point| metric_query_matches(query, point))
                 {
-                    retain_metric_winner(&mut winners, point);
+                    retain_metric_winner(&mut winners, *series, point);
                 }
             }
         }
@@ -1665,6 +1695,77 @@ impl MetricStripe {
         points.sort_unstable_by_key(|point| (point.timestamp_unix_nanos, point.record_ref.offset));
         points.truncate(limit);
         Ok(points)
+    }
+
+    fn query_exact_series(
+        &self,
+        query: &MetricQuery,
+        series: SeriesFingerprint,
+        limit: usize,
+    ) -> TelemetryResult<Vec<DurableMetricPoint>> {
+        let Some(head) = self.series.get(&series) else {
+            return Ok(Vec::new());
+        };
+        if !metric_identity_matches(query, &head.identity) {
+            return Ok(Vec::new());
+        }
+        let mut sources = Vec::with_capacity(
+            usize::from(!head.points.is_empty()) + self.chunks.get(&series).map_or(0, Vec::len),
+        );
+        if !head.points.is_empty() {
+            sources.push(ExactMetricSource::Head(head));
+        }
+        sources.extend(
+            self.chunks
+                .get(&series)
+                .into_iter()
+                .flatten()
+                .map(ExactMetricSource::Chunk),
+        );
+        sources.sort_unstable_by_key(ExactMetricSource::min_timestamp_unix_nanos);
+
+        let mut winners = BTreeMap::<u64, DurableMetricPoint>::new();
+        for source in sources {
+            let min_timestamp = source.min_timestamp_unix_nanos();
+            let max_timestamp = source.max_timestamp_unix_nanos();
+            if query
+                .start_time_unix_nanos
+                .is_some_and(|start| max_timestamp < start)
+                || query
+                    .end_time_unix_nanos
+                    .is_some_and(|end| min_timestamp > end)
+            {
+                continue;
+            }
+            if winners.len() >= limit
+                && winners
+                    .keys()
+                    .nth(limit - 1)
+                    .is_some_and(|cutoff| min_timestamp > *cutoff)
+            {
+                break;
+            }
+            match source {
+                ExactMetricSource::Head(head) => {
+                    for point in head
+                        .points
+                        .values()
+                        .filter(|point| metric_point_time_matches(query, point))
+                    {
+                        retain_exact_metric_winner(&mut winners, point.clone());
+                    }
+                }
+                ExactMetricSource::Chunk(chunk) => {
+                    for point in decode_metric_chunk(&chunk.payload)?
+                        .into_iter()
+                        .filter(|point| metric_point_time_matches(query, point))
+                    {
+                        retain_exact_metric_winner(&mut winners, point);
+                    }
+                }
+            }
+        }
+        Ok(winners.into_values().take(limit).collect())
     }
 
     fn sealed_points_at(
@@ -1856,15 +1957,54 @@ fn update_accumulator(head: &mut SeriesHead, point: &DurableMetricPoint) {
 
 fn retain_metric_winner(
     winners: &mut BTreeMap<(SeriesFingerprint, u64), DurableMetricPoint>,
+    series: SeriesFingerprint,
     point: DurableMetricPoint,
 ) {
-    let key = (point.series_fingerprint(), point.timestamp_unix_nanos);
+    let key = (series, point.timestamp_unix_nanos);
     if winners
         .get(&key)
         .is_none_or(|winner| winner.record_ref.offset < point.record_ref.offset)
     {
         winners.insert(key, point);
     }
+}
+
+fn retain_exact_metric_winner(
+    winners: &mut BTreeMap<u64, DurableMetricPoint>,
+    point: DurableMetricPoint,
+) {
+    let key = point.timestamp_unix_nanos;
+    if winners
+        .get(&key)
+        .is_none_or(|winner| winner.record_ref.offset < point.record_ref.offset)
+    {
+        winners.insert(key, point);
+    }
+}
+
+fn metric_identity_matches(query: &MetricQuery, identity: &MetricIdentity) -> bool {
+    identity.tenant == query.tenant
+        && query
+            .name
+            .as_ref()
+            .is_none_or(|name| name.as_ref() == identity.name.as_ref())
+        && query.exact_labels.iter().all(|(name, value)| {
+            prometheus_string_labels(identity)
+                .iter()
+                .any(|(observed_name, observed_value)| {
+                    observed_name.as_ref() == name.as_ref()
+                        && observed_value.as_ref() == value.as_ref()
+                })
+        })
+}
+
+fn metric_point_time_matches(query: &MetricQuery, point: &DurableMetricPoint) -> bool {
+    query
+        .start_time_unix_nanos
+        .is_none_or(|start| point.timestamp_unix_nanos >= start)
+        && query
+            .end_time_unix_nanos
+            .is_none_or(|end| point.timestamp_unix_nanos <= end)
 }
 
 /// Native metric selector used by PromQL storage scans and direct APIs.
@@ -1887,25 +2027,7 @@ pub struct MetricQuery {
 }
 
 pub(crate) fn metric_query_matches(query: &MetricQuery, point: &DurableMetricPoint) -> bool {
-    point.identity.tenant == query.tenant
-        && query
-            .name
-            .as_ref()
-            .is_none_or(|name| name.as_ref() == point.identity.name.as_ref())
-        && query
-            .start_time_unix_nanos
-            .is_none_or(|start| point.timestamp_unix_nanos >= start)
-        && query
-            .end_time_unix_nanos
-            .is_none_or(|end| point.timestamp_unix_nanos <= end)
-        && query.exact_labels.iter().all(|(name, value)| {
-            prometheus_string_labels(&point.identity).iter().any(
-                |(observed_name, observed_value)| {
-                    observed_name.as_ref() == name.as_ref()
-                        && observed_value.as_ref() == value.as_ref()
-                },
-            )
-        })
+    metric_identity_matches(query, &point.identity) && metric_point_time_matches(query, point)
 }
 
 /// Returns Prometheus-visible string labels for one canonical series.
@@ -2120,6 +2242,50 @@ mod tests {
             })
             .unwrap();
         assert_eq!(queried, vec![conflict]);
+    }
+
+    #[test]
+    fn exact_series_query_limits_early_and_keeps_late_conflict_winners() {
+        let mut stripe = MetricStripe::new(1024 * 1024).unwrap();
+        stripe.chunk_points = 2;
+        let first = point(1, 100, NumberValue::Integer(1));
+        let series = first.series_fingerprint();
+        for value in [
+            first,
+            point(2, 200, NumberValue::Integer(2)),
+            point(3, 300, NumberValue::Integer(3)),
+            point(4, 400, NumberValue::Integer(4)),
+        ] {
+            stripe.apply(value, MetricIngestProtocol::Otlp).unwrap();
+        }
+        let conflict = point(5, 100, NumberValue::Integer(9));
+        assert_eq!(
+            stripe
+                .apply(conflict.clone(), MetricIngestProtocol::Otlp)
+                .unwrap(),
+            MetricApplyOutcome::Replaced
+        );
+
+        let first_result = stripe
+            .query(&MetricQuery {
+                tenant: Arc::from("tenant-a"),
+                series: Some(series),
+                limit: 1,
+                ..MetricQuery::default()
+            })
+            .unwrap();
+        assert_eq!(first_result, vec![conflict]);
+
+        let ranged = stripe
+            .query(&MetricQuery {
+                tenant: Arc::from("tenant-a"),
+                series: Some(series),
+                start_time_unix_nanos: Some(201),
+                limit: 1,
+                ..MetricQuery::default()
+            })
+            .unwrap();
+        assert_eq!(ranged[0].timestamp_unix_nanos, 300);
     }
 
     #[test]
