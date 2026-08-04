@@ -528,7 +528,7 @@ fn run_sink_worker(
                 let _ = response.send(result);
             }
             SinkCommand::QueryTraces { query, response } => {
-                let _ = response.send(Ok(stripe.traces.query(&query)));
+                let _ = response.send(stripe.traces.query(&query));
             }
             SinkCommand::QueryMetrics { query, response } => {
                 let _ = response.send(stripe.metrics.query(&query));

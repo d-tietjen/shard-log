@@ -6,8 +6,9 @@ use clap::Parser;
 use shard_telemetry::{
     DurableLokiConfig, DurableLokiStore, LokiApiConfig, NativeServerConfig, OtlpIngestService,
     OtlpReceiverConfig, ProductionRuntime, PrometheusApiConfig, PrometheusService,
-    ServiceLifecycle, SingleTenantConfig, StripeConfig, loki_router, loki_router_with_clickhouse,
-    otlp_http_router, prometheus_router, serve_native, serve_otlp_grpc, single_tenant_loki_router,
+    ServiceLifecycle, SingleTenantConfig, StripeConfig, TempoApiConfig, TempoService, loki_router,
+    loki_router_with_clickhouse, otlp_http_router, prometheus_router, serve_native,
+    serve_otlp_grpc, single_tenant_loki_router, tempo_router,
 };
 
 #[derive(Debug, Parser)]
@@ -211,6 +212,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?
     .with_production(production.clone());
+    let tempo_service = TempoService::new(
+        Arc::clone(&store),
+        TempoApiConfig {
+            tenant: Arc::from(arguments.default_tenant.as_str()),
+            ..TempoApiConfig::default()
+        },
+    )?
+    .with_production(production.clone());
     let clickhouse_token = arguments
         .clickhouse_token_file
         .as_ref()
@@ -230,7 +239,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             None => loki_router(store.clone(), api_config),
         },
     }
-    .merge(prometheus_router(prometheus_service));
+    .merge(prometheus_router(prometheus_service))
+    .merge(tempo_router(tempo_service));
     lifecycle.mark_ready();
     let (shutdown, _) = tokio::sync::broadcast::channel::<()>(1);
     let signal = shutdown.clone();

@@ -1,19 +1,22 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::num::NonZeroU16;
 use std::sync::Arc;
 
 use axum::Router;
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Form, Query, State};
+use axum::extract::{DefaultBodyLimit, Form, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use prost::Message;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::prometheus_protocol::v1 as prometheus_v1;
 use crate::{
-    DurableLokiStore, ProductionRuntime, PromqlEngine, PromqlLimits, PromqlValue,
-    RemoteWriteDecoder, RemoteWriteStats, RemoteWriteVersion, ServiceState, TelemetryError,
-    TelemetryResult, TelemetryRouter,
+    DurableLokiStore, MetricKind, MetricValue, NumberValue, ProductionRuntime, PromqlEngine,
+    PromqlLimits, PromqlValue, RemoteWriteDecoder, RemoteWriteStats, RemoteWriteVersion,
+    ServiceState, TelemetryError, TelemetryResult, TelemetryRouter, TelemetryValue,
 };
 
 /// Single-tenant Prometheus compatibility limits.
@@ -135,10 +138,22 @@ pub fn prometheus_router(service: PrometheusService) -> Router {
     let max_request_bytes = service.config.max_request_bytes;
     Router::new()
         .route("/api/v1/write", post(remote_write))
+        .route("/api/v1/read", post(remote_read))
         .route("/api/v1/query", get(query_get).post(query_post))
         .route(
             "/api/v1/query_range",
             get(query_range_get).post(query_range_post),
+        )
+        .route("/api/v1/series", get(series_get).post(series_post))
+        .route("/api/v1/labels", get(labels_get).post(labels_post))
+        .route(
+            "/api/v1/label/{name}/values",
+            get(label_values_get).post(label_values_post),
+        )
+        .route("/api/v1/metadata", get(metadata_get))
+        .route(
+            "/api/v1/query_exemplars",
+            get(exemplars_get).post(exemplars_post),
         )
         .layer(DefaultBodyLimit::max(max_request_bytes))
         .with_state(service)
@@ -156,6 +171,27 @@ struct RangeQueryParameters {
     start: String,
     end: String,
     step: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct DiscoveryParameters {
+    #[serde(default, rename = "match[]")]
+    selectors: Vec<String>,
+    start: Option<String>,
+    end: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct MetadataParameters {
+    metric: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ExemplarParameters {
+    query: String,
+    start: String,
+    end: String,
 }
 
 async fn query_get(
@@ -276,6 +312,295 @@ async fn execute_range_query(
     }
 }
 
+async fn series_get(
+    State(service): State<PrometheusService>,
+    headers: HeaderMap,
+    Query(parameters): Query<DiscoveryParameters>,
+) -> Response {
+    execute_series(service, headers, parameters).await
+}
+
+async fn series_post(
+    State(service): State<PrometheusService>,
+    headers: HeaderMap,
+    Form(parameters): Form<DiscoveryParameters>,
+) -> Response {
+    execute_series(service, headers, parameters).await
+}
+
+async fn execute_series(
+    service: PrometheusService,
+    headers: HeaderMap,
+    parameters: DiscoveryParameters,
+) -> Response {
+    let points = match discovery_points(&service, &headers, &parameters).await {
+        Ok(points) => points,
+        Err(response) => return response,
+    };
+    let series = points
+        .iter()
+        .map(metric_labels)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    api_success(json!(series))
+}
+
+async fn labels_get(
+    State(service): State<PrometheusService>,
+    headers: HeaderMap,
+    Query(parameters): Query<DiscoveryParameters>,
+) -> Response {
+    execute_labels(service, headers, parameters).await
+}
+
+async fn labels_post(
+    State(service): State<PrometheusService>,
+    headers: HeaderMap,
+    Form(parameters): Form<DiscoveryParameters>,
+) -> Response {
+    execute_labels(service, headers, parameters).await
+}
+
+async fn execute_labels(
+    service: PrometheusService,
+    headers: HeaderMap,
+    parameters: DiscoveryParameters,
+) -> Response {
+    let points = match discovery_points(&service, &headers, &parameters).await {
+        Ok(points) => points,
+        Err(response) => return response,
+    };
+    let mut labels = BTreeSet::new();
+    for point in &points {
+        labels.extend(metric_labels(point).into_keys());
+    }
+    api_success(json!(labels))
+}
+
+async fn label_values_get(
+    State(service): State<PrometheusService>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Query(parameters): Query<DiscoveryParameters>,
+) -> Response {
+    execute_label_values(service, headers, name, parameters).await
+}
+
+async fn label_values_post(
+    State(service): State<PrometheusService>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+    Form(parameters): Form<DiscoveryParameters>,
+) -> Response {
+    execute_label_values(service, headers, name, parameters).await
+}
+
+async fn execute_label_values(
+    service: PrometheusService,
+    headers: HeaderMap,
+    name: String,
+    parameters: DiscoveryParameters,
+) -> Response {
+    if name.is_empty() {
+        return query_error(StatusCode::BAD_REQUEST, "bad_data", "label name is empty");
+    }
+    let points = match discovery_points(&service, &headers, &parameters).await {
+        Ok(points) => points,
+        Err(response) => return response,
+    };
+    let values = points
+        .iter()
+        .filter_map(|point| metric_labels(point).remove(&name))
+        .collect::<BTreeSet<_>>();
+    api_success(json!(values))
+}
+
+async fn metadata_get(
+    State(service): State<PrometheusService>,
+    headers: HeaderMap,
+    Query(parameters): Query<MetadataParameters>,
+) -> Response {
+    let _permit = match service.authorize(&headers) {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+    let engine = PromqlEngine::new(
+        Arc::clone(&service.store),
+        Arc::clone(&service.config.tenant),
+        PromqlLimits::default(),
+    );
+    let selectors = parameters
+        .metric
+        .as_ref()
+        .map(|metric| vec![metric.clone()])
+        .unwrap_or_default();
+    let points = match tokio::task::spawn_blocking(move || {
+        engine.raw_points(&selectors, 0, current_time_ms())
+    })
+    .await
+    {
+        Ok(Ok(points)) => points,
+        Ok(Err(error)) => {
+            return query_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "execution",
+                &error.to_string(),
+            );
+        }
+        Err(error) => {
+            return query_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &format!("metadata worker failed: {error}"),
+            );
+        }
+    };
+    let limit = parameters.limit.unwrap_or(usize::MAX);
+    let mut metadata = BTreeMap::<String, BTreeSet<(String, String, String)>>::new();
+    for point in points {
+        if metadata.len() >= limit && !metadata.contains_key(point.identity.name.as_ref()) {
+            continue;
+        }
+        metadata
+            .entry(point.identity.name.to_string())
+            .or_default()
+            .insert((
+                prometheus_metric_type(&point.identity.kind).into(),
+                point.description.to_string(),
+                point.identity.unit.to_string(),
+            ));
+    }
+    let data = metadata
+        .into_iter()
+        .map(|(name, entries)| {
+            let entries = entries
+                .into_iter()
+                .map(|(metric_type, help, unit)| {
+                    json!({"type": metric_type, "help": help, "unit": unit})
+                })
+                .collect::<Vec<_>>();
+            (name, Value::Array(entries))
+        })
+        .collect::<serde_json::Map<_, _>>();
+    api_success(Value::Object(data))
+}
+
+async fn exemplars_get(
+    State(service): State<PrometheusService>,
+    headers: HeaderMap,
+    Query(parameters): Query<ExemplarParameters>,
+) -> Response {
+    execute_exemplars(service, headers, parameters).await
+}
+
+async fn exemplars_post(
+    State(service): State<PrometheusService>,
+    headers: HeaderMap,
+    Form(parameters): Form<ExemplarParameters>,
+) -> Response {
+    execute_exemplars(service, headers, parameters).await
+}
+
+async fn execute_exemplars(
+    service: PrometheusService,
+    headers: HeaderMap,
+    parameters: ExemplarParameters,
+) -> Response {
+    let start_ms = match parse_prometheus_time(&parameters.start) {
+        Ok(value) => value,
+        Err(error) => return query_error(StatusCode::BAD_REQUEST, "bad_data", &error),
+    };
+    let end_ms = match parse_prometheus_time(&parameters.end) {
+        Ok(value) => value,
+        Err(error) => return query_error(StatusCode::BAD_REQUEST, "bad_data", &error),
+    };
+    let discovery = DiscoveryParameters {
+        selectors: vec![parameters.query],
+        start: Some((start_ms as f64 / 1_000.0).to_string()),
+        end: Some((end_ms as f64 / 1_000.0).to_string()),
+    };
+    let points = match discovery_points(&service, &headers, &discovery).await {
+        Ok(points) => points,
+        Err(response) => return response,
+    };
+    let mut series = BTreeMap::<BTreeMap<String, String>, Vec<Value>>::new();
+    for point in points {
+        let labels = metric_labels(&point);
+        for exemplar in point.exemplars.iter() {
+            let exemplar_labels = exemplar
+                .filtered_attributes
+                .iter()
+                .filter_map(|attribute| {
+                    attribute
+                        .value
+                        .as_ref()
+                        .map(|value| (attribute.key.to_string(), render_telemetry_value(value)))
+                })
+                .collect::<BTreeMap<_, _>>();
+            series.entry(labels.clone()).or_default().push(json!({
+                "labels": exemplar_labels,
+                "value": format_number(exemplar.value),
+                "timestamp": timestamp_seconds(
+                    i64::try_from(exemplar.timestamp_unix_nanos / 1_000_000).unwrap_or(i64::MAX)
+                ),
+                "traceID": exemplar.trace_id.map(|id| id.to_string()).unwrap_or_default(),
+                "spanID": exemplar.span_id.map(|id| id.to_string()).unwrap_or_default()
+            }));
+        }
+    }
+    let data = series
+        .into_iter()
+        .map(|(series_labels, exemplars)| {
+            json!({"seriesLabels": series_labels, "exemplars": exemplars})
+        })
+        .collect::<Vec<_>>();
+    api_success(json!(data))
+}
+
+#[allow(clippy::result_large_err)]
+async fn discovery_points(
+    service: &PrometheusService,
+    headers: &HeaderMap,
+    parameters: &DiscoveryParameters,
+) -> Result<Vec<crate::DurableMetricPoint>, Response> {
+    let _permit = service.authorize(headers)?;
+    let start_ms = parameters
+        .start
+        .as_deref()
+        .map(parse_prometheus_time)
+        .transpose()
+        .map_err(|error| query_error(StatusCode::BAD_REQUEST, "bad_data", &error))?
+        .unwrap_or(0);
+    let end_ms = parameters
+        .end
+        .as_deref()
+        .map(parse_prometheus_time)
+        .transpose()
+        .map_err(|error| query_error(StatusCode::BAD_REQUEST, "bad_data", &error))?
+        .unwrap_or_else(current_time_ms);
+    let engine = PromqlEngine::new(
+        Arc::clone(&service.store),
+        Arc::clone(&service.config.tenant),
+        PromqlLimits::default(),
+    );
+    let selectors = parameters.selectors.clone();
+    match tokio::task::spawn_blocking(move || engine.raw_points(&selectors, start_ms, end_ms)).await
+    {
+        Ok(Ok(points)) => Ok(points),
+        Ok(Err(error)) => Err(query_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "execution",
+            &error.to_string(),
+        )),
+        Err(error) => Err(query_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal",
+            &format!("discovery worker failed: {error}"),
+        )),
+    }
+}
+
 async fn remote_write(
     State(service): State<PrometheusService>,
     headers: HeaderMap,
@@ -380,6 +705,143 @@ async fn remote_write(
             &format!("Remote Write worker failed: {error}"),
         ),
     }
+}
+
+async fn remote_read(
+    State(service): State<PrometheusService>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let _permit = match service.authorize(&headers) {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+    if body.len() > service.config.max_request_bytes {
+        return write_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Remote Read body is too large",
+        );
+    }
+    if !headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("snappy"))
+    {
+        return write_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "Remote Read requires Content-Encoding: snappy",
+        );
+    }
+    let decompressed_len = match snap::raw::decompress_len(&body) {
+        Ok(length) if length <= service.config.max_request_bytes => length,
+        Ok(_) => {
+            return write_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Remote Read Snappy payload expands beyond 64 MiB",
+            );
+        }
+        Err(error) => return write_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    let mut protobuf = vec![0_u8; decompressed_len];
+    if let Err(error) = snap::raw::Decoder::new().decompress(&body, &mut protobuf) {
+        return write_error(StatusCode::BAD_REQUEST, &error.to_string());
+    }
+    let request = match prometheus_v1::ReadRequest::decode(protobuf.as_slice()) {
+        Ok(request) => request,
+        Err(error) => return write_error(StatusCode::BAD_REQUEST, &error.to_string()),
+    };
+    let accepts_samples = request.accepted_response_types.is_empty()
+        || request.accepted_response_types.iter().any(|response_type| {
+            *response_type == prometheus_v1::ReadRequestResponseType::Samples as i32
+        });
+    if !accepts_samples {
+        return write_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "streamed XOR Remote Read is not enabled until its conformance gate passes",
+        );
+    }
+    let engine = PromqlEngine::new(
+        Arc::clone(&service.store),
+        Arc::clone(&service.config.tenant),
+        PromqlLimits::default(),
+    );
+    let result = tokio::task::spawn_blocking(move || {
+        let mut results = Vec::with_capacity(request.queries.len());
+        for query in request.queries {
+            let selector = remote_read_selector(&query.matchers)?;
+            let points = engine.raw_points(
+                &[selector],
+                query.start_timestamp_ms,
+                query.end_timestamp_ms,
+            )?;
+            let mut series =
+                BTreeMap::<BTreeMap<String, String>, Vec<prometheus_v1::Sample>>::new();
+            for point in points {
+                if let Some(value) = remote_read_float(&point.value) {
+                    series
+                        .entry(metric_labels(&point))
+                        .or_default()
+                        .push(prometheus_v1::Sample {
+                            value,
+                            timestamp: i64::try_from(point.timestamp_unix_nanos / 1_000_000)
+                                .unwrap_or(i64::MAX),
+                        });
+                }
+            }
+            let timeseries = series
+                .into_iter()
+                .map(|(labels, mut samples)| {
+                    samples.sort_unstable_by_key(|sample| sample.timestamp);
+                    prometheus_v1::TimeSeries {
+                        labels: labels
+                            .into_iter()
+                            .map(|(name, value)| prometheus_v1::Label { name, value })
+                            .collect(),
+                        samples,
+                        exemplars: Vec::new(),
+                        histograms: Vec::new(),
+                    }
+                })
+                .collect();
+            results.push(prometheus_v1::QueryResult { timeseries });
+        }
+        Ok::<_, crate::PromqlError>(prometheus_v1::ReadResponse { results })
+    })
+    .await;
+    let response = match result {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) => {
+            return query_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "execution",
+                &error.to_string(),
+            );
+        }
+        Err(error) => {
+            return query_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal",
+                &format!("Remote Read worker failed: {error}"),
+            );
+        }
+    };
+    let protobuf = response.encode_to_vec();
+    let compressed = match snap::raw::Encoder::new().compress_vec(&protobuf) {
+        Ok(compressed) => compressed,
+        Err(error) => return write_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
+    };
+    (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/x-protobuf"),
+            ),
+            (header::CONTENT_ENCODING, HeaderValue::from_static("snappy")),
+        ],
+        compressed,
+    )
+        .into_response()
 }
 
 #[allow(clippy::result_large_err)]
@@ -499,6 +961,110 @@ fn query_success(value: PromqlValue) -> Response {
         .into_response()
 }
 
+fn api_success(data: Value) -> Response {
+    (
+        StatusCode::OK,
+        axum::Json(json!({"status": "success", "data": data})),
+    )
+        .into_response()
+}
+
+fn metric_labels(point: &crate::DurableMetricPoint) -> BTreeMap<String, String> {
+    let mut labels = crate::prometheus_string_labels(&point.identity)
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect::<BTreeMap<_, _>>();
+    labels.insert("__name__".into(), point.identity.name.to_string());
+    labels
+}
+
+fn remote_read_selector(
+    matchers: &[prometheus_v1::LabelMatcher],
+) -> Result<String, crate::PromqlError> {
+    if matchers.is_empty() {
+        return Ok("{__name__=~\".+\"}".into());
+    }
+    let mut selector = String::from("{");
+    for (index, matcher) in matchers.iter().enumerate() {
+        if matcher.name.is_empty() {
+            return Err(crate::PromqlError::new(
+                "Remote Read matcher has an empty label name",
+            ));
+        }
+        if index != 0 {
+            selector.push(',');
+        }
+        selector.push_str(&matcher.name);
+        selector.push_str(
+            match prometheus_v1::LabelMatcherType::try_from(matcher.r#type) {
+                Ok(prometheus_v1::LabelMatcherType::Equal) => "=",
+                Ok(prometheus_v1::LabelMatcherType::NotEqual) => "!=",
+                Ok(prometheus_v1::LabelMatcherType::RegexMatch) => "=~",
+                Ok(prometheus_v1::LabelMatcherType::RegexNoMatch) => "!~",
+                Err(_) => {
+                    return Err(crate::PromqlError::new(
+                        "Remote Read matcher has an unknown type",
+                    ));
+                }
+            },
+        );
+        selector.push_str(
+            &serde_json::to_string(&matcher.value)
+                .map_err(|error| crate::PromqlError::new(error.to_string()))?,
+        );
+    }
+    selector.push('}');
+    Ok(selector)
+}
+
+fn remote_read_float(value: &MetricValue) -> Option<f64> {
+    match value {
+        MetricValue::Gauge(value) | MetricValue::Sum(value) => Some(match value {
+            NumberValue::Integer(value) => *value as f64,
+            NumberValue::DoubleBits(bits) => f64::from_bits(*bits),
+        }),
+        MetricValue::ExplicitHistogram(_)
+        | MetricValue::ExponentialHistogram(_)
+        | MetricValue::Summary(_) => None,
+    }
+}
+
+fn prometheus_metric_type(kind: &MetricKind) -> &'static str {
+    match kind {
+        MetricKind::Gauge => "gauge",
+        MetricKind::Sum {
+            monotonic: true, ..
+        } => "counter",
+        MetricKind::Sum { .. } => "gauge",
+        MetricKind::ExplicitHistogram { .. } | MetricKind::ExponentialHistogram { .. } => {
+            "histogram"
+        }
+        MetricKind::Summary => "summary",
+    }
+}
+
+fn format_number(value: NumberValue) -> String {
+    match value {
+        NumberValue::Integer(value) => value.to_string(),
+        NumberValue::DoubleBits(bits) => format_sample(f64::from_bits(bits)),
+    }
+}
+
+fn render_telemetry_value(value: &TelemetryValue) -> String {
+    match value {
+        TelemetryValue::Empty => String::new(),
+        TelemetryValue::String(value) => value.to_string(),
+        TelemetryValue::Boolean(value) => value.to_string(),
+        TelemetryValue::Integer(value) => value.to_string(),
+        TelemetryValue::DoubleBits(bits) => format_sample(f64::from_bits(*bits)),
+        TelemetryValue::Bytes(value) => value.iter().map(|byte| format!("{byte:02x}")).collect(),
+        TelemetryValue::Array(_) | TelemetryValue::Map(_) => {
+            serde_json::to_string(value).unwrap_or_default()
+        }
+        TelemetryValue::StringTableIndex(value) => value.to_string(),
+    }
+}
+
 fn query_error(status: StatusCode, error_type: &str, message: &str) -> Response {
     (
         status,
@@ -584,7 +1150,50 @@ fn parse_prometheus_duration(value: &str) -> Result<i64, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
     use super::*;
+    use crate::{DurableLokiConfig, StripeConfig};
+
+    fn test_service() -> (PrometheusService, std::path::PathBuf) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "shard-telemetry-prometheus-api-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = Arc::new(
+            DurableLokiStore::open(DurableLokiConfig {
+                data_directory: directory.clone(),
+                object_store_directory: None,
+                recovery_journal: false,
+                retention: None,
+                shard_count: 2,
+                tenant_partitions: 8,
+                append_linger: Duration::from_micros(250),
+                stripe: StripeConfig::default(),
+                indexed_ack_timeout: Duration::from_secs(30),
+            })
+            .expect("store opens"),
+        );
+        let service = PrometheusService::new(
+            store,
+            PrometheusApiConfig {
+                tenant: Arc::from("tenant-a"),
+                logical_partitions: NonZeroU16::new(8).unwrap(),
+                ..PrometheusApiConfig::default()
+            },
+        )
+        .expect("service");
+        (service, directory)
+    }
 
     #[test]
     fn version_header_must_match_negotiated_schema() {
@@ -617,5 +1226,76 @@ mod tests {
             response.headers()["x-prometheus-remote-write-exemplars-written"],
             "1"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn query_discovery_and_remote_read_routes_use_prometheus_envelopes() {
+        let (service, directory) = test_service();
+        let app = prometheus_router(service.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/query?query=1%2B2&time=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("query response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1_024 * 1_024)
+            .await
+            .expect("query body");
+        let body: Value = serde_json::from_slice(&body).expect("query JSON");
+        assert_eq!(body["status"], "success");
+        assert_eq!(body["data"]["resultType"], "scalar");
+        assert_eq!(body["data"]["result"][1], "3");
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/series?start=0&end=10")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("series response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let request = prometheus_v1::ReadRequest {
+            queries: Vec::new(),
+            accepted_response_types: vec![prometheus_v1::ReadRequestResponseType::Samples as i32],
+        };
+        let compressed = snap::raw::Encoder::new()
+            .compress_vec(&request.encode_to_vec())
+            .expect("Snappy request");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/read")
+                    .header(header::CONTENT_ENCODING, "snappy")
+                    .body(Body::from(compressed))
+                    .unwrap(),
+            )
+            .await
+            .expect("read response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1_024 * 1_024)
+            .await
+            .expect("read body");
+        let protobuf = snap::raw::Decoder::new()
+            .decompress_vec(&body)
+            .expect("Snappy response");
+        assert!(
+            prometheus_v1::ReadResponse::decode(protobuf.as_slice())
+                .expect("read response protobuf")
+                .results
+                .is_empty()
+        );
+
+        drop(service);
+        fs::remove_dir_all(directory).expect("remove test store");
     }
 }

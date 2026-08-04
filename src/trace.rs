@@ -610,6 +610,7 @@ pub struct TraceStripe {
     idle_nanos: u64,
     late_grace_nanos: u64,
     traces: HashMap<(Arc<str>, TraceId), HotTrace>,
+    sealed_blocks: Vec<Arc<[u8]>>,
     directory: TraceDirectory,
     next_block_id: u64,
 }
@@ -628,6 +629,7 @@ impl TraceStripe {
             idle_nanos: DEFAULT_TRACE_IDLE_NANOS,
             late_grace_nanos: DEFAULT_LATE_TRACE_NANOS,
             traces: HashMap::new(),
+            sealed_blocks: Vec::new(),
             directory: TraceDirectory::default(),
             next_block_id: 1,
         })
@@ -718,6 +720,7 @@ impl TraceStripe {
             self.next_block_id = self.next_block_id.saturating_add(1);
             let block = encode_trace_block(&spans)?;
             self.directory.publish(summarize_trace(&spans, block_id)?);
+            self.sealed_blocks.push(Arc::from(block.clone()));
             blocks.push(block);
         }
         Ok(blocks)
@@ -730,10 +733,17 @@ impl TraceStripe {
     }
 
     /// Queries current hot spans after trace/time pushdown.
-    #[must_use]
-    pub fn query(&self, query: &TraceQuery) -> Vec<DurableSpan> {
+    pub fn query(&self, query: &TraceQuery) -> TelemetryResult<Vec<DurableSpan>> {
         let limit = query.limit.max(1);
-        let mut spans = self
+        let mut winners = BTreeMap::<(Arc<str>, TraceId, SpanId), DurableSpan>::new();
+        for block in &self.sealed_blocks {
+            for span in decode_trace_block(block)? {
+                if trace_query_matches(query, &span) {
+                    retain_newest_span(&mut winners, span);
+                }
+            }
+        }
+        for span in self
             .traces
             .iter()
             .filter(|((tenant, trace_id), _)| {
@@ -759,7 +769,10 @@ impl TraceStripe {
                     .is_none_or(|duration| span.duration_nanos >= duration)
             })
             .cloned()
-            .collect::<Vec<_>>();
+        {
+            retain_newest_span(&mut winners, span);
+        }
+        let mut spans = winners.into_values().collect::<Vec<_>>();
         spans.sort_unstable_by_key(|span| {
             (
                 span.trace_id,
@@ -768,7 +781,7 @@ impl TraceStripe {
             )
         });
         spans.truncate(limit);
-        spans
+        Ok(spans)
     }
 
     /// Returns current stripe-local head bytes.
@@ -781,6 +794,33 @@ impl TraceStripe {
     #[must_use]
     pub const fn late_grace_nanos(&self) -> u64 {
         self.late_grace_nanos
+    }
+}
+
+fn trace_query_matches(query: &TraceQuery, span: &DurableSpan) -> bool {
+    span.tenant == query.tenant
+        && query.trace_id.is_none_or(|value| value == span.trace_id)
+        && query
+            .start_time_unix_nanos
+            .is_none_or(|start| span.end_time_unix_nanos().unwrap_or(u64::MAX) >= start)
+        && query
+            .end_time_unix_nanos
+            .is_none_or(|end| span.start_time_unix_nanos < end)
+        && query
+            .min_duration_nanos
+            .is_none_or(|duration| span.duration_nanos >= duration)
+}
+
+fn retain_newest_span(
+    winners: &mut BTreeMap<(Arc<str>, TraceId, SpanId), DurableSpan>,
+    span: DurableSpan,
+) {
+    let key = (Arc::clone(&span.tenant), span.trace_id, span.span_id);
+    if winners
+        .get(&key)
+        .is_none_or(|existing| existing.record_ref.offset < span.record_ref.offset)
+    {
+        winners.insert(key, span);
     }
 }
 
@@ -895,13 +935,15 @@ mod tests {
         stripe.apply(span(1, 1, 1), 10).unwrap();
         let blocks = stripe.seal_idle(10 + DEFAULT_TRACE_IDLE_NANOS).unwrap();
         assert_eq!(blocks.len(), 1);
-        let summaries = stripe.directory().query(&TraceQuery {
+        let query = TraceQuery {
             tenant: Arc::from("tenant-a"),
             trace_id: Some(TraceId::from_bytes([1; 16]).unwrap()),
             limit: 10,
             ..TraceQuery::default()
-        });
+        };
+        let summaries = stripe.directory().query(&query);
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].span_count, 1);
+        assert_eq!(stripe.query(&query).unwrap().len(), 1);
     }
 }

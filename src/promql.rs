@@ -89,7 +89,7 @@ pub enum PromqlValue {
 pub struct PromqlError(String);
 
 impl PromqlError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self(message.into())
     }
 }
@@ -199,6 +199,51 @@ impl PromqlEngine {
                 .map(|(labels, samples)| PromqlSeries { labels, samples })
                 .collect(),
         ))
+    }
+
+    /// Selects exact raw points for Prometheus discovery, metadata, and exemplar APIs.
+    pub(crate) fn raw_points(
+        &self,
+        selectors: &[String],
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<DurableMetricPoint>, PromqlError> {
+        if start_ms > end_ms {
+            return Err(PromqlError::new("invalid Prometheus discovery range"));
+        }
+        if selectors.is_empty() {
+            return self
+                .store
+                .query_metrics(&MetricQuery {
+                    tenant: Arc::clone(&self.tenant),
+                    start_time_unix_nanos: Some(millis_to_nanos(start_ms)?),
+                    end_time_unix_nanos: Some(millis_to_nanos(end_ms)?),
+                    limit: self.limits.max_points,
+                    ..MetricQuery::default()
+                })
+                .map_err(|error| PromqlError::new(error.to_string()));
+        }
+        let mut points = BTreeMap::new();
+        for expression in selectors {
+            let selector = match parse(expression).map_err(PromqlError::new)? {
+                Expr::VectorSelector(selector) => selector,
+                _ => {
+                    return Err(PromqlError::new(
+                        "series matchers must be instant vector selectors",
+                    ));
+                }
+            };
+            for point in self.scan_selector(&selector, start_ms, end_ms)? {
+                let labels = point_labels(&point);
+                if selector_matches(&selector, &labels) {
+                    points.insert(
+                        (point.record_ref.topic_partition, point.record_ref.offset),
+                        point,
+                    );
+                }
+            }
+        }
+        Ok(points.into_values().collect())
     }
 
     fn eval(&self, expr: &Expr, context: &EvalContext) -> Result<PromqlValue, PromqlError> {

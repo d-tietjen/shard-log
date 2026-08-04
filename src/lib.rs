@@ -39,9 +39,12 @@ mod storage_format;
 mod stripe;
 mod structural;
 mod telemetry;
+mod tempo_api;
+mod tempo_protocol;
 mod tier;
 mod tier_ingest;
 mod trace;
+mod traceql;
 mod types;
 
 pub use analytics::{
@@ -121,6 +124,7 @@ pub use telemetry::{
     ShardTelemetryConfig, SignalConfig, SpanId, TRACES_TOPIC_ID, TelemetryAttribute,
     TelemetryEntityRef, TelemetryRouter, TelemetrySignal, TelemetryValue, TraceId,
 };
+pub use tempo_api::{TempoApiConfig, TempoService, tempo_router};
 pub use tier::{
     CatalogGroupEntry, CatalogPage, CatalogPageRef, CatalogPointer, CatalogRoot, LocalObjectStore,
     ObjectMetadata, ObjectTierConfig, SharedTelemetryObjectStore, SsdCacheConfig, SsdObjectCache,
@@ -132,6 +136,7 @@ pub use trace::{
     DurableSpan, SpanEvent, SpanLink, SpanStatus, TraceApplyOutcome, TraceDirectory, TraceQuery,
     TraceStripe, TraceSummary, decode_trace_block, encode_trace_block,
 };
+pub use traceql::{TraceqlEngine, TraceqlError, TraceqlLimits, TraceqlTrace};
 pub use types::{
     CaseSensitivity, DurableLog, LogMatch, LogPredicate, LogQuery, LogRegex, MetadataField,
     NumericComparison, QueryCursor, QueryOrder, QuerySort, TelemetryRecordRef, TextMatchKind,
