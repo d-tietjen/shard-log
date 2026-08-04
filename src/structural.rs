@@ -29,7 +29,12 @@ const EMPTY_ATTRIBUTE_KEY: u32 = u32::MAX;
 const LINEAR_ATTRIBUTE_DICTIONARY_LIMIT: usize = 16;
 const ATTRIBUTE_KEY_CACHE_ENTRIES: usize = 32;
 const SEEK_CHECKPOINT_INTERVAL: usize = 256;
-const EMBEDDED_MEMBERSHIP_FILTER_WORDS: usize = 128;
+// Candidate filters are fail-open and only avoid obviously absent block reads.
+// A compact filter is deliberately preferred here: false positives cost one
+// selective verification, while every filter byte is retained in every frame.
+const EMBEDDED_MEMBERSHIP_FILTER_WORDS: usize = 8;
+const PACKED_IDS_BITPACKED: u8 = 0;
+const PACKED_IDS_RUN_LENGTH: u8 = 1;
 
 type DecodedAttributeTables = (Vec<Arc<str>>, Vec<Vec<Arc<str>>>);
 
@@ -583,7 +588,12 @@ impl EmbeddedFrameIndex {
         let mut encoded = Vec::new();
         encoded.extend_from_slice(EMBEDDED_INDEX_MAGIC);
         write_varint(u64::from(self.record_count), &mut encoded);
-        encode_packed_column(&self.layout_ids, self.layout_count, &mut encoded)?;
+        encode_packed_column(
+            &self.layout_ids,
+            self.layout_count,
+            self.record_count,
+            &mut encoded,
+        )?;
         encode_optional_sorted_ids(&self.residual_layout_ids, self.layout_count, &mut encoded)?;
         encode_membership_filter(&self.term_membership, &mut encoded);
         write_varint(
@@ -594,7 +604,12 @@ impl EmbeddedFrameIndex {
             append_bytes(&mut encoded, locator.term.as_bytes())?;
             encode_sorted_ids(&locator.layout_ids, self.layout_count, &mut encoded)?;
         }
-        encode_packed_column(&self.field_set_ids, self.field_set_count, &mut encoded)?;
+        encode_packed_column(
+            &self.field_set_ids,
+            self.field_set_count,
+            self.record_count,
+            &mut encoded,
+        )?;
         encode_membership_filter(&self.field_membership, &mut encoded);
         write_varint(
             u64::try_from(self.fields.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
@@ -2664,11 +2679,51 @@ fn matching_packed_ids(
 fn encode_packed_column(
     column: &PackedIdColumn,
     dictionary_count: u32,
+    record_count: u32,
     encoded: &mut Vec<u8>,
 ) -> TelemetryResult<()> {
     write_varint(u64::from(dictionary_count), encoded);
-    encoded.push(column.bits_per_id);
-    append_bytes(encoded, &column.values)
+    let mut runs = Vec::<(u32, u32)>::new();
+    for ordinal in 0..record_count {
+        let id = packed_id(column, ordinal);
+        if let Some((last_id, length)) = runs.last_mut()
+            && *last_id == id
+        {
+            *length = length
+                .checked_add(1)
+                .ok_or(TelemetryError::RecordTooLarge)?;
+        } else {
+            runs.push((id, 1));
+        }
+    }
+
+    let mut run_length = Vec::new();
+    write_varint(
+        u64::try_from(runs.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
+        &mut run_length,
+    );
+    for (id, length) in runs {
+        write_varint(u64::from(id), &mut run_length);
+        write_varint(u64::from(length), &mut run_length);
+    }
+
+    let value_bytes =
+        u64::try_from(column.values.len()).map_err(|_| TelemetryError::RecordTooLarge)?;
+    let bitpacked_bytes = 1usize
+        .checked_add(varint_length(value_bytes))
+        .and_then(|length| length.checked_add(column.values.len()))
+        .ok_or(TelemetryError::RecordTooLarge)?;
+    let run_length_bytes = 1usize
+        .checked_add(run_length.len())
+        .ok_or(TelemetryError::RecordTooLarge)?;
+    if run_length_bytes < bitpacked_bytes {
+        encoded.push(PACKED_IDS_RUN_LENGTH);
+        encoded.extend_from_slice(&run_length);
+    } else {
+        encoded.push(PACKED_IDS_BITPACKED);
+        append_bytes(encoded, &column.values)?;
+    }
+    Ok(())
 }
 
 fn decode_packed_column(
@@ -2684,23 +2739,63 @@ fn decode_packed_column(
             "invalid embedded dictionary count",
         ));
     }
-    let bits_per_id = read_byte(encoded, cursor)?;
-    if bits_per_id != bits_for_dictionary(dictionary_count) {
-        return Err(TelemetryError::InvalidBlockEncoding(
-            "noncanonical packed ID width",
-        ));
-    }
-    let values = read_bytes(encoded, cursor)?.to_vec();
+    let bits_per_id = bits_for_dictionary(dictionary_count);
     let expected_bytes = usize::try_from(record_count)
         .map_err(|_| TelemetryError::RecordTooLarge)?
         .checked_mul(usize::from(bits_per_id))
         .ok_or(TelemetryError::RecordTooLarge)?
         .div_ceil(u8::BITS as usize);
-    if values.len() != expected_bytes {
-        return Err(TelemetryError::InvalidBlockEncoding(
-            "packed ID column length mismatch",
-        ));
-    }
+    let encoding = read_byte(encoded, cursor)?;
+    let values = match encoding {
+        PACKED_IDS_BITPACKED => {
+            let values = read_bytes(encoded, cursor)?.to_vec();
+            if values.len() != expected_bytes {
+                return Err(TelemetryError::InvalidBlockEncoding(
+                    "packed ID column length mismatch",
+                ));
+            }
+            values
+        }
+        PACKED_IDS_RUN_LENGTH => {
+            let run_count = read_usize(encoded, cursor)?;
+            ensure_count_within(
+                run_count,
+                encoded.len().saturating_sub(*cursor),
+                "packed ID run count",
+            )?;
+            let mut ids = Vec::with_capacity(
+                usize::try_from(record_count).map_err(|_| TelemetryError::RecordTooLarge)?,
+            );
+            for _ in 0..run_count {
+                let id = read_u32(encoded, cursor)?;
+                let length = read_usize(encoded, cursor)?;
+                if id >= dictionary_count || length == 0 {
+                    return Err(TelemetryError::InvalidBlockEncoding(
+                        "packed ID run is invalid",
+                    ));
+                }
+                let new_length = ids
+                    .len()
+                    .checked_add(length)
+                    .filter(|length| *length <= record_count as usize)
+                    .ok_or(TelemetryError::InvalidBlockEncoding(
+                        "packed ID runs exceed record count",
+                    ))?;
+                ids.resize(new_length, id);
+            }
+            if ids.len() != record_count as usize {
+                return Err(TelemetryError::InvalidBlockEncoding(
+                    "packed ID runs do not cover record count",
+                ));
+            }
+            pack_ids(&ids, dictionary_count)?.values
+        }
+        _ => {
+            return Err(TelemetryError::InvalidBlockEncoding(
+                "unknown packed ID column encoding",
+            ));
+        }
+    };
     let column = PackedIdColumn {
         bits_per_id,
         values,
@@ -2839,6 +2934,15 @@ fn write_varint(value: u64, encoded: &mut Vec<u8>) {
     } else {
         write_multibyte_varint(value, encoded);
     }
+}
+
+fn varint_length(mut value: u64) -> usize {
+    let mut length = 1usize;
+    while value >= 0x80 {
+        value >>= 7;
+        length += 1;
+    }
+    length
 }
 
 #[inline(never)]
@@ -3169,6 +3273,41 @@ mod tests {
                 .term_candidate_ordinals("definitely_absent_987654321")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn packed_id_columns_choose_the_smaller_lossless_encoding() {
+        let repeated_ids = vec![1_u32; 4_096];
+        let repeated = pack_ids(&repeated_ids, 2).expect("repeated IDs pack");
+        let mut repeated_encoded = Vec::new();
+        encode_packed_column(&repeated, 2, 4_096, &mut repeated_encoded)
+            .expect("repeated column encodes");
+        let mut cursor = 0;
+        assert_eq!(read_u32(&repeated_encoded, &mut cursor).unwrap(), 2);
+        assert_eq!(
+            read_byte(&repeated_encoded, &mut cursor).unwrap(),
+            PACKED_IDS_RUN_LENGTH
+        );
+        cursor = 0;
+        let (_, decoded) = decode_packed_column(&repeated_encoded, &mut cursor, 4_096).unwrap();
+        assert_eq!(decoded, repeated);
+        require_consumed(&repeated_encoded, cursor).unwrap();
+
+        let alternating_ids = (0..4_096).map(|ordinal| ordinal & 1).collect::<Vec<_>>();
+        let alternating = pack_ids(&alternating_ids, 2).expect("alternating IDs pack");
+        let mut alternating_encoded = Vec::new();
+        encode_packed_column(&alternating, 2, 4_096, &mut alternating_encoded)
+            .expect("alternating column encodes");
+        cursor = 0;
+        assert_eq!(read_u32(&alternating_encoded, &mut cursor).unwrap(), 2);
+        assert_eq!(
+            read_byte(&alternating_encoded, &mut cursor).unwrap(),
+            PACKED_IDS_BITPACKED
+        );
+        cursor = 0;
+        let (_, decoded) = decode_packed_column(&alternating_encoded, &mut cursor, 4_096).unwrap();
+        assert_eq!(decoded, alternating);
+        require_consumed(&alternating_encoded, cursor).unwrap();
     }
 
     #[test]
