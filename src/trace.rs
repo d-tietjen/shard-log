@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 use pco::ChunkConfig;
@@ -572,6 +572,18 @@ impl TraceDirectory {
         current.block_fragments = Arc::new(fragments);
     }
 
+    fn publish_current(&mut self, mut summary: TraceSummary) {
+        let key = (Arc::clone(&summary.tenant), summary.trace_id);
+        if let Some(current) = self.entries.get(&key) {
+            let mut fragments = current.block_fragments.as_ref().clone();
+            fragments.extend(summary.block_fragments.iter().copied());
+            fragments.sort_unstable();
+            fragments.dedup();
+            summary.block_fragments = Arc::new(fragments);
+        }
+        self.entries.insert(key, summary);
+    }
+
     /// Executes direct-ID or bounded summary search without span materialization.
     #[must_use]
     pub fn query(&self, query: &TraceQuery) -> Vec<TraceSummary> {
@@ -611,6 +623,16 @@ struct HotTrace {
     retries: u64,
 }
 
+#[derive(Debug)]
+struct RecentlySealedTrace {
+    spans: BTreeMap<SpanId, DurableSpan>,
+    bytes: usize,
+    first_sealed_nanos: u64,
+    last_sealed_nanos: u64,
+    conflicts: u64,
+    retries: u64,
+}
+
 /// Result of applying one span to a stripe-local trace head.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TraceApplyOutcome {
@@ -632,6 +654,9 @@ pub struct TraceStripe {
     idle_nanos: u64,
     late_grace_nanos: u64,
     traces: HashMap<(Arc<str>, TraceId), HotTrace>,
+    recently_sealed: HashMap<(Arc<str>, TraceId), RecentlySealedTrace>,
+    recent_order: VecDeque<(u64, (Arc<str>, TraceId))>,
+    recently_sealed_bytes: usize,
     sealed_blocks: Vec<SealedTraceBlock>,
     pending_blocks: Vec<SignalTierPayload>,
     directory: TraceDirectory,
@@ -658,6 +683,9 @@ impl TraceStripe {
             idle_nanos: DEFAULT_TRACE_IDLE_NANOS,
             late_grace_nanos: DEFAULT_LATE_TRACE_NANOS,
             traces: HashMap::new(),
+            recently_sealed: HashMap::new(),
+            recent_order: VecDeque::new(),
+            recently_sealed_bytes: 0,
             sealed_blocks: Vec::new(),
             pending_blocks: Vec::new(),
             directory: TraceDirectory::default(),
@@ -681,25 +709,54 @@ impl TraceStripe {
         if estimated > self.head_budget_bytes {
             return Err(TelemetryError::RecordTooLarge);
         }
-        if self.head_bytes.saturating_add(estimated) > self.head_budget_bytes {
+        self.expire_recent(append_time_nanos);
+        let hot_has_span = self
+            .traces
+            .get(&key)
+            .is_some_and(|trace| trace.spans.contains_key(&span.span_id));
+        let mut replaces_recent = false;
+        if !hot_has_span
+            && let Some(recent) = self.recently_sealed.get_mut(&key)
+            && let Some(existing) = recent.spans.get(&span.span_id)
+        {
+            if same_span_payload(existing, &span) {
+                recent.retries = recent.retries.saturating_add(1);
+                return Ok(TraceApplyOutcome::Duplicate);
+            }
+            recent.conflicts = recent.conflicts.saturating_add(1);
+            if existing.record_ref.offset >= span.record_ref.offset {
+                return Ok(TraceApplyOutcome::Obsolete);
+            }
+            let previous = existing.estimated_head_bytes();
+            recent.spans.remove(&span.span_id);
+            recent.bytes = recent.bytes.saturating_sub(previous);
+            self.recently_sealed_bytes = self.recently_sealed_bytes.saturating_sub(previous);
+            replaces_recent = true;
+        }
+        if self.resident_state_bytes().saturating_add(estimated) > self.head_budget_bytes {
             self.seal_idle(append_time_nanos)?;
         }
-        if self.head_bytes.saturating_add(estimated) > self.head_budget_bytes {
+        self.evict_recent_to_fit(estimated);
+        if self.resident_state_bytes().saturating_add(estimated) > self.head_budget_bytes {
             return Err(TelemetryError::InvalidConfig(
                 "trace head memory budget exhausted",
             ));
         }
+        let first_sealed_nanos = self
+            .recently_sealed
+            .get(&key)
+            .map(|recent| recent.first_sealed_nanos);
         let trace = self.traces.entry(key).or_insert_with(|| HotTrace {
             spans: BTreeMap::new(),
             bytes: 0,
             last_append_nanos: append_time_nanos,
-            first_sealed_nanos: None,
+            first_sealed_nanos,
             conflicts: 0,
             retries: 0,
         });
         trace.last_append_nanos = append_time_nanos;
         match trace.spans.get(&span.span_id) {
-            Some(existing) if existing == &span => {
+            Some(existing) if same_span_payload(existing, &span) => {
                 trace.retries = trace.retries.saturating_add(1);
                 Ok(TraceApplyOutcome::Duplicate)
             }
@@ -725,9 +782,93 @@ impl TraceStripe {
                 trace.bytes = trace.bytes.saturating_add(estimated);
                 self.head_bytes = self.head_bytes.saturating_add(estimated);
                 trace.spans.insert(span.span_id, span);
-                Ok(TraceApplyOutcome::Inserted)
+                Ok(if replaces_recent {
+                    TraceApplyOutcome::Replaced
+                } else {
+                    TraceApplyOutcome::Inserted
+                })
             }
         }
+    }
+
+    fn resident_state_bytes(&self) -> usize {
+        self.head_bytes.saturating_add(self.recently_sealed_bytes)
+    }
+
+    fn expire_recent(&mut self, now_nanos: u64) {
+        while self.recent_order.front().is_some_and(|(sealed_at, _)| {
+            now_nanos.saturating_sub(*sealed_at) > self.late_grace_nanos
+        }) {
+            let (sealed_at, key) = self.recent_order.pop_front().expect("front was checked");
+            if self
+                .recently_sealed
+                .get(&key)
+                .is_some_and(|recent| recent.last_sealed_nanos == sealed_at)
+                && let Some(recent) = self.recently_sealed.remove(&key)
+            {
+                self.recently_sealed_bytes =
+                    self.recently_sealed_bytes.saturating_sub(recent.bytes);
+            }
+        }
+    }
+
+    fn evict_recent_to_fit(&mut self, additional_bytes: usize) {
+        while self.resident_state_bytes().saturating_add(additional_bytes) > self.head_budget_bytes
+        {
+            let Some((sealed_at, key)) = self.recent_order.pop_front() else {
+                break;
+            };
+            if self
+                .recently_sealed
+                .get(&key)
+                .is_some_and(|recent| recent.last_sealed_nanos == sealed_at)
+                && let Some(recent) = self.recently_sealed.remove(&key)
+            {
+                self.recently_sealed_bytes =
+                    self.recently_sealed_bytes.saturating_sub(recent.bytes);
+            }
+        }
+    }
+
+    fn remember_recent(
+        &mut self,
+        key: &(Arc<str>, TraceId),
+        spans: &[DurableSpan],
+        first_sealed_nanos: u64,
+        now_nanos: u64,
+    ) {
+        let recent =
+            self.recently_sealed
+                .entry(key.clone())
+                .or_insert_with(|| RecentlySealedTrace {
+                    spans: BTreeMap::new(),
+                    bytes: 0,
+                    first_sealed_nanos,
+                    last_sealed_nanos: now_nanos,
+                    conflicts: 0,
+                    retries: 0,
+                });
+        let previous_bytes = recent.bytes;
+        recent.first_sealed_nanos = recent.first_sealed_nanos.min(first_sealed_nanos);
+        recent.last_sealed_nanos = now_nanos;
+        for span in spans {
+            let replace = recent
+                .spans
+                .get(&span.span_id)
+                .is_none_or(|existing| existing.record_ref.offset < span.record_ref.offset);
+            if replace {
+                if let Some(existing) = recent.spans.insert(span.span_id, span.clone()) {
+                    recent.bytes = recent.bytes.saturating_sub(existing.estimated_head_bytes());
+                }
+                recent.bytes = recent.bytes.saturating_add(span.estimated_head_bytes());
+            }
+        }
+        self.recently_sealed_bytes = self
+            .recently_sealed_bytes
+            .saturating_sub(previous_bytes)
+            .saturating_add(recent.bytes);
+        self.recent_order.push_back((now_nanos, key.clone()));
+        self.evict_recent_to_fit(0);
     }
 
     /// Seals traces idle for 30 seconds and returns immutable trace blocks.
@@ -771,14 +912,22 @@ impl TraceStripe {
     ) -> TelemetryResult<Vec<Vec<u8>>> {
         let mut blocks = Vec::with_capacity(ready.len());
         for key in ready {
-            let mut trace = self.traces.remove(&key).expect("selected trace exists");
+            let trace = self.traces.remove(&key).expect("selected trace exists");
             self.head_bytes = self.head_bytes.saturating_sub(trace.bytes);
-            trace.first_sealed_nanos = Some(now_nanos);
+            let continued_recent_trace = trace.first_sealed_nanos.is_some();
+            let first_sealed_nanos = trace.first_sealed_nanos.unwrap_or(now_nanos);
             let spans = trace.spans.into_values().collect::<Vec<_>>();
             let block_id = self.next_block_id;
             self.next_block_id = self.next_block_id.saturating_add(1);
             let block = encode_trace_block(&spans)?;
-            self.directory.publish(summarize_trace(&spans, block_id)?);
+            self.remember_recent(&key, &spans, first_sealed_nanos, now_nanos);
+            if continued_recent_trace && let Some(recent) = self.recently_sealed.get(&key) {
+                let current = recent.spans.values().cloned().collect::<Vec<_>>();
+                self.directory
+                    .publish_current(summarize_trace(&current, block_id)?);
+            } else {
+                self.directory.publish(summarize_trace(&spans, block_id)?);
+            }
             let payload = Arc::<[u8]>::from(block.clone());
             let first_offset = spans
                 .iter()
@@ -899,10 +1048,10 @@ impl TraceStripe {
         Ok(spans)
     }
 
-    /// Returns current stripe-local head bytes.
+    /// Returns current mutable and late-fragment state bytes.
     #[must_use]
-    pub const fn head_bytes(&self) -> usize {
-        self.head_bytes
+    pub fn head_bytes(&self) -> usize {
+        self.resident_state_bytes()
     }
 
     /// Returns the configured late-fragment compaction window.
@@ -924,6 +1073,12 @@ pub(crate) fn trace_query_matches(query: &TraceQuery, span: &DurableSpan) -> boo
         && query
             .min_duration_nanos
             .is_none_or(|duration| span.duration_nanos >= duration)
+}
+
+fn same_span_payload(left: &DurableSpan, right: &DurableSpan) -> bool {
+    let mut normalized = right.clone();
+    normalized.record_ref.offset = left.record_ref.offset;
+    left == &normalized
 }
 
 fn retain_newest_span(
@@ -1045,6 +1200,58 @@ mod tests {
     }
 
     #[test]
+    fn retries_and_conflicts_remain_deterministic_after_sealing() {
+        let mut stripe = TraceStripe::new(1024 * 1024).unwrap();
+        let original = span(1, 1, 1);
+        stripe.apply(original.clone(), 10).unwrap();
+        stripe.seal_idle(10 + DEFAULT_TRACE_IDLE_NANOS).unwrap();
+
+        let mut retry = original.clone();
+        retry.record_ref.offset = LogicalOffset::new(2);
+        assert_eq!(
+            stripe
+                .apply(retry, 10 + DEFAULT_TRACE_IDLE_NANOS + 1)
+                .unwrap(),
+            TraceApplyOutcome::Duplicate
+        );
+
+        let mut replacement = original.clone();
+        replacement.record_ref.offset = LogicalOffset::new(3);
+        replacement.name = Arc::from("changed");
+        let replacement_time = 10 + DEFAULT_TRACE_IDLE_NANOS + 2;
+        assert_eq!(
+            stripe.apply(replacement, replacement_time).unwrap(),
+            TraceApplyOutcome::Replaced
+        );
+        stripe
+            .seal_idle(replacement_time + DEFAULT_TRACE_IDLE_NANOS)
+            .unwrap();
+
+        let mut obsolete = original;
+        obsolete.record_ref.offset = LogicalOffset::new(2);
+        obsolete.name = Arc::from("obsolete");
+        assert_eq!(
+            stripe
+                .apply(obsolete, replacement_time + DEFAULT_TRACE_IDLE_NANOS + 1)
+                .unwrap(),
+            TraceApplyOutcome::Obsolete
+        );
+
+        let query = TraceQuery {
+            tenant: Arc::from("tenant-a"),
+            trace_id: Some(TraceId::from_bytes([1; 16]).unwrap()),
+            limit: 10,
+            ..TraceQuery::default()
+        };
+        let summary = stripe.directory().query(&query);
+        assert_eq!(summary[0].span_count, 1);
+        assert_eq!(summary[0].block_fragments.as_ref(), &[1, 2]);
+        let spans = stripe.query(&query).unwrap();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].name.as_ref(), "changed");
+    }
+
+    #[test]
     fn idle_trace_seals_and_becomes_directly_queryable() {
         let mut stripe = TraceStripe::new(1024 * 1024).unwrap();
         stripe.apply(span(1, 1, 1), 10).unwrap();
@@ -1085,5 +1292,23 @@ mod tests {
         assert_eq!(summaries[0].span_count, 2);
         assert_eq!(summaries[0].block_fragments.as_ref(), &[1, 2]);
         assert_eq!(stripe.query(&query).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn late_retry_state_stays_within_the_trace_head_budget() {
+        let one_span_bytes = span(1, 1, 1).estimated_head_bytes();
+        let budget = one_span_bytes.saturating_mul(2);
+        let mut stripe = TraceStripe::new(budget).unwrap();
+        let mut now = 1u64;
+        for trace_byte in 1..=16 {
+            stripe
+                .apply(span(u64::from(trace_byte), trace_byte, 1), now)
+                .unwrap();
+            now = now.saturating_add(DEFAULT_TRACE_IDLE_NANOS);
+            stripe.seal_idle(now).unwrap();
+            now = now.saturating_add(1);
+            assert!(stripe.head_bytes() <= budget);
+        }
+        assert!(stripe.recently_sealed.len() <= 2);
     }
 }
