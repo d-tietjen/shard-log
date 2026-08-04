@@ -25,6 +25,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut records = 32_768usize;
     let mut iterations = 2_000usize;
     let mut clickhouse_dir = None::<PathBuf>;
+    let mut durable_output_dir = None::<PathBuf>;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
@@ -33,6 +34,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--clickhouse-dir" => {
                 clickhouse_dir = Some(PathBuf::from(
                     args.next().ok_or("missing value for --clickhouse-dir")?,
+                ));
+            }
+            "--durable-output-dir" => {
+                durable_output_dir = Some(PathBuf::from(
+                    args.next()
+                        .ok_or("missing value for --durable-output-dir")?,
                 ));
             }
             _ => return Err(format!("unknown argument {argument}").into()),
@@ -46,12 +53,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(output_dir) = clickhouse_dir.as_deref() {
         export_clickhouse_corpus(&corpus, output_dir)?;
     }
+    if let Some(output_dir) = durable_output_dir.as_deref() {
+        fs::create_dir_all(output_dir)?;
+    }
     println!("ShardTelemetry signal benchmark (v1)");
     println!("records_per_signal={records} lookup_iterations={iterations}");
 
     let log_result = benchmark_logs(&corpus, iterations)?;
-    let trace_result = benchmark_traces(&corpus, iterations)?;
-    let metric_result = benchmark_metrics(&corpus, iterations)?;
+    let trace_result = benchmark_traces(&corpus, iterations, durable_output_dir.as_deref())?;
+    let metric_result = benchmark_metrics(&corpus, iterations, durable_output_dir.as_deref())?;
     let correlation_result = benchmark_correlations(&corpus, iterations);
     print_result("logs", log_result);
     print_result("traces", trace_result);
@@ -515,6 +525,7 @@ struct ResultRow {
     source_bytes: usize,
     payload_bytes: usize,
     auxiliary_bytes: usize,
+    durable_bytes: usize,
     encode_mib_per_second: f64,
     decode_mib_per_second: f64,
     lookup_count: usize,
@@ -567,6 +578,7 @@ fn benchmark_logs(
         source_bytes,
         payload_bytes,
         auxiliary_bytes: 0,
+        durable_bytes: payload_bytes,
         encode_mib_per_second: mib_per_second(source_bytes, encode_elapsed),
         decode_mib_per_second: mib_per_second(source_bytes, decode_elapsed),
         lookup_count,
@@ -579,6 +591,7 @@ fn benchmark_logs(
 fn benchmark_traces(
     corpus: &Corpus,
     iterations: usize,
+    durable_output_dir: Option<&Path>,
 ) -> Result<ResultRow, Box<dyn std::error::Error>> {
     let source_bytes = serialized_bytes(&corpus.spans)?;
     let grouped = group_trace_blocks(&corpus.spans)?;
@@ -588,12 +601,21 @@ fn benchmark_traces(
         .map(|spans| {
             let payload = encode_trace_block(spans)?;
             let filter = serde_json::to_vec(&CorrelationBlockFilter::for_spans(spans))?;
-            Ok::<_, Box<dyn std::error::Error>>((payload, filter.len()))
+            Ok::<_, Box<dyn std::error::Error>>((payload, filter))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let durable_bytes = durable_output_dir.map_or_else(
+        || {
+            Ok(encoded
+                .iter()
+                .map(|(payload, filter)| payload.len() + filter.len())
+                .sum())
+        },
+        |output_dir| persist_encoded(output_dir.join("traces.pack"), &encoded),
+    )?;
     let encode_elapsed = start.elapsed();
     let payload_bytes = encoded.iter().map(|(payload, _)| payload.len()).sum();
-    let auxiliary_bytes = encoded.iter().map(|(_, bytes)| *bytes).sum();
+    let auxiliary_bytes = encoded.iter().map(|(_, filter)| filter.len()).sum();
     let start = Instant::now();
     let decoded_count = encoded.iter().try_fold(0usize, |count, (block, _)| {
         decode_trace_block(block).map(|spans| count + spans.len())
@@ -619,6 +641,7 @@ fn benchmark_traces(
         source_bytes,
         payload_bytes,
         auxiliary_bytes,
+        durable_bytes,
         encode_mib_per_second: mib_per_second(source_bytes, encode_elapsed),
         decode_mib_per_second: mib_per_second(source_bytes, decode_elapsed),
         lookup_count,
@@ -631,6 +654,7 @@ fn benchmark_traces(
 fn benchmark_metrics(
     corpus: &Corpus,
     iterations: usize,
+    durable_output_dir: Option<&Path>,
 ) -> Result<ResultRow, Box<dyn std::error::Error>> {
     let source_bytes = serialized_bytes(&corpus.points)?;
     let mut series = BTreeMap::<SeriesFingerprint, Vec<DurableMetricPoint>>::new();
@@ -646,12 +670,21 @@ fn benchmark_metrics(
         .map(|points| {
             let payload = encode_metric_chunk(points)?;
             let filter = serde_json::to_vec(&CorrelationBlockFilter::for_metrics(points))?;
-            Ok::<_, Box<dyn std::error::Error>>((payload, filter.len()))
+            Ok::<_, Box<dyn std::error::Error>>((payload, filter))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let durable_bytes = durable_output_dir.map_or_else(
+        || {
+            Ok(encoded
+                .iter()
+                .map(|(payload, filter)| payload.len() + filter.len())
+                .sum())
+        },
+        |output_dir| persist_encoded(output_dir.join("metrics.pack"), &encoded),
+    )?;
     let encode_elapsed = start.elapsed();
     let payload_bytes = encoded.iter().map(|(payload, _)| payload.len()).sum();
-    let auxiliary_bytes = encoded.iter().map(|(_, bytes)| *bytes).sum();
+    let auxiliary_bytes = encoded.iter().map(|(_, filter)| filter.len()).sum();
     let start = Instant::now();
     let decoded_count = encoded.iter().try_fold(0usize, |count, (chunk, _)| {
         decode_metric_chunk(chunk).map(|points| count + points.len())
@@ -678,6 +711,7 @@ fn benchmark_metrics(
         source_bytes,
         payload_bytes,
         auxiliary_bytes,
+        durable_bytes,
         encode_mib_per_second: mib_per_second(source_bytes, encode_elapsed),
         decode_mib_per_second: mib_per_second(source_bytes, decode_elapsed),
         lookup_count,
@@ -712,6 +746,7 @@ fn benchmark_correlations(corpus: &Corpus, iterations: usize) -> ResultRow {
         source_bytes: 0,
         payload_bytes: 0,
         auxiliary_bytes: 0,
+        durable_bytes: 0,
         encode_mib_per_second: 0.0,
         decode_mib_per_second: 0.0,
         lookup_count,
@@ -772,12 +807,13 @@ fn measure_lookup(
 fn print_result(signal: &str, result: ResultRow) {
     let stored_bytes = result.payload_bytes + result.auxiliary_bytes;
     println!(
-        "{signal} source_bytes={} payload_bytes={} auxiliary_bytes={} stored_bytes={} ratio={:.2}x encode_mib_s={:.2} decode_mib_s={:.2} lookup_results={} lookup_ops_s={:.2} p50_us={:.3} p99_us={:.3}",
+        "{signal} source_bytes={} payload_bytes={} auxiliary_bytes={} stored_bytes={} durable_bytes={} ratio={:.2}x encode_mib_s={:.2} decode_mib_s={:.2} lookup_results={} lookup_ops_s={:.2} p50_us={:.3} p99_us={:.3}",
         result.source_bytes,
         result.payload_bytes,
         result.auxiliary_bytes,
         stored_bytes,
-        result.source_bytes as f64 / stored_bytes as f64,
+        result.durable_bytes,
+        result.source_bytes as f64 / result.durable_bytes as f64,
         result.encode_mib_per_second,
         result.decode_mib_per_second,
         result.lookup_count,
@@ -785,6 +821,21 @@ fn print_result(signal: &str, result: ResultRow) {
         result.lookup_p50.as_secs_f64() * 1e6,
         result.lookup_p99.as_secs_f64() * 1e6,
     );
+}
+
+fn persist_encoded(
+    path: PathBuf,
+    encoded: &[(Vec<u8>, Vec<u8>)],
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let mut output = File::create(&path)?;
+    for (payload, filter) in encoded {
+        output.write_all(&(payload.len() as u64).to_le_bytes())?;
+        output.write_all(&(filter.len() as u64).to_le_bytes())?;
+        output.write_all(payload)?;
+        output.write_all(filter)?;
+    }
+    output.sync_all()?;
+    Ok(fs::metadata(path)?.len() as usize)
 }
 
 fn group_trace_blocks(

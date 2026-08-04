@@ -58,6 +58,7 @@ echo "ShardTelemetry: generating equal-input corpus and running on CPU $CPU"
     --records "$RECORDS" \
     --iterations "$LOOKUP_ITERATIONS" \
     --clickhouse-dir "$CORPUS_DIR" \
+    --durable-output-dir "$RUN_DIR/shard-telemetry-storage" \
     >"$RUN_DIR/shard-telemetry-signal.txt"
 cat "$RUN_DIR/shard-telemetry-signal.txt"
 
@@ -260,9 +261,9 @@ field_from_signal() {
     ' "$RUN_DIR/shard-telemetry-signal.txt"
 }
 
-TRACE_STORED=$(field_from_signal traces stored_bytes)
+TRACE_STORED=$(field_from_signal traces durable_bytes)
 TRACE_ENCODE=$(field_from_signal traces encode_mib_s)
-METRIC_STORED=$(field_from_signal metrics stored_bytes)
+METRIC_STORED=$(field_from_signal metrics durable_bytes)
 METRIC_ENCODE=$(field_from_signal metrics encode_mib_s)
 CH_TRACE_STORED=$(awk -F'\t' '$1 == "traces" { print $3 }' "$RUN_DIR/clickhouse-parts.tsv")
 CH_METRIC_STORED=$(awk -F'\t' '$1 == "metrics" { print $3 }' "$RUN_DIR/clickhouse-parts.tsv")
