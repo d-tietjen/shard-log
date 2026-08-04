@@ -10,6 +10,9 @@ RESULT_ROOT=${RESULT_ROOT:-/home/dtietjen/shard-telemetry-loki-benchmarks}
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}
 CORE_COUNT=${CORE_COUNT:-16}
 LOKI_PORT=${LOKI_PORT:-33100}
+SETTLE_TIMEOUT_SECONDS=${SETTLE_TIMEOUT_SECONDS:-900}
+SETTLE_POLL_SECONDS=${SETTLE_POLL_SECONDS:-10}
+SETTLED_WAL_LIMIT_BYTES=${SETTLED_WAL_LIMIT_BYTES:-1}
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 LOKI_CONFIG=${LOKI_CONFIG:-$SCRIPT_DIR/loki-benchmark.yaml}
 
@@ -140,13 +143,33 @@ taskset -c "$CPU_SET" "$LOADER_BIN" "$SOURCE" \
 
 curl --fail --silent --show-error -X POST \
     "http://127.0.0.1:$LOKI_PORT/flush" >"$RUN_DIR/flush-response.txt"
-sleep 10
+settle_deadline=$(($(date +%s) + SETTLE_TIMEOUT_SECONDS))
+settled=0
+while [[ $(date +%s) -lt $settle_deadline ]]; do
+    WAL_BYTES=$(du -sb "$RUN_DIR/loki-data/wal" | awk '{ print $1 }')
+    CURRENT_BYTES=$(du -sb "$RUN_DIR/loki-data" | awk '{ print $1 }')
+    printf 'wal_bytes=%s total_bytes=%s\n' "$WAL_BYTES" "$CURRENT_BYTES" \
+        | tee -a "$RUN_DIR/settlement.log"
+    if [[ $WAL_BYTES -lt $SETTLED_WAL_LIMIT_BYTES ]]; then
+        settled=1
+        break
+    fi
+    sleep "$SETTLE_POLL_SECONDS"
+done
+[[ $settled -eq 1 ]] || {
+    echo "Loki WAL did not settle below $SETTLED_WAL_LIMIT_BYTES bytes" >&2
+    exit 1
+}
 docker logs "$CONTAINER" >"$RUN_DIR/loki-container.log" 2>&1
 docker stop --time 60 "$CONTAINER" >/dev/null
 docker rm "$CONTAINER" >/dev/null
 STARTED=0
 
 SETTLED_BYTES=$(du -sb "$RUN_DIR/loki-data" | awk '{ print $1 }')
+CHUNK_BYTES=$(du -sb "$RUN_DIR/loki-data/chunks" | awk '{ print $1 }')
+WAL_BYTES=$(du -sb "$RUN_DIR/loki-data/wal" | awk '{ print $1 }')
+ACTIVE_INDEX_BYTES=$(du -sb "$RUN_DIR/loki-data/tsdb-shipper-active" | awk '{ print $1 }')
+CACHE_INDEX_BYTES=$(du -sb "$RUN_DIR/loki-data/tsdb-shipper-cache" | awk '{ print $1 }')
 REPRESENTED_BYTES=$(awk -F': ' '$1 == "source bytes" { print $2 }' "$RUN_DIR/loader.log")
 RECORDS=$(awk -F': ' '$1 == "records" { print $2 }' "$RUN_DIR/loader.log")
 WIRE_BYTES=$(awk -F': ' '$1 == "pushed wire bytes" { print $2 }' "$RUN_DIR/loader.log")
@@ -161,6 +184,15 @@ RATIO=$(awk -v source="$REPRESENTED_BYTES" -v stored="$SETTLED_BYTES" \
         "$REPRESENTED_BYTES" "$RECORDS" "$WIRE_BYTES" "$SETTLED_BYTES" \
         "$ELAPSED" "$THROUGHPUT" "$RATIO"
 } | tee "$RUN_DIR/summary.tsv"
+
+{
+    printf 'component\tbytes\n'
+    printf 'chunks\t%s\n' "$CHUNK_BYTES"
+    printf 'wal\t%s\n' "$WAL_BYTES"
+    printf 'tsdb_shipper_active\t%s\n' "$ACTIVE_INDEX_BYTES"
+    printf 'tsdb_shipper_cache\t%s\n' "$CACHE_INDEX_BYTES"
+    printf 'total\t%s\n' "$SETTLED_BYTES"
+} >"$RUN_DIR/components.tsv"
 
 find "$RUN_DIR/loki-data" -type f -printf '%s\t%p\n' | sort -nr >"$RUN_DIR/files.tsv"
 echo "results: $RUN_DIR"
