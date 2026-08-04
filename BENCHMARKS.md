@@ -68,7 +68,83 @@ Retained evidence:
 /home/dtietjen/shard-telemetry-evidence-bdcb1c8/signal-run-{1,2,3}.txt
 ```
 
-Reproduce locally with:
+### Adam traces and metrics versus ClickHouse — 2026-08-04
+
+The exact public revision
+`b1b27118085c344cc1a8a82e04718df38d01c35d` was compared with ClickHouse
+26.5.1.882 three times sequentially on physical CPU 0. Each run used the same
+deterministic 262,144-record corpus per signal and 2,000 warm lookup
+iterations. The tables report medians.
+
+ClickHouse stored typed query columns plus the complete lossless MessagePack
+record in Zstandard-1 columns. ShardTelemetry stored its signal-native payload,
+cold-correlation filters, and durable frame lengths. Both timed storage paths
+wrote their output and synchronized it before stopping the timer. ClickHouse
+used an isolated one-core MergeTree container with
+`fsync_after_insert = 1`; ShardTelemetry wrote one framed pack per signal and
+called `sync_all`.
+
+| Signal | Engine | Canonical bytes | Durable bytes | Ratio | Durable encode |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Traces | **ShardTelemetry** | 107,609,736 | **1,558,432** | **69.05x** | **261.28 MiB/s** |
+| Traces | ClickHouse | 107,609,736 | 5,753,460 | 18.70x | 106.90 MiB/s |
+| Metrics | **ShardTelemetry** | 126,451,328 | **2,244,829** | **56.33x** | **578.82 MiB/s** |
+| Metrics | ClickHouse | 126,451,328 | 3,882,804 | 32.57x | 113.77 MiB/s |
+
+ShardTelemetry used 72.91% fewer bytes and encoded 2.44x faster for traces. It
+used 42.19% fewer bytes and encoded 5.09x faster for metrics. The metric corpus
+contains exactly 128 series with 2,048 points each, so every series stays below
+the production 4,096-point chunk bound.
+
+| Warm lookup | Results | ShardTelemetry ops/s | ShardTelemetry p50 / p99 | ClickHouse ops/s | ClickHouse p50 / p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Trace ID | 8 | **1,174.60** | **0.796 / 1.697 ms** | 335.07 | 2 / 6 ms |
+| Exact metric series | 100 | 178.88 | 5.554 / **6.681 ms** | **269.92** | **3** / 9 ms |
+
+ShardTelemetry completed 3.51x more trace-ID lookups per second. ClickHouse
+completed 1.51x more exact-series metric lookups per second and had the lower
+metric p50, while ShardTelemetry retained the lower metric p99. The
+ShardTelemetry measurements use the native Rust query API; ClickHouse uses one
+persistent `clickhouse-benchmark` client/server connection, whose percentile
+output is quantized to milliseconds. This is an engine-boundary comparison,
+not a same-wire-protocol claim.
+
+Before timing, ClickHouse returned the selected trace and the complete
+2,048-point metric series as byte-identical MessagePack. All three runs produced
+the same corpus hashes and query-result hashes. Cross-signal correlation is not
+claimed as a ClickHouse comparison because the current ClickHouse query covers
+only one table, while the ShardTelemetry operation follows resource, typed
+attribute, trace, span-link, and exemplar postings across all three signals.
+
+Retained evidence:
+
+```text
+/home/dtietjen/shard-telemetry-signal-clickhouse-head-to-head/measured-b1b2711-r{1,2,3}
+```
+
+The three `summary.tsv` SHA-256 values are, in run order:
+
+```text
+7879cedfb8bd732b39bb9ab8f12dac6aecd1b6d3816e73d58775c3038def0adf
+018b6b06a69e77b90a5cd502cec868e0f2d233082cd36402296b27108aacd858
+dcc60d8f27ef0b968b46dd1c24e0b53ccb7f4ecca704d8ab7570cd5dcb1c94ca
+```
+
+These are deterministic production-like records, not retained production
+captures. A publishable production-corpus claim still requires the planned
+16 GiB trace and metric captures with the same lossless schema and validation
+gates.
+
+Reproduce the head-to-head on Adam from a release build with:
+
+```bash
+RUN_ID=signal-h2h-reproduction \
+RECORDS=262144 \
+LOOKUP_ITERATIONS=2000 \
+scripts/run-signal-clickhouse-head-to-head.sh
+```
+
+Run the standalone signal benchmark locally with:
 
 ```bash
 cargo run --release --bin shard-telemetry-signal-bench -- \
