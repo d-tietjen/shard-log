@@ -857,6 +857,8 @@ pub struct MetricStripe {
 #[derive(Debug)]
 struct SealedMetricChunk {
     resident_id: u64,
+    min_timestamp_unix_nanos: u64,
+    max_timestamp_unix_nanos: u64,
     payload: Arc<[u8]>,
 }
 
@@ -938,6 +940,8 @@ impl MetricStripe {
             ));
         }
         self.recovered_accumulators.remove(&fingerprint);
+        let sealed_same_timestamp =
+            self.sealed_points_at(fingerprint, point.timestamp_unix_nanos)?;
         let (outcome, should_seal) = {
             let head = self
                 .series
@@ -965,7 +969,7 @@ impl MetricStripe {
                     "metric point exceeds the 10 minute out-of-order window".into(),
                 ));
             }
-            let same_timestamp = head
+            let mut same_timestamp = head
                 .points
                 .range(
                     (point.timestamp_unix_nanos, LogicalOffset::new(0))
@@ -973,6 +977,12 @@ impl MetricStripe {
                 )
                 .map(|(key, value)| (*key, value.clone()))
                 .collect::<Vec<_>>();
+            same_timestamp.extend(sealed_same_timestamp.into_iter().map(|existing| {
+                (
+                    (existing.timestamp_unix_nanos, existing.record_ref.offset),
+                    existing,
+                )
+            }));
             if same_timestamp.iter().any(|(_, existing)| {
                 existing.value == point.value
                     && existing.flags == point.flags
@@ -1134,7 +1144,7 @@ impl MetricStripe {
     /// Queries exact raw hot and immutable-chunk points with index pushdown.
     pub fn query(&self, query: &MetricQuery) -> TelemetryResult<Vec<DurableMetricPoint>> {
         let limit = query.limit.max(1);
-        let mut points = Vec::new();
+        let mut winners = BTreeMap::<(SeriesFingerprint, u64), DurableMetricPoint>::new();
         let candidates = self.query_candidates(query);
         for (series, head) in &self.series {
             if candidates
@@ -1149,12 +1159,13 @@ impl MetricStripe {
             {
                 continue;
             }
-            points.extend(
-                head.points
-                    .values()
-                    .filter(|point| metric_query_matches(query, point))
-                    .cloned(),
-            );
+            for point in head
+                .points
+                .values()
+                .filter(|point| metric_query_matches(query, point))
+            {
+                retain_metric_winner(&mut winners, point.clone());
+            }
         }
         for (series, chunks) in &self.chunks {
             if candidates
@@ -1165,18 +1176,42 @@ impl MetricStripe {
                 continue;
             }
             for chunk in chunks {
-                points.extend(
-                    decode_metric_chunk(&chunk.payload)?
-                        .into_iter()
-                        .filter(|point| metric_query_matches(query, point)),
-                );
-                if points.len() >= limit {
-                    break;
+                for point in decode_metric_chunk(&chunk.payload)?
+                    .into_iter()
+                    .filter(|point| metric_query_matches(query, point))
+                {
+                    retain_metric_winner(&mut winners, point);
                 }
             }
         }
+        let mut points = winners.into_values().collect::<Vec<_>>();
         points.sort_unstable_by_key(|point| (point.timestamp_unix_nanos, point.record_ref.offset));
         points.truncate(limit);
+        Ok(points)
+    }
+
+    fn sealed_points_at(
+        &self,
+        series: SeriesFingerprint,
+        timestamp_unix_nanos: u64,
+    ) -> TelemetryResult<Vec<DurableMetricPoint>> {
+        let mut points = Vec::new();
+        for chunk in self
+            .chunks
+            .get(&series)
+            .into_iter()
+            .flatten()
+            .filter(|chunk| {
+                chunk.min_timestamp_unix_nanos <= timestamp_unix_nanos
+                    && timestamp_unix_nanos <= chunk.max_timestamp_unix_nanos
+            })
+        {
+            points.extend(
+                decode_metric_chunk(&chunk.payload)?
+                    .into_iter()
+                    .filter(|point| point.timestamp_unix_nanos == timestamp_unix_nanos),
+            );
+        }
         Ok(points)
     }
 
@@ -1277,6 +1312,8 @@ impl MetricStripe {
             .or_default()
             .push(SealedMetricChunk {
                 resident_id,
+                min_timestamp_unix_nanos,
+                max_timestamp_unix_nanos,
                 payload,
             });
         Ok(())
@@ -1335,6 +1372,19 @@ fn update_accumulator(head: &mut SeriesHead, point: &DurableMetricPoint) {
         };
     } else {
         head.cumulative = Some(value);
+    }
+}
+
+fn retain_metric_winner(
+    winners: &mut BTreeMap<(SeriesFingerprint, u64), DurableMetricPoint>,
+    point: DurableMetricPoint,
+) {
+    let key = (point.series_fingerprint(), point.timestamp_unix_nanos);
+    if winners
+        .get(&key)
+        .is_none_or(|winner| winner.record_ref.offset < point.record_ref.offset)
+    {
+        winners.insert(key, point);
     }
 }
 
@@ -1482,6 +1532,57 @@ mod tests {
                 .unwrap(),
             MetricApplyOutcome::Replaced
         );
+    }
+
+    #[test]
+    fn sealed_metric_conflicts_preserve_remote_write_and_offset_semantics() {
+        let mut stripe = MetricStripe::new(1024 * 1024).unwrap();
+        stripe.chunk_points = 1;
+        let first = point(1, 100, NumberValue::Integer(1));
+        assert_eq!(
+            stripe
+                .apply(first.clone(), MetricIngestProtocol::RemoteWrite)
+                .unwrap(),
+            MetricApplyOutcome::Inserted
+        );
+        assert!(stripe.series[&first.series_fingerprint()].points.is_empty());
+
+        let mut duplicate = first.clone();
+        duplicate.record_ref.offset = LogicalOffset::new(2);
+        assert_eq!(
+            stripe
+                .apply(duplicate, MetricIngestProtocol::RemoteWrite)
+                .unwrap(),
+            MetricApplyOutcome::Duplicate
+        );
+
+        let conflict = point(2, 100, NumberValue::Integer(2));
+        assert!(matches!(
+            stripe.apply(conflict.clone(), MetricIngestProtocol::RemoteWrite),
+            Err(TelemetryError::MetricSampleConflict { .. })
+        ));
+        let mut obsolete = conflict.clone();
+        obsolete.record_ref.offset = LogicalOffset::new(0);
+        assert_eq!(
+            stripe.apply(obsolete, MetricIngestProtocol::Otlp).unwrap(),
+            MetricApplyOutcome::Obsolete
+        );
+        assert_eq!(
+            stripe
+                .apply(conflict.clone(), MetricIngestProtocol::Otlp)
+                .unwrap(),
+            MetricApplyOutcome::Replaced
+        );
+
+        let queried = stripe
+            .query(&MetricQuery {
+                tenant: Arc::from("tenant-a"),
+                series: Some(conflict.series_fingerprint()),
+                limit: usize::MAX,
+                ..MetricQuery::default()
+            })
+            .unwrap();
+        assert_eq!(queried, vec![conflict]);
     }
 
     #[test]
