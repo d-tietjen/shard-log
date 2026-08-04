@@ -265,14 +265,13 @@ struct PackedIdColumn {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EmbeddedTermLocator {
-    term: Arc<str>,
+    fingerprint: u32,
     layout_ids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EmbeddedFieldLocator {
-    key: Arc<str>,
-    value: Arc<str>,
+    fingerprint: u32,
     field_set_ids: Vec<u32>,
 }
 
@@ -325,10 +324,10 @@ impl MembershipFilter {
 
 /// Lossless compressed-domain candidate index embedded in one structural frame.
 ///
-/// Repeated static message terms reference compressor template IDs and repeated
-/// metadata values reference field-set IDs. High-cardinality values fail open
-/// through bounded membership filters and are checked after selective decode.
-/// The index can produce extra candidates but cannot suppress an exact match.
+/// Deterministic term and metadata fingerprints reference compressor template
+/// and field-set IDs. High-cardinality values fail open through bounded
+/// membership filters and are checked after selective decode. Fingerprint
+/// collisions can produce extra candidates but cannot suppress an exact match.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EmbeddedFrameIndex {
     record_count: u32,
@@ -373,9 +372,10 @@ impl EmbeddedFrameIndex {
             return Vec::new();
         }
         let mut selected = self.residual_layout_ids.clone();
+        let fingerprint = membership_hash(normalized.as_bytes()) as u32;
         if let Ok(position) = self
             .terms
-            .binary_search_by(|locator| locator.term.as_ref().cmp(normalized.as_ref()))
+            .binary_search_by_key(&fingerprint, |locator| locator.fingerprint)
         {
             selected.extend_from_slice(&self.terms[position].layout_ids);
         }
@@ -399,13 +399,11 @@ impl EmbeddedFrameIndex {
         {
             return Vec::new();
         }
-        let Ok(position) = self.fields.binary_search_by(|locator| {
-            locator
-                .key
-                .as_ref()
-                .cmp(key)
-                .then_with(|| locator.value.as_ref().cmp(value))
-        }) else {
+        let fingerprint = membership_pair_hash(key.as_bytes(), value.as_bytes()) as u32;
+        let Ok(position) = self
+            .fields
+            .binary_search_by_key(&fingerprint, |locator| locator.fingerprint)
+        else {
             return (0..self.record_count).collect();
         };
         matching_packed_ids(
@@ -455,7 +453,7 @@ impl EmbeddedFrameIndex {
         let field_set_count =
             u32::try_from(fields.sets.len()).map_err(|_| TelemetryError::RecordTooLarge)?;
 
-        let mut term_layouts = HashMap::<String, Vec<u32>>::new();
+        let mut term_layouts = HashMap::<u32, Vec<u32>>::new();
         let mut term_membership = MembershipFilter::new();
         let mut residual_layout_ids = if record_count == 0 {
             Vec::new()
@@ -493,7 +491,8 @@ impl EmbeddedFrameIndex {
                 if is_dynamic {
                     continue;
                 }
-                let layouts = term_layouts.entry(normalized.into_owned()).or_default();
+                let fingerprint = membership_hash(normalized.as_bytes()) as u32;
+                let layouts = term_layouts.entry(fingerprint).or_default();
                 if layouts.last().copied() != Some(template_id) {
                     layouts.push(template_id);
                 }
@@ -503,18 +502,18 @@ impl EmbeddedFrameIndex {
         residual_layout_ids.dedup();
         let mut terms = term_layouts
             .into_iter()
-            .map(|(term, mut layout_ids)| {
+            .map(|(fingerprint, mut layout_ids)| {
                 layout_ids.sort_unstable();
                 layout_ids.dedup();
                 EmbeddedTermLocator {
-                    term: Arc::from(term),
+                    fingerprint,
                     layout_ids,
                 }
             })
             .collect::<Vec<_>>();
-        terms.sort_unstable_by(|left, right| left.term.cmp(&right.term));
+        terms.sort_unstable_by_key(|locator| locator.fingerprint);
 
-        let mut field_sets = HashMap::<(String, String), Vec<u32>>::new();
+        let mut field_sets = HashMap::<u32, Vec<u32>>::new();
         for (field_set_id, field_set) in fields.sets.iter().enumerate() {
             let field_set_id =
                 u32::try_from(field_set_id).map_err(|_| TelemetryError::RecordTooLarge)?;
@@ -529,15 +528,8 @@ impl EmbeddedFrameIndex {
                     .ok_or(TelemetryError::InvalidBlockEncoding(
                         "embedded field value ID is out of range",
                     ))?;
-                let key = std::str::from_utf8(key).map_err(|_| {
-                    TelemetryError::InvalidBlockEncoding("field key is invalid UTF-8")
-                })?;
-                let value = std::str::from_utf8(value).map_err(|_| {
-                    TelemetryError::InvalidBlockEncoding("field value is invalid UTF-8")
-                })?;
-                let set_ids = field_sets
-                    .entry((key.to_owned(), value.to_owned()))
-                    .or_default();
+                let fingerprint = membership_pair_hash(key, value) as u32;
+                let set_ids = field_sets.entry(fingerprint).or_default();
                 if set_ids.last().copied() != Some(field_set_id) {
                     set_ids.push(field_set_id);
                 }
@@ -545,17 +537,12 @@ impl EmbeddedFrameIndex {
         }
         let mut field_locators = field_sets
             .into_iter()
-            .map(|((key, value), field_set_ids)| EmbeddedFieldLocator {
-                key: Arc::from(key),
-                value: Arc::from(value),
+            .map(|(fingerprint, field_set_ids)| EmbeddedFieldLocator {
+                fingerprint,
                 field_set_ids,
             })
             .collect::<Vec<_>>();
-        field_locators.sort_unstable_by(|left, right| {
-            left.key
-                .cmp(&right.key)
-                .then_with(|| left.value.cmp(&right.value))
-        });
+        field_locators.sort_unstable_by_key(|locator| locator.fingerprint);
 
         Ok(Self {
             record_count,
@@ -599,7 +586,7 @@ impl EmbeddedFrameIndex {
             &mut encoded,
         );
         for locator in &self.terms {
-            append_bytes(&mut encoded, locator.term.as_bytes())?;
+            encoded.extend_from_slice(&locator.fingerprint.to_le_bytes());
             encode_sorted_ids(&locator.layout_ids, self.layout_count, &mut encoded)?;
         }
         encode_packed_column(
@@ -614,8 +601,7 @@ impl EmbeddedFrameIndex {
             &mut encoded,
         );
         for locator in &self.fields {
-            append_bytes(&mut encoded, locator.key.as_bytes())?;
-            append_bytes(&mut encoded, locator.value.as_bytes())?;
+            encoded.extend_from_slice(&locator.fingerprint.to_le_bytes());
             encode_sorted_ids(&locator.field_set_ids, self.field_set_count, &mut encoded)?;
         }
         Ok(encoded)
@@ -640,17 +626,20 @@ impl EmbeddedFrameIndex {
         )?;
         let mut terms = Vec::with_capacity(term_count);
         for _ in 0..term_count {
-            let term = read_arc_str(encoded, &mut cursor)?;
+            let fingerprint = read_fixed_u32(encoded, &mut cursor)?;
             let layout_ids = decode_sorted_ids(encoded, &mut cursor, layout_count)?;
             if terms
                 .last()
-                .is_some_and(|previous: &EmbeddedTermLocator| previous.term >= term)
+                .is_some_and(|previous: &EmbeddedTermLocator| previous.fingerprint >= fingerprint)
             {
                 return Err(TelemetryError::InvalidBlockEncoding(
                     "embedded terms are not ordered",
                 ));
             }
-            terms.push(EmbeddedTermLocator { term, layout_ids });
+            terms.push(EmbeddedTermLocator {
+                fingerprint,
+                layout_ids,
+            });
         }
         let (field_set_count, field_set_ids) =
             decode_packed_column(encoded, &mut cursor, record_count)?;
@@ -663,23 +652,18 @@ impl EmbeddedFrameIndex {
         )?;
         let mut fields = Vec::with_capacity(field_count);
         for _ in 0..field_count {
-            let key = read_arc_str(encoded, &mut cursor)?;
-            let value = read_arc_str(encoded, &mut cursor)?;
+            let fingerprint = read_fixed_u32(encoded, &mut cursor)?;
             let field_set_ids = decode_sorted_ids(encoded, &mut cursor, field_set_count)?;
             if fields
                 .last()
-                .is_some_and(|previous: &EmbeddedFieldLocator| {
-                    (previous.key.as_ref(), previous.value.as_ref())
-                        >= (key.as_ref(), value.as_ref())
-                })
+                .is_some_and(|previous: &EmbeddedFieldLocator| previous.fingerprint >= fingerprint)
             {
                 return Err(TelemetryError::InvalidBlockEncoding(
                     "embedded fields are not ordered",
                 ));
             }
             fields.push(EmbeddedFieldLocator {
-                key,
-                value,
+                fingerprint,
                 field_set_ids,
             });
         }
@@ -2953,10 +2937,21 @@ fn read_u32(encoded: &[u8], cursor: &mut usize) -> TelemetryResult<u32> {
         .map_err(|_| TelemetryError::InvalidBlockEncoding("value does not fit u32"))
 }
 
-fn read_arc_str(encoded: &[u8], cursor: &mut usize) -> TelemetryResult<Arc<str>> {
-    let value = std::str::from_utf8(read_bytes(encoded, cursor)?)
-        .map_err(|_| TelemetryError::InvalidBlockEncoding("embedded string is invalid UTF-8"))?;
-    Ok(Arc::from(value))
+fn read_fixed_u32(encoded: &[u8], cursor: &mut usize) -> TelemetryResult<u32> {
+    let end = cursor
+        .checked_add(size_of::<u32>())
+        .ok_or(TelemetryError::InvalidBlockEncoding(
+            "fixed integer cursor overflow",
+        ))?;
+    let bytes = encoded
+        .get(*cursor..end)
+        .ok_or(TelemetryError::InvalidBlockEncoding(
+            "fixed integer is truncated",
+        ))?;
+    *cursor = end;
+    Ok(u32::from_le_bytes(
+        bytes.try_into().expect("fixed integer width"),
+    ))
 }
 
 #[inline]
@@ -3388,6 +3383,51 @@ mod tests {
         assert!(decoded.iter().zip(selected).all(|(decoded, ordinal)| {
             decoded.message.as_ref() == records[ordinal as usize].message.as_ref()
         }));
+    }
+
+    #[test]
+    fn embedded_fingerprint_collisions_only_add_exactly_verified_candidates() {
+        let records = vec![
+            record(0, "alpha static message"),
+            record(1, "beta static message"),
+            record(2, "alpha static message"),
+            record(3, "beta static message"),
+        ];
+        let mut indexed = encode_indexed_structural_records(&records).expect("fingerprints encode");
+        let alpha = membership_hash(b"alpha") as u32;
+        let beta = membership_hash(b"beta") as u32;
+        let beta_layouts = indexed.index.terms[indexed
+            .index
+            .terms
+            .binary_search_by_key(&beta, |locator| locator.fingerprint)
+            .expect("beta locator")]
+        .layout_ids
+        .clone();
+        let alpha_position = indexed
+            .index
+            .terms
+            .binary_search_by_key(&alpha, |locator| locator.fingerprint)
+            .expect("alpha locator");
+        let alpha_locator = &mut indexed.index.terms[alpha_position];
+        alpha_locator.layout_ids.extend(beta_layouts);
+        alpha_locator.layout_ids.sort_unstable();
+        alpha_locator.layout_ids.dedup();
+
+        let candidates = indexed.index.term_candidate_ordinals("alpha");
+        assert_eq!(candidates, vec![0, 1, 2, 3]);
+        let selected = LogQuery::new(records[0].record_ref.topic_partition)
+            .with_term("alpha")
+            .select(
+                decode_structural_records(&indexed.structural, &candidates)
+                    .expect("collision candidates decode"),
+            );
+        assert_eq!(
+            selected
+                .into_iter()
+                .map(|record| record.offset.get())
+                .collect::<Vec<_>>(),
+            vec![0, 2]
+        );
     }
 
     #[test]
