@@ -793,16 +793,10 @@ pub struct TraceStripe {
     recently_sealed: HashMap<(Arc<str>, TraceId), RecentlySealedTrace>,
     recent_order: VecDeque<(u64, (Arc<str>, TraceId))>,
     recently_sealed_bytes: usize,
-    sealed_blocks: Vec<SealedTraceBlock>,
+    sealed_blocks: HashMap<u64, Arc<[u8]>>,
     pending_blocks: Vec<SignalTierPayload>,
     directory: TraceDirectory,
     next_block_id: u64,
-}
-
-#[derive(Debug)]
-struct SealedTraceBlock {
-    block_id: u64,
-    payload: Arc<[u8]>,
 }
 
 struct PreparedTrace {
@@ -829,7 +823,7 @@ impl TraceStripe {
             recently_sealed: HashMap::new(),
             recent_order: VecDeque::new(),
             recently_sealed_bytes: 0,
-            sealed_blocks: Vec::new(),
+            sealed_blocks: HashMap::new(),
             pending_blocks: Vec::new(),
             directory: TraceDirectory::default(),
             next_block_id: 1,
@@ -1169,8 +1163,7 @@ impl TraceStripe {
             payload: Arc::clone(&payload),
             correlation_filter: CorrelationBlockFilter::for_spans(&spans),
         });
-        self.sealed_blocks
-            .push(SealedTraceBlock { block_id, payload });
+        self.sealed_blocks.insert(block_id, payload);
         Ok(block)
     }
 
@@ -1186,13 +1179,13 @@ impl TraceStripe {
         self.pending_blocks
             .retain(|payload| !resident_ids.contains(&payload.resident_id));
         self.sealed_blocks
-            .retain(|block| !resident_ids.contains(&block.block_id));
+            .retain(|block_id, _| !resident_ids.contains(block_id));
     }
 
     pub(crate) fn retained_payload_bytes(&self) -> u64 {
         self.sealed_blocks
-            .iter()
-            .map(|block| u64::try_from(block.payload.len()).unwrap_or(u64::MAX))
+            .values()
+            .map(|payload| u64::try_from(payload.len()).unwrap_or(u64::MAX))
             .sum()
     }
 
@@ -1205,9 +1198,12 @@ impl TraceStripe {
     /// Queries current hot spans after trace/time pushdown.
     pub fn query(&self, query: &TraceQuery) -> TelemetryResult<Vec<DurableSpan>> {
         let limit = query.limit.max(1);
+        if let Some(trace_id) = query.trace_id {
+            return self.query_exact_trace(query, trace_id, limit);
+        }
         let mut winners = BTreeMap::<(Arc<str>, TraceId, SpanId), DurableSpan>::new();
-        for block in &self.sealed_blocks {
-            for span in decode_trace_block(&block.payload)? {
+        for payload in self.sealed_blocks.values() {
+            for span in decode_trace_block(payload)? {
                 if trace_query_matches(query, &span) {
                     retain_newest_span(&mut winners, span);
                 }
@@ -1250,6 +1246,41 @@ impl TraceStripe {
                 span.record_ref.offset,
             )
         });
+        spans.truncate(limit);
+        Ok(spans)
+    }
+
+    fn query_exact_trace(
+        &self,
+        query: &TraceQuery,
+        trace_id: TraceId,
+        limit: usize,
+    ) -> TelemetryResult<Vec<DurableSpan>> {
+        let key = (Arc::clone(&query.tenant), trace_id);
+        let mut winners = BTreeMap::<SpanId, DurableSpan>::new();
+        if let Some(summary) = self.directory.entries.get(&key) {
+            for block_id in summary.block_fragments.iter() {
+                let Some(payload) = self.sealed_blocks.get(block_id) else {
+                    continue;
+                };
+                for span in decode_trace_block(payload)? {
+                    if trace_query_matches(query, &span) {
+                        retain_exact_trace_span(&mut winners, span);
+                    }
+                }
+            }
+        }
+        if let Some(trace) = self.traces.get(&key) {
+            for span in trace
+                .spans
+                .values()
+                .filter(|span| trace_query_matches(query, span))
+            {
+                retain_exact_trace_span(&mut winners, span.clone());
+            }
+        }
+        let mut spans = winners.into_values().collect::<Vec<_>>();
+        spans.sort_unstable_by_key(|span| (span.start_time_unix_nanos, span.record_ref.offset));
         spans.truncate(limit);
         Ok(spans)
     }
@@ -1297,6 +1328,15 @@ fn retain_newest_span(
         .is_none_or(|existing| existing.record_ref.offset < span.record_ref.offset)
     {
         winners.insert(key, span);
+    }
+}
+
+fn retain_exact_trace_span(winners: &mut BTreeMap<SpanId, DurableSpan>, span: DurableSpan) {
+    if winners
+        .get(&span.span_id)
+        .is_none_or(|existing| existing.record_ref.offset < span.record_ref.offset)
+    {
+        winners.insert(span.span_id, span);
     }
 }
 
