@@ -15,7 +15,6 @@ use crate::{
 };
 
 const STRUCTURAL_BLOCK_MAGIC: &[u8; 4] = b"STLG";
-const EMBEDDED_INDEX_MAGIC: &[u8; 4] = b"SLI1";
 const DIRECT_ATTRIBUTE_VALUE: u8 = 0;
 const DICTIONARY_ATTRIBUTE_VALUE: u8 = 1;
 const TIMESTAMP_PCO_LEVEL: usize = 8;
@@ -321,6 +320,12 @@ impl MembershipFilter {
             self.words[bit / u64::BITS as usize] & (1u64 << (bit % u64::BITS as usize)) != 0
         })
     }
+
+    fn merge(&mut self, other: &Self) {
+        for (word, other) in self.words.iter_mut().zip(other.words.iter()) {
+            *word |= *other;
+        }
+    }
 }
 
 /// Lossless compressed-domain candidate index embedded in one structural frame.
@@ -545,6 +550,8 @@ impl EmbeddedFrameIndex {
             .collect::<Vec<_>>();
         field_locators.sort_unstable_by_key(|locator| locator.fingerprint);
 
+        term_membership.merge(&fields.membership_filter);
+        let field_membership = term_membership.clone();
         Ok(Self {
             record_count,
             layout_count,
@@ -565,15 +572,13 @@ impl EmbeddedFrameIndex {
             terms,
             field_set_count,
             field_set_ids: pack_ids(&fields.set_ids, field_set_count)?,
-            field_membership: fields.membership_filter.clone(),
+            field_membership,
             fields: field_locators,
         })
     }
 
     fn encode(&self) -> TelemetryResult<Vec<u8>> {
         let mut encoded = Vec::new();
-        encoded.extend_from_slice(EMBEDDED_INDEX_MAGIC);
-        write_varint(u64::from(self.record_count), &mut encoded);
         encode_packed_column(
             &self.layout_ids,
             self.layout_count,
@@ -596,7 +601,6 @@ impl EmbeddedFrameIndex {
             self.record_count,
             &mut encoded,
         )?;
-        encode_membership_filter(&self.field_membership, &mut encoded);
         write_varint(
             u64::try_from(self.fields.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
             &mut encoded,
@@ -608,14 +612,8 @@ impl EmbeddedFrameIndex {
         Ok(encoded)
     }
 
-    fn decode(encoded: &[u8]) -> TelemetryResult<Self> {
-        if encoded.get(..EMBEDDED_INDEX_MAGIC.len()) != Some(EMBEDDED_INDEX_MAGIC) {
-            return Err(TelemetryError::InvalidBlockEncoding(
-                "missing embedded index magic",
-            ));
-        }
-        let mut cursor = EMBEDDED_INDEX_MAGIC.len();
-        let record_count = read_u32(encoded, &mut cursor)?;
+    fn decode(encoded: &[u8], record_count: u32) -> TelemetryResult<Self> {
+        let mut cursor = 0;
         let (layout_count, layout_ids) = decode_packed_column(encoded, &mut cursor, record_count)?;
         let residual_layout_ids = decode_optional_sorted_ids(encoded, &mut cursor, layout_count)?;
         let term_membership = decode_membership_filter(encoded, &mut cursor)?;
@@ -644,7 +642,7 @@ impl EmbeddedFrameIndex {
         }
         let (field_set_count, field_set_ids) =
             decode_packed_column(encoded, &mut cursor, record_count)?;
-        let field_membership = decode_membership_filter(encoded, &mut cursor)?;
+        let field_membership = term_membership.clone();
         let field_count = read_usize(encoded, &mut cursor)?;
         ensure_count_within(
             field_count,
@@ -1063,8 +1061,10 @@ pub(crate) fn decode_embedded_frame_index_section(
     encoded: &[u8],
     expected_record_count: usize,
 ) -> TelemetryResult<EmbeddedFrameIndex> {
-    let index = EmbeddedFrameIndex::decode(encoded)?;
-    if index.record_count as usize != expected_record_count {
+    let expected_record_count =
+        u32::try_from(expected_record_count).map_err(|_| TelemetryError::RecordTooLarge)?;
+    let index = EmbeddedFrameIndex::decode(encoded, expected_record_count)?;
+    if index.record_count != expected_record_count {
         return Err(TelemetryError::InvalidBlockEncoding(
             "embedded index record count mismatch",
         ));
@@ -1100,7 +1100,10 @@ pub fn decode_structural_block(encoded: &[u8]) -> TelemetryResult<Vec<DecodedStr
     if cursor != encoded.len() {
         return Err(TelemetryError::InvalidBlockEncoding("trailing bytes"));
     }
-    let embedded_index = EmbeddedFrameIndex::decode(embedded_index_section)?;
+    let embedded_index = EmbeddedFrameIndex::decode(
+        embedded_index_section,
+        u32::try_from(record_count).map_err(|_| TelemetryError::RecordTooLarge)?,
+    )?;
     if embedded_index.record_count as usize != record_count {
         return Err(TelemetryError::InvalidBlockEncoding(
             "embedded index record count mismatch",
@@ -1178,7 +1181,10 @@ pub fn decode_structural_records(
     if cursor != encoded.len() {
         return Err(TelemetryError::InvalidBlockEncoding("trailing bytes"));
     }
-    let embedded_index = EmbeddedFrameIndex::decode(embedded_index_section)?;
+    let embedded_index = EmbeddedFrameIndex::decode(
+        embedded_index_section,
+        u32::try_from(record_count).map_err(|_| TelemetryError::RecordTooLarge)?,
+    )?;
     if embedded_index.record_count as usize != record_count {
         return Err(TelemetryError::InvalidBlockEncoding(
             "embedded index record count mismatch",
