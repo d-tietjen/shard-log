@@ -1,5 +1,53 @@
 # Compression benchmark results
 
+## Logs, traces, metrics, and correlation — local v1 storage run (2026-08-03)
+
+`shard-telemetry-signal-bench` generates one deterministic, correlated
+production-like corpus for all three signals. Every signal shares exact typed
+resource and scope metadata; logs and spans share trace/span IDs; metric
+exemplars use the same link model. It measures the sole pre-release v1 format:
+
+- logs use the structural storage codec and its embedded lookup index;
+- traces use bounded 8 MiB multi-trace columnar blocks;
+- metrics use per-series chunks;
+- trace and metric stored bytes include their serialized cold-correlation
+  filters.
+
+The current storage-inclusive run used an Apple M5 Max, 32,768 records per
+signal, and 2,000 warm lookup iterations. Encode throughput includes codec and
+cold-filter construction; log encode also includes structural indexing.
+
+| Signal | Canonical bytes | Payload bytes | Auxiliary bytes | Stored bytes | Ratio | Encode | Decode |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Logs | 29,773,336 | 1,188,990 | 0 | 1,188,990 | **25.04x** | 290.97 MiB/s | 529.80 MiB/s |
+| Traces | 13,371,009 | 194,521 | 604 | 195,125 | **68.53x** | 707.91 MiB/s | 3,846.34 MiB/s |
+| Metrics | 14,806,656 | 313,678 | 3,814 | 317,492 | **46.64x** | 1,432.72 MiB/s | 4,274.31 MiB/s |
+
+| Lookup path | Results/page | Lookups/s | p50 | p99 |
+| --- | ---: | ---: | ---: | ---: |
+| Log term + exact metadata | 100 | 52,639 | 18.75 us | 21.83 us |
+| Trace ID | 8 | 97,541 | 10.29 us | 11.17 us |
+| Exact metric series | 100 | 2,723 | 364.92 us | 400.96 us |
+| Resource + typed-label correlation | 1,000 | 4,653 | 214.83 us | 242.21 us |
+
+An earlier codec-only ablation omitted block grouping, structural log storage,
+and cold-correlation bytes. It reported 25.41x logs, 68.98x traces, and 47.20x
+metrics on the same 32,768-record corpus. Those figures remain useful for
+isolating codec changes but are superseded by the storage-inclusive table for
+capacity planning.
+
+These are deterministic synthetic storage/index results, not Adam production
+capture or competitor claims. The existing 80 GiB Adam log result below remains
+the authoritative real-log gate. Retained 16 GiB trace and metric captures are
+still required before publishing Tempo and Prometheus head-to-head claims.
+
+Reproduce locally with:
+
+```bash
+cargo run --release --bin shard-telemetry-signal-bench -- \
+  --records 32768 --iterations 2000
+```
+
 ## Current single-format 80 GiB acceptance — 2026-08-04
 
 This is the current pre-release result for commit

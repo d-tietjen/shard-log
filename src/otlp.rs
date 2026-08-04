@@ -184,6 +184,8 @@ fn decode_scope_logs(
 ) -> TelemetryResult<Vec<OtlpLogEvent>> {
     let scope_fields = scope_fields(scope_logs.scope.as_ref());
     let scope = Arc::new(scope_context(scope_logs));
+    let resource_id = resource.id().to_string();
+    let scope_id = scope.id().to_string();
     let compression_cohort = compression_cohort(resource_fields, scope_logs.scope.as_ref());
     scope_logs
         .log_records
@@ -194,6 +196,8 @@ fn decode_scope_logs(
             );
             fields.extend_from_slice(resource_fields);
             fields.extend_from_slice(&scope_fields);
+            fields.push(MetadataField::new("otel.resource.id", resource_id.clone()));
+            fields.push(MetadataField::new("otel.scope.id", scope_id.clone()));
             fields.extend(record_fields(record));
             let trace_id = optional_trace_id(&record.trace_id)?;
             let span_id = optional_span_id(&record.span_id)?;

@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 use shard_stream_core::{ShardId, TopicPartition};
 
 use crate::{
-    BlockCatalog, BlockDescriptor, BlockId, CompressionCodec, TelemetryError, TelemetryResult,
-    TelemetrySignal,
+    BlockCatalog, BlockDescriptor, BlockId, CompressionCodec, CorrelationBlockFilter,
+    TelemetryError, TelemetryResult, TelemetrySignal,
 };
 
 const TIER_FORMAT_VERSION: u8 = 1;
@@ -389,8 +389,12 @@ pub struct TierBlockEntry {
     pub payload_bytes: u64,
     /// Lowercase BLAKE3 checksum of this block's compressed bytes.
     pub payload_checksum: String,
-    /// Optional trace ID or metric-series fingerprint used for catalog pruning.
-    pub signal_identity: Option<u128>,
+    /// Lowest trace ID or metric-series fingerprint represented by this block.
+    pub min_signal_identity: Option<u128>,
+    /// Highest trace ID or metric-series fingerprint represented by this block.
+    pub max_signal_identity: Option<u128>,
+    /// Compact shared-identity filter for cold cross-signal lookup.
+    pub correlation_filter: Option<CorrelationBlockFilter>,
 }
 
 /// Durable sink watermark covered by an immutable object-tier group.
@@ -441,7 +445,9 @@ impl TierBlockEntry {
             payload_offset,
             payload_bytes: descriptor.stored_bytes,
             payload_checksum,
-            signal_identity: None,
+            min_signal_identity: None,
+            max_signal_identity: None,
+            correlation_filter: None,
         }
     }
 
@@ -450,7 +456,8 @@ impl TierBlockEntry {
     pub fn for_signal_payload(
         signal: TelemetrySignal,
         block_id: u64,
-        signal_identity: u128,
+        min_signal_identity: u128,
+        max_signal_identity: u128,
         first_offset: u64,
         last_offset: u64,
         record_count: u32,
@@ -459,6 +466,7 @@ impl TierBlockEntry {
         payload_offset: u64,
         payload_bytes: u64,
         payload_checksum: String,
+        correlation_filter: CorrelationBlockFilter,
     ) -> TelemetryResult<Self> {
         if !matches!(signal, TelemetrySignal::Traces | TelemetrySignal::Metrics) {
             return Err(TelemetryError::InvalidConfig(
@@ -491,7 +499,9 @@ impl TierBlockEntry {
             payload_offset,
             payload_bytes,
             payload_checksum,
-            signal_identity: Some(signal_identity),
+            min_signal_identity: Some(min_signal_identity),
+            max_signal_identity: Some(max_signal_identity),
+            correlation_filter: Some(correlation_filter),
         })
     }
 
@@ -505,7 +515,13 @@ impl TierBlockEntry {
                 self.compression_codec.as_str(),
                 "zstd" | "trace-native" | "metric-native"
             )
-            || (self.compression_codec == "zstd") != self.signal_identity.is_none()
+            || self.min_signal_identity.is_some() != self.max_signal_identity.is_some()
+            || self
+                .min_signal_identity
+                .zip(self.max_signal_identity)
+                .is_some_and(|(minimum, maximum)| minimum > maximum)
+            || (self.compression_codec == "zstd") != self.min_signal_identity.is_none()
+            || (self.compression_codec == "zstd") != self.correlation_filter.is_none()
             || !valid_checksum(&self.payload_checksum)
             || self
                 .payload_offset
@@ -544,8 +560,10 @@ pub struct SignalTierPayload {
     pub resident_id: u64,
     /// Signal partition whose catalog owns this payload.
     pub topic_partition: TopicPartition,
-    /// Trace ID or canonical metric-series fingerprint.
-    pub signal_identity: u128,
+    /// Lowest trace ID or canonical metric-series fingerprint in the payload.
+    pub min_signal_identity: u128,
+    /// Highest trace ID or canonical metric-series fingerprint in the payload.
+    pub max_signal_identity: u128,
     /// First durable offset represented by the payload.
     pub first_offset: u64,
     /// Last durable offset represented by the payload.
@@ -558,6 +576,8 @@ pub struct SignalTierPayload {
     pub max_timestamp_unix_nanos: u64,
     /// Complete self-verifying signal-native bytes.
     pub payload: Arc<[u8]>,
+    /// Compact shared-identity filter computed before the mutable head is released.
+    pub correlation_filter: CorrelationBlockFilter,
 }
 
 /// Stages one complete trace or metric object-tier group.
@@ -610,7 +630,8 @@ pub fn stage_signal_group(
             first_block_id
                 .checked_add(u64::try_from(ordinal).map_err(|_| TelemetryError::RecordTooLarge)?)
                 .ok_or(TelemetryError::RecordTooLarge)?,
-            payload.signal_identity,
+            payload.min_signal_identity,
+            payload.max_signal_identity,
             payload.first_offset,
             payload.last_offset,
             payload.record_count,
@@ -619,6 +640,7 @@ pub fn stage_signal_group(
             payload_offset,
             payload_bytes,
             checksum_bytes(&payload.payload),
+            payload.correlation_filter.clone(),
         )?);
     }
     let index = encode_signal_index(signal, recovery_state)?;
@@ -878,12 +900,12 @@ impl CatalogGroupEntry {
         let min_signal_identity = manifest
             .blocks
             .iter()
-            .filter_map(|block| block.signal_identity)
+            .filter_map(|block| block.min_signal_identity)
             .min();
         let max_signal_identity = manifest
             .blocks
             .iter()
-            .filter_map(|block| block.signal_identity)
+            .filter_map(|block| block.max_signal_identity)
             .max();
         Ok(Self {
             group_sequence: manifest.group_sequence,
@@ -2572,7 +2594,9 @@ mod tests {
                 payload_offset: 0,
                 payload_bytes: 32,
                 payload_checksum: checksum_bytes(&payload),
-                signal_identity: None,
+                min_signal_identity: None,
+                max_signal_identity: None,
+                correlation_filter: None,
             }],
             artifacts: vec![
                 TierArtifactSource {

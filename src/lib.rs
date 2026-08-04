@@ -10,6 +10,7 @@
 
 mod analytics;
 mod block;
+mod correlation;
 mod deletion;
 mod dictionary;
 mod envelope;
@@ -53,6 +54,9 @@ pub use analytics::{
     CLICKHOUSE_COMPATIBILITY_TARGET,
 };
 pub use block::{BlockCatalog, BlockDescriptor, BlockId, CompressionCodec};
+pub use correlation::{
+    CorrelationBlockFilter, CorrelationConfig, CorrelationIndex, CorrelationQuery, CorrelationStats,
+};
 pub use deletion::DeleteRequest;
 pub use dictionary::{
     CompressionCohortId, DictionaryCache, DictionaryCatalog, DictionaryCatalogSnapshot,
@@ -108,7 +112,7 @@ pub use remote_write::{
     RemoteWriteStats, RemoteWriteVersion,
 };
 pub use signal_ingest::{
-    prepare_log_envelope, prepare_loki_log_envelope, prepare_metric_envelope,
+    decode_log_envelope, prepare_log_envelope, prepare_loki_log_envelope, prepare_metric_envelope,
     prepare_metric_envelope_with_protocol, prepare_trace_envelope,
 };
 pub use sink::{OtlpSinkConfig, SinkObjectTierConfig, TelemetryService, TelemetrySinkFactory};
@@ -120,9 +124,10 @@ pub use structural::{
     encode_structural_records, message_pattern,
 };
 pub use telemetry::{
-    LOGS_TOPIC_ID, METRICS_TOPIC_ID, ResourceContext, ScopeContext, SeriesFingerprint,
-    ShardTelemetryConfig, SignalConfig, SpanId, TRACES_TOPIC_ID, TelemetryAttribute,
-    TelemetryEntityRef, TelemetryRouter, TelemetrySignal, TelemetryValue, TraceId,
+    AttributeFingerprint, LOGS_TOPIC_ID, METRICS_TOPIC_ID, ResourceContext, ResourceContextId,
+    ScopeContext, ScopeContextId, SeriesFingerprint, ShardTelemetryConfig, SignalConfig, SpanId,
+    TRACES_TOPIC_ID, TelemetryAttribute, TelemetryEntityRef, TelemetryRouter, TelemetrySignal,
+    TelemetryValue, TraceId,
 };
 pub use telemetry_store::{DurableTelemetryConfig, DurableTelemetryStore, RetentionReport};
 pub use tempo_api::{TempoApiConfig, TempoService, tempo_router};

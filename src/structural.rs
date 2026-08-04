@@ -1633,7 +1633,7 @@ fn encode_typed_metadata<R: StructuralRecordView>(records: &[R]) -> TelemetryRes
     if metadata.iter().all(Option::is_none) {
         return Ok(Vec::new());
     }
-    let raw = rmp_serde::to_vec_named(&metadata)
+    let raw = rmp_serde::to_vec(&metadata)
         .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
     let compressed = zstd::bulk::compress(&raw, 1)
         .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;

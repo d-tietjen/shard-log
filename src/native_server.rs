@@ -24,7 +24,7 @@ pub trait NativeRequestGate: Send + Sync + std::fmt::Debug + 'static {
     /// Returns `Ok` only when this process may append every routed partition.
     ///
     /// The default preserves coordinator-only gates. HA products override this
-    /// method to fence each signal partition after the complete STB2 request is
+    /// method to fence each signal partition after the complete STB1 request is
     /// decoded and before any partition append starts.
     fn check_partitions(&self, _partitions: &[crate::NativePartitionAppend]) -> Result<(), String> {
         self.check()
@@ -330,7 +330,7 @@ async fn dispatch(
                 return error_frame(
                     header,
                     NativeStatus::BadRequest,
-                    "native append requires the signal-aware STB2 payload",
+                    "native append requires the signal-aware STB1 payload",
                 );
             }
             let telemetry_batch = match NativeTelemetryBatch::decode(&payload) {

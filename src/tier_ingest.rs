@@ -146,7 +146,9 @@ pub(crate) fn write_tier_ingest_group(
                 payload_offset,
                 payload_bytes,
                 payload_checksum,
-                signal_identity: None,
+                min_signal_identity: None,
+                max_signal_identity: None,
+                correlation_filter: None,
             });
             payload_offset = payload_offset
                 .checked_add(payload_bytes)

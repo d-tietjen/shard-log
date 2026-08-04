@@ -11,12 +11,12 @@ pub const NATIVE_FRAME_HEADER_BYTES: usize = 32;
 pub const MAX_NATIVE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 const FRAME_MAGIC: [u8; 4] = *b"STNP";
-const FRAME_VERSION: u8 = 2;
+const FRAME_VERSION: u8 = 1;
 const FRAME_FLAG_RESPONSE: u8 = 1;
-const LOG_QUERY_RESULT_MAGIC: [u8; 4] = *b"STR2";
-const TELEMETRY_BATCH_MAGIC: [u8; 4] = *b"STB2";
-const TELEMETRY_ACK_MAGIC: [u8; 4] = *b"STM2";
-const QUERY_MAGIC: [u8; 4] = *b"STQ2";
+const LOG_QUERY_RESULT_MAGIC: [u8; 4] = *b"STR1";
+const TELEMETRY_BATCH_MAGIC: [u8; 4] = *b"STB1";
+const TELEMETRY_ACK_MAGIC: [u8; 4] = *b"STM1";
+const QUERY_MAGIC: [u8; 4] = *b"STQ1";
 const LOG_QUERY_RESULT_HEADER_BYTES: usize = 16;
 const QUERY_HEADER_BYTES: usize = 32;
 const MAX_TENANT_BYTES: usize = 1_024;
@@ -280,7 +280,7 @@ pub struct NativePartitionAppend {
     pub envelope: TelemetryEnvelope,
 }
 
-/// Native protocol v2 append containing one envelope per resulting partition.
+/// Native protocol v1 append containing one envelope per resulting partition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeTelemetryBatch {
     /// Routed partition appends. Duplicate partitions are rejected.
@@ -288,7 +288,7 @@ pub struct NativeTelemetryBatch {
 }
 
 impl NativeTelemetryBatch {
-    /// Encodes the bounded signal-aware native v2 payload.
+    /// Encodes the bounded signal-aware native v1 payload.
     pub fn encode(&self) -> Result<Vec<u8>, NativeProtocolError> {
         if self.partitions.is_empty() || self.partitions.len() > 256 {
             return Err(NativeProtocolError::new(
@@ -383,13 +383,13 @@ impl NativeTelemetryBatch {
     }
 }
 
-/// Returns true when a native append payload uses the signal-aware v2 batch format.
+/// Returns true when a native append payload uses the signal-aware v1 batch format.
 #[must_use]
 pub fn is_native_telemetry_batch(payload: &[u8]) -> bool {
     payload.starts_with(&TELEMETRY_BATCH_MAGIC)
 }
 
-/// Per-partition acknowledgement returned by native protocol v2.
+/// Per-partition acknowledgement returned by native protocol v1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NativePartitionAck {
     /// Appended topic and partition.
@@ -400,7 +400,7 @@ pub struct NativePartitionAck {
     pub last_offset: u64,
 }
 
-/// Atomic native v2 response containing one acknowledgement per partition.
+/// Atomic native v1 response containing one acknowledgement per partition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeTelemetryAppendAck {
     /// Partition acknowledgements in request order.
@@ -408,7 +408,7 @@ pub struct NativeTelemetryAppendAck {
 }
 
 impl NativeTelemetryAppendAck {
-    /// Encodes a native v2 multi-partition acknowledgement.
+    /// Encodes a native v1 multi-partition acknowledgement.
     pub fn encode(&self) -> Result<Vec<u8>, NativeProtocolError> {
         if self.partitions.len() > 256 {
             return Err(NativeProtocolError::new(
@@ -432,7 +432,7 @@ impl NativeTelemetryAppendAck {
         Ok(encoded)
     }
 
-    /// Decodes a native v2 multi-partition acknowledgement.
+    /// Decodes a native v1 multi-partition acknowledgement.
     pub fn decode(payload: &[u8]) -> Result<Self, NativeProtocolError> {
         if payload.len() < 8 || payload[..4] != TELEMETRY_ACK_MAGIC {
             return Err(NativeProtocolError::new(

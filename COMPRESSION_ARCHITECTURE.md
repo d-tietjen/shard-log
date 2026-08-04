@@ -11,6 +11,41 @@ block selection. The stripe-local zstd context compresses each resulting
 payload. This retains the single-writer stripe model, durable offsets, and
 exact record reconstruction while giving each codec homogeneous data.
 
+Logs, traces, and metrics all use the single pre-release v1 durable format, but
+their payloads remain signal-native:
+
+- log frames use structural templates, Pco timestamps, field dictionaries, and
+  the compressed-domain term/field index;
+- trace heads are collected by trace and then packed by partition into bounded
+  8 MiB multi-trace blocks; each block prefix/XOR encodes IDs, Pco-encodes times
+  and durations, and refers to exact tenant/resource/scope/name/attribute/event/
+  link/status values through block-local ordinals before Zstd-1;
+- metric chunks delta-of-delta encode timestamps, Pco-encode integer samples,
+  Gorilla-bitpack exact floating-point XOR windows, and Zstd-encode homogeneous
+  histogram/summary lanes. Description, metadata, and exemplar sets use
+  chunk-local ordinals.
+
+The ordinal builders use linear search for up to 16 distinct values and promote
+to a hash table only for higher-cardinality blocks. This keeps common repeated
+telemetry on the cache-friendly path while bounding high-cardinality insertion
+cost. Every dictionary is part of its checksummed block; no mutable global
+interner is required for decoding.
+
+Resource contexts, scope contexts, and typed attributes also receive stable
+128-bit content identities. The owner stripe indexes those identities together
+with trace links from logs, spans, span links, and metric exemplars. Correlation
+postings contain only durable record references and are strictly bounded; if
+the optional navigation index is full, ingestion and native per-signal indexes
+remain exact and available.
+
+Every immutable trace block and metric chunk also carries a compact
+shared-identity Bloom filter. Catalog trace-ID ranges and these filters prune
+cold object reads; candidate blocks are always decoded and compared exactly, so
+filter collisions can add work but cannot add results. Primary trace IDs use
+the exact sorted block range, leaving the trace Bloom bits for cross-trace span
+links. Filters are computed while source records are still owned by the stripe
+and survive object-tier restart without retaining record bodies in RAM.
+
 The Adam error-loop corpus reached 33.13x with bzip2 and 27.56x with zstd-9 as
 raw 8 MiB blocks. A trained dictionary and the current line-template prototype
 did not improve that corpus materially. That is evidence to optimize data

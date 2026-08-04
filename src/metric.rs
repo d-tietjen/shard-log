@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::hash::Hash;
 use std::sync::Arc;
 
 use pco::ChunkConfig;
@@ -7,9 +8,9 @@ use serde::{Deserialize, Serialize};
 use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicId, TopicPartition};
 
 use crate::{
-    ResourceContext, ScopeContext, SeriesFingerprint, SignalTierPayload, SpanId,
-    TelemetryAttribute, TelemetryError, TelemetryRecordRef, TelemetryResult, TelemetrySignal,
-    TraceId,
+    CorrelationBlockFilter, ResourceContext, ScopeContext, SeriesFingerprint, SignalTierPayload,
+    SpanId, TelemetryAttribute, TelemetryError, TelemetryRecordRef, TelemetryResult,
+    TelemetrySignal, TraceId,
 };
 
 const METRIC_CHUNK_MAGIC: [u8; 4] = *b"STMP";
@@ -22,7 +23,7 @@ const DEFAULT_CHUNK_POINTS: usize = 4_096;
 const DEFAULT_CHUNK_NANOS: u64 = 2 * 60 * 60 * 1_000_000_000;
 
 /// Exact scalar number used by gauges, sums, and exemplars.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NumberValue {
     /// Signed integer sample.
     Integer(i64),
@@ -48,7 +49,7 @@ impl NumberValue {
 }
 
 /// One metric exemplar nested under a point.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct MetricExemplar {
     /// Filtered attributes in wire order.
     pub filtered_attributes: Arc<Vec<TelemetryAttribute>>,
@@ -205,6 +206,18 @@ pub struct MetricIdentity {
 }
 
 impl MetricIdentity {
+    /// Returns the cross-signal identity of this series' resource context.
+    #[must_use]
+    pub fn resource_id(&self) -> crate::ResourceContextId {
+        self.resource.id()
+    }
+
+    /// Returns the cross-signal identity of this series' instrumentation scope.
+    #[must_use]
+    pub fn scope_id(&self) -> crate::ScopeContextId {
+        self.scope.id()
+    }
+
     /// Computes the process-independent canonical series fingerprint.
     #[must_use]
     pub fn fingerprint(&self) -> SeriesFingerprint {
@@ -272,16 +285,19 @@ impl DurableMetricPoint {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MetricPointSidecar {
-    description: Arc<str>,
-    metadata: Arc<Vec<TelemetryAttribute>>,
+    description_id: u32,
+    metadata_id: u32,
     start_time_unix_nanos: u64,
     flags: u32,
-    exemplars: Arc<Vec<MetricExemplar>>,
+    exemplars_id: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct MetricChunkSidecars {
     identity: Arc<MetricIdentity>,
+    descriptions: Vec<Arc<str>>,
+    metadata_sets: Vec<Arc<Vec<TelemetryAttribute>>>,
+    exemplar_sets: Vec<Arc<Vec<MetricExemplar>>>,
     points: Vec<MetricPointSidecar>,
 }
 
@@ -299,7 +315,7 @@ pub fn encode_metric_chunk(points: &[DurableMetricPoint]) -> TelemetryResult<Vec
         point.record_ref.signal != TelemetrySignal::Metrics
             || point.record_ref.topic_partition != partition
             || point.stream_shard_id != stream_shard_id
-            || point.series_fingerprint() != fingerprint
+            || point.identity.as_ref() != first.identity.as_ref()
     }) {
         return Err(TelemetryError::InvalidBlockEncoding(
             "metric chunk points do not share a series, partition, and owner",
@@ -316,20 +332,8 @@ pub fn encode_metric_chunk(points: &[DurableMetricPoint]) -> TelemetryResult<Vec
         .map(|point| point.timestamp_unix_nanos)
         .collect::<Vec<_>>();
     let values = encode_metric_values(&sorted)?;
-    let sidecars = MetricChunkSidecars {
-        identity: Arc::clone(&first.identity),
-        points: sorted
-            .iter()
-            .map(|point| MetricPointSidecar {
-                description: Arc::clone(&point.description),
-                metadata: Arc::clone(&point.metadata),
-                start_time_unix_nanos: point.start_time_unix_nanos,
-                flags: point.flags,
-                exemplars: Arc::clone(&point.exemplars),
-            })
-            .collect(),
-    };
-    let sidecar_bytes = rmp_serde::to_vec_named(&sidecars)
+    let sidecars = encode_metric_sidecars(&sorted)?;
+    let sidecar_bytes = rmp_serde::to_vec(&sidecars)
         .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
     let compressed_sidecars = zstd::bulk::compress(&sidecar_bytes, METRIC_SIDECAR_ZSTD_LEVEL)
         .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
@@ -418,13 +422,13 @@ pub fn decode_metric_chunk(encoded: &[u8]) -> TelemetryResult<Vec<DurableMetricP
             "metric sidecar identity or count mismatch",
         ));
     }
-    Ok(offsets
+    offsets
         .into_iter()
         .zip(timestamps)
         .zip(values)
         .zip(sidecars.points)
-        .map(
-            |(((offset, timestamp_unix_nanos), value), sidecar)| DurableMetricPoint {
+        .map(|(((offset, timestamp_unix_nanos), value), sidecar)| {
+            Ok(DurableMetricPoint {
                 stream_shard_id,
                 record_ref: TelemetryRecordRef::for_signal(
                     TelemetrySignal::Metrics,
@@ -432,20 +436,184 @@ pub fn decode_metric_chunk(encoded: &[u8]) -> TelemetryResult<Vec<DurableMetricP
                     LogicalOffset::new(offset),
                 ),
                 identity: Arc::clone(&sidecars.identity),
-                description: sidecar.description,
-                metadata: sidecar.metadata,
+                description: resolve_metric_sidecar(
+                    &sidecars.descriptions,
+                    sidecar.description_id,
+                    "description",
+                )?,
+                metadata: resolve_metric_sidecar(
+                    &sidecars.metadata_sets,
+                    sidecar.metadata_id,
+                    "metadata",
+                )?,
                 start_time_unix_nanos: sidecar.start_time_unix_nanos,
                 timestamp_unix_nanos,
                 flags: sidecar.flags,
                 value,
-                exemplars: sidecar.exemplars,
-            },
-        )
-        .collect())
+                exemplars: resolve_metric_sidecar(
+                    &sidecars.exemplar_sets,
+                    sidecar.exemplars_id,
+                    "exemplars",
+                )?,
+            })
+        })
+        .collect::<TelemetryResult<Vec<_>>>()
+}
+
+fn encode_metric_sidecars(points: &[&DurableMetricPoint]) -> TelemetryResult<MetricChunkSidecars> {
+    let mut descriptions = MetricSidecarInterner::new(points.len());
+    let mut metadata_sets = MetricSidecarInterner::new(points.len());
+    let mut exemplar_sets = MetricSidecarInterner::new(points.len());
+    let mut packed = Vec::with_capacity(points.len());
+    for point in points {
+        let description_id = descriptions.intern(&point.description)?;
+        let metadata_id = metadata_sets.intern(&point.metadata)?;
+        let exemplars_id = exemplar_sets.intern(&point.exemplars)?;
+        packed.push(MetricPointSidecar {
+            description_id,
+            metadata_id,
+            start_time_unix_nanos: point.start_time_unix_nanos,
+            flags: point.flags,
+            exemplars_id,
+        });
+    }
+    Ok(MetricChunkSidecars {
+        identity: Arc::clone(&points[0].identity),
+        descriptions: descriptions.into_values(),
+        metadata_sets: metadata_sets.into_values(),
+        exemplar_sets: exemplar_sets.into_values(),
+        points: packed,
+    })
+}
+
+struct MetricSidecarInterner<T> {
+    values: Vec<T>,
+    ids: Option<HashMap<T, u32>>,
+    capacity: usize,
+}
+
+impl<T: Clone + Eq + Hash> MetricSidecarInterner<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            values: Vec::new(),
+            ids: None,
+            capacity,
+        }
+    }
+
+    fn intern(&mut self, value: &T) -> TelemetryResult<u32> {
+        if let Some(ids) = &self.ids {
+            if let Some(index) = ids.get(value) {
+                return Ok(*index);
+            }
+        } else {
+            if let Some(index) = self.values.iter().position(|candidate| candidate == value) {
+                return u32::try_from(index).map_err(|_| TelemetryError::RecordTooLarge);
+            }
+            if self.values.len() == 16 {
+                self.ids = Some(
+                    self.values
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            Ok((
+                                value,
+                                u32::try_from(index).map_err(|_| TelemetryError::RecordTooLarge)?,
+                            ))
+                        })
+                        .collect::<TelemetryResult<HashMap<_, _>>>()?,
+                );
+                self.ids
+                    .as_mut()
+                    .expect("interner map was installed")
+                    .reserve(self.capacity.min(4_096).saturating_sub(16));
+            }
+        }
+        let index = u32::try_from(self.values.len()).map_err(|_| TelemetryError::RecordTooLarge)?;
+        let value = value.clone();
+        self.values.push(value.clone());
+        if let Some(ids) = &mut self.ids {
+            ids.insert(value, index);
+        }
+        Ok(index)
+    }
+
+    fn into_values(self) -> Vec<T> {
+        self.values
+    }
+}
+
+fn resolve_metric_sidecar<T: Clone>(
+    values: &[T],
+    id: u32,
+    lane: &'static str,
+) -> TelemetryResult<T> {
+    values
+        .get(id as usize)
+        .cloned()
+        .ok_or(TelemetryError::InvalidBlockEncoding(match lane {
+            "description" => "metric description sidecar ID is out of range",
+            "metadata" => "metric metadata sidecar ID is out of range",
+            "exemplars" => "metric exemplar sidecar ID is out of range",
+            _ => "metric sidecar ID is out of range",
+        }))
 }
 
 fn encode_metric_values(points: &[&DurableMetricPoint]) -> TelemetryResult<Vec<u8>> {
-    let mut encoded = Vec::new();
+    if let Some(values) = collect_number_lane(points, true, false) {
+        return encode_integer_value_lane(1, &values);
+    }
+    if let Some(values) = collect_double_lane(points, true) {
+        return encode_double_value_lane(2, &values);
+    }
+    if let Some(values) = collect_number_lane(points, false, true) {
+        return encode_integer_value_lane(3, &values);
+    }
+    if let Some(values) = collect_double_lane(points, false) {
+        return encode_double_value_lane(4, &values);
+    }
+    if points
+        .iter()
+        .all(|point| matches!(point.value, MetricValue::ExplicitHistogram(_)))
+    {
+        let values = points
+            .iter()
+            .map(|point| match &point.value {
+                MetricValue::ExplicitHistogram(value) => value.clone(),
+                _ => unreachable!("value kind was checked"),
+            })
+            .collect::<Vec<_>>();
+        return encode_zstd_value_lane(5, &values);
+    }
+    if points
+        .iter()
+        .all(|point| matches!(point.value, MetricValue::ExponentialHistogram(_)))
+    {
+        let values = points
+            .iter()
+            .map(|point| match &point.value {
+                MetricValue::ExponentialHistogram(value) => value.clone(),
+                _ => unreachable!("value kind was checked"),
+            })
+            .collect::<Vec<_>>();
+        return encode_zstd_value_lane(6, &values);
+    }
+    if points
+        .iter()
+        .all(|point| matches!(point.value, MetricValue::Summary(_)))
+    {
+        let values = points
+            .iter()
+            .map(|point| match &point.value {
+                MetricValue::Summary(value) => value.clone(),
+                _ => unreachable!("value kind was checked"),
+            })
+            .collect::<Vec<_>>();
+        return encode_zstd_value_lane(7, &values);
+    }
+
+    let mut encoded = vec![0];
     let mut previous_float = 0u64;
     for point in points {
         match &point.value {
@@ -475,6 +643,80 @@ fn encode_metric_values(points: &[&DurableMetricPoint]) -> TelemetryResult<Vec<u
 }
 
 fn decode_metric_values(encoded: &[u8], count: usize) -> TelemetryResult<Vec<MetricValue>> {
+    let (&codec, payload) = encoded
+        .split_first()
+        .ok_or(TelemetryError::InvalidBlockEncoding(
+            "metric value lane is empty",
+        ))?;
+    match codec {
+        1 => {
+            return decode_integer_value_lane(payload, count).map(|values| {
+                values
+                    .into_iter()
+                    .map(NumberValue::Integer)
+                    .map(MetricValue::Gauge)
+                    .collect()
+            });
+        }
+        2 => {
+            return decode_double_value_lane(payload, count).map(|values| {
+                values
+                    .into_iter()
+                    .map(NumberValue::DoubleBits)
+                    .map(MetricValue::Gauge)
+                    .collect()
+            });
+        }
+        3 => {
+            return decode_integer_value_lane(payload, count).map(|values| {
+                values
+                    .into_iter()
+                    .map(NumberValue::Integer)
+                    .map(MetricValue::Sum)
+                    .collect()
+            });
+        }
+        4 => {
+            return decode_double_value_lane(payload, count).map(|values| {
+                values
+                    .into_iter()
+                    .map(NumberValue::DoubleBits)
+                    .map(MetricValue::Sum)
+                    .collect()
+            });
+        }
+        5 => {
+            return decode_zstd_value_lane::<ExplicitHistogramValue>(payload, count).map(
+                |values| {
+                    values
+                        .into_iter()
+                        .map(MetricValue::ExplicitHistogram)
+                        .collect()
+                },
+            );
+        }
+        6 => {
+            return decode_zstd_value_lane::<ExponentialHistogramValue>(payload, count).map(
+                |values| {
+                    values
+                        .into_iter()
+                        .map(MetricValue::ExponentialHistogram)
+                        .collect()
+                },
+            );
+        }
+        7 => {
+            return decode_zstd_value_lane::<SummaryValue>(payload, count)
+                .map(|values| values.into_iter().map(MetricValue::Summary).collect());
+        }
+        0 => {}
+        _ => {
+            return Err(TelemetryError::InvalidBlockEncoding(
+                "invalid metric value-lane codec",
+            ));
+        }
+    }
+    let encoded = payload;
     let mut cursor = 0;
     let mut previous_float = 0u64;
     let mut values = Vec::with_capacity(count);
@@ -498,6 +740,241 @@ fn decode_metric_values(encoded: &[u8], count: usize) -> TelemetryResult<Vec<Met
         ));
     }
     Ok(values)
+}
+
+fn collect_number_lane(points: &[&DurableMetricPoint], gauge: bool, sum: bool) -> Option<Vec<i64>> {
+    points
+        .iter()
+        .map(|point| match point.value {
+            MetricValue::Gauge(NumberValue::Integer(value)) if gauge => Some(value),
+            MetricValue::Sum(NumberValue::Integer(value)) if sum => Some(value),
+            _ => None,
+        })
+        .collect()
+}
+
+fn collect_double_lane(points: &[&DurableMetricPoint], gauge: bool) -> Option<Vec<u64>> {
+    points
+        .iter()
+        .map(|point| match point.value {
+            MetricValue::Gauge(NumberValue::DoubleBits(value)) if gauge => Some(value),
+            MetricValue::Sum(NumberValue::DoubleBits(value)) if !gauge => Some(value),
+            _ => None,
+        })
+        .collect()
+}
+
+fn encode_integer_value_lane(codec: u8, values: &[i64]) -> TelemetryResult<Vec<u8>> {
+    let compressed = simple_compress(
+        values,
+        &ChunkConfig::default().with_compression_level(METRIC_PCO_LEVEL),
+    )
+    .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
+    let mut encoded = Vec::with_capacity(1 + compressed.len());
+    encoded.push(codec);
+    encoded.extend_from_slice(&compressed);
+    Ok(encoded)
+}
+
+fn decode_integer_value_lane(encoded: &[u8], count: usize) -> TelemetryResult<Vec<i64>> {
+    let mut values = vec![0; count];
+    let progress = simple_decompress_into(encoded, &mut values)
+        .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid metric integer Pco lane"))?;
+    if progress.n_processed != count || !progress.finished {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "metric integer Pco lane count mismatch",
+        ));
+    }
+    Ok(values)
+}
+
+fn encode_double_value_lane(codec: u8, values: &[u64]) -> TelemetryResult<Vec<u8>> {
+    let Some((&first, rest)) = values.split_first() else {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "metric double lane is empty",
+        ));
+    };
+    let mut writer = MetricBitWriter::new();
+    let mut previous = first;
+    for &value in rest {
+        let xor = value ^ previous;
+        if xor == 0 {
+            writer.write_bit(false);
+        } else {
+            writer.write_bit(true);
+            let leading = xor.leading_zeros() as u8;
+            let trailing = xor.trailing_zeros() as u8;
+            let significant = 64 - leading - trailing;
+            writer.write_bits(u64::from(leading), 6);
+            writer.write_bits(u64::from(trailing), 6);
+            writer.write_bits(xor >> trailing, significant);
+        }
+        previous = value;
+    }
+    let bits = writer.finish();
+    let mut encoded = Vec::with_capacity(9 + bits.len());
+    encoded.push(codec);
+    encoded.extend_from_slice(&first.to_le_bytes());
+    encoded.extend_from_slice(&bits);
+    Ok(encoded)
+}
+
+fn decode_double_value_lane(encoded: &[u8], count: usize) -> TelemetryResult<Vec<u64>> {
+    if count == 0 || encoded.len() < 8 {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "invalid metric double lane",
+        ));
+    }
+    let first = u64::from_le_bytes(encoded[..8].try_into().expect("fixed range"));
+    let mut values = Vec::with_capacity(count);
+    values.push(first);
+    let mut previous = first;
+    let mut reader = MetricBitReader::new(&encoded[8..]);
+    for _ in 1..count {
+        let value = if !reader.read_bit()? {
+            previous
+        } else {
+            let leading = reader.read_bits(6)? as u8;
+            let trailing = reader.read_bits(6)? as u8;
+            if leading.saturating_add(trailing) >= 64 {
+                return Err(TelemetryError::InvalidBlockEncoding(
+                    "invalid metric double XOR window",
+                ));
+            }
+            let significant = 64 - leading - trailing;
+            previous ^ (reader.read_bits(significant)? << trailing)
+        };
+        values.push(value);
+        previous = value;
+    }
+    reader.finish()?;
+    Ok(values)
+}
+
+fn encode_zstd_value_lane<T: Serialize>(codec: u8, values: &[T]) -> TelemetryResult<Vec<u8>> {
+    let raw = rmp_serde::to_vec(values)
+        .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
+    let compressed = zstd::bulk::compress(&raw, METRIC_SIDECAR_ZSTD_LEVEL)
+        .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
+    let mut encoded = Vec::with_capacity(5 + compressed.len());
+    encoded.push(codec);
+    encoded.extend_from_slice(
+        &u32::try_from(raw.len())
+            .map_err(|_| TelemetryError::RecordTooLarge)?
+            .to_le_bytes(),
+    );
+    encoded.extend_from_slice(&compressed);
+    Ok(encoded)
+}
+
+fn decode_zstd_value_lane<T: for<'de> Deserialize<'de>>(
+    encoded: &[u8],
+    count: usize,
+) -> TelemetryResult<Vec<T>> {
+    if encoded.len() < 4 {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "truncated compressed metric value lane",
+        ));
+    }
+    let raw_len = u32::from_le_bytes(encoded[..4].try_into().expect("fixed range")) as usize;
+    if raw_len > 64 * 1024 * 1024 {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "metric value lane exceeds safety limit",
+        ));
+    }
+    let raw = zstd::bulk::decompress(&encoded[4..], raw_len)
+        .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid metric value compression"))?;
+    let values: Vec<T> = rmp_serde::from_slice(&raw)
+        .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid metric value lane"))?;
+    if values.len() != count {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "metric value lane count mismatch",
+        ));
+    }
+    Ok(values)
+}
+
+struct MetricBitWriter {
+    bytes: Vec<u8>,
+    used: u8,
+}
+
+impl MetricBitWriter {
+    fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            used: 8,
+        }
+    }
+
+    fn write_bit(&mut self, value: bool) {
+        if self.used == 8 {
+            self.bytes.push(0);
+            self.used = 0;
+        }
+        if value {
+            let last = self.bytes.len() - 1;
+            self.bytes[last] |= 1 << (7 - self.used);
+        }
+        self.used += 1;
+    }
+
+    fn write_bits(&mut self, value: u64, bits: u8) {
+        for shift in (0..bits).rev() {
+            self.write_bit(value & (1u64 << shift) != 0);
+        }
+    }
+
+    fn finish(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+struct MetricBitReader<'a> {
+    bytes: &'a [u8],
+    bit: usize,
+}
+
+impl<'a> MetricBitReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, bit: 0 }
+    }
+
+    fn read_bit(&mut self) -> TelemetryResult<bool> {
+        if self.bit >= self.bytes.len().saturating_mul(8) {
+            return Err(TelemetryError::InvalidBlockEncoding(
+                "truncated metric double lane",
+            ));
+        }
+        let value = self.bytes[self.bit / 8] & (1 << (7 - self.bit % 8)) != 0;
+        self.bit += 1;
+        Ok(value)
+    }
+
+    fn read_bits(&mut self, bits: u8) -> TelemetryResult<u64> {
+        let mut value = 0;
+        for _ in 0..bits {
+            value = (value << 1) | u64::from(self.read_bit()?);
+        }
+        Ok(value)
+    }
+
+    fn finish(mut self) -> TelemetryResult<()> {
+        let remaining = self.bytes.len().saturating_mul(8).saturating_sub(self.bit);
+        if remaining >= 8 {
+            return Err(TelemetryError::InvalidBlockEncoding(
+                "trailing metric double-lane bytes",
+            ));
+        }
+        while self.bit < self.bytes.len().saturating_mul(8) {
+            if self.read_bit()? {
+                return Err(TelemetryError::InvalidBlockEncoding(
+                    "nonzero metric double-lane padding",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 fn encode_number(value: NumberValue, previous_float: &mut u64, encoded: &mut Vec<u8>) {
@@ -1064,7 +1541,7 @@ impl MetricStripe {
                 }),
         );
         checkpoints.sort_unstable_by_key(|checkpoint| checkpoint.series);
-        rmp_serde::to_vec_named(&checkpoints)
+        rmp_serde::to_vec(&checkpoints)
             .map_err(|error| TelemetryError::StorageIo(error.to_string()))
     }
 
@@ -1088,7 +1565,7 @@ impl MetricStripe {
             })
         }));
         checkpoints.sort_unstable_by_key(|checkpoint| checkpoint.series);
-        rmp_serde::to_vec_named(&checkpoints)
+        rmp_serde::to_vec(&checkpoints)
             .map_err(|error| TelemetryError::StorageIo(error.to_string()))
     }
 
@@ -1298,7 +1775,8 @@ impl MetricStripe {
         self.pending_chunks.push(SignalTierPayload {
             resident_id,
             topic_partition: head.topic_partition,
-            signal_identity: series.get(),
+            min_signal_identity: series.get(),
+            max_signal_identity: series.get(),
             first_offset,
             last_offset,
             record_count: u32::try_from(points.len())
@@ -1306,6 +1784,7 @@ impl MetricStripe {
             min_timestamp_unix_nanos,
             max_timestamp_unix_nanos,
             payload: Arc::clone(&payload),
+            correlation_filter: CorrelationBlockFilter::for_metrics(&points),
         });
         self.chunks
             .entry(series)
@@ -1512,6 +1991,64 @@ mod tests {
         let decoded = decode_metric_chunk(&encoded).unwrap();
         assert_eq!(decoded[0], points[1]);
         assert_eq!(decoded[1], points[0]);
+    }
+
+    #[test]
+    fn metric_sidecar_interner_promotes_and_gorilla_lane_stays_bit_exact() {
+        let points = (1..=40)
+            .map(|ordinal| {
+                let mut point = point(
+                    ordinal,
+                    ordinal * 100,
+                    NumberValue::DoubleBits(
+                        f64::from_bits(0x3ff0_0000_0000_0000 + ordinal).to_bits(),
+                    ),
+                );
+                point.description = Arc::from(format!("description-{ordinal}"));
+                point.metadata = Arc::new(vec![TelemetryAttribute::new(
+                    "metadata.id",
+                    TelemetryValue::Integer(ordinal as i64),
+                )]);
+                point
+            })
+            .collect::<Vec<_>>();
+        let encoded = encode_metric_chunk(&points).unwrap();
+        let decoded = decode_metric_chunk(&encoded).unwrap();
+        assert_eq!(decoded, points);
+    }
+
+    #[test]
+    fn homogeneous_integer_and_histogram_value_lanes_round_trip() {
+        let integers = vec![
+            point(1, 100, NumberValue::Integer(i64::MIN)),
+            point(2, 200, NumberValue::Integer(i64::MAX)),
+        ];
+        assert_eq!(
+            decode_metric_chunk(&encode_metric_chunk(&integers).unwrap()).unwrap(),
+            integers
+        );
+
+        let histogram = ExplicitHistogramValue {
+            count: HistogramCount::Integer(3),
+            sum_bits: Some(6.0f64.to_bits()),
+            bucket_counts: Arc::new(vec![HistogramCount::Integer(1), HistogramCount::Integer(2)]),
+            explicit_bounds_bits: Arc::new(vec![1.0f64.to_bits()]),
+            min_bits: Some(1.0f64.to_bits()),
+            max_bits: Some(3.0f64.to_bits()),
+            reset_hint: 0,
+        };
+        let mut histograms = integers;
+        for point in &mut histograms {
+            point.identity = Arc::new(MetricIdentity {
+                kind: MetricKind::ExplicitHistogram { temporality: 2 },
+                ..point.identity.as_ref().clone()
+            });
+            point.value = MetricValue::ExplicitHistogram(histogram.clone());
+        }
+        assert_eq!(
+            decode_metric_chunk(&encode_metric_chunk(&histograms).unwrap()).unwrap(),
+            histograms
+        );
     }
 
     #[test]

@@ -14,18 +14,21 @@ use shard_stream_engine::{
     DurableSinkCheckpoint, EngineError, EngineResult,
 };
 
+use crate::correlation::{metric_matches_correlation, span_matches_correlation};
 use crate::ingest_pack::validate_ingest_pack;
 use crate::metric::metric_query_matches;
 use crate::sink_journal::{SinkJournal, checkpoint_allows_lane_gap};
 use crate::trace::trace_query_matches;
 use crate::{
-    DictionaryCatalog, DurableMetricPoint, DurableSpan, LogMatch, LogQuery, LogStripe,
+    CorrelationConfig, CorrelationIndex, CorrelationQuery, DictionaryCatalog, DurableMetricPoint,
+    DurableSpan, LogMatch, LogPredicate, LogQuery, LogStripe, MetricApplyOutcome,
     MetricIngestProtocol, MetricQuery, MetricStripe, ObjectMetadata, ObjectTierConfig,
     RealtimeDictionaryObserver, RealtimeDictionaryTrainer, ShardTelemetryConfig,
     SharedTelemetryObjectStore, SsdCacheConfig, SsdObjectCache, StripeConfig, TelemetryEnvelope,
-    TelemetryError, TelemetryObjectTier, TelemetryResult, TelemetryRouter, TelemetrySignal,
-    TierArtifactKind, TierCheckpoint, TierQueryRange, TraceQuery, TraceStripe, decode_metric_chunk,
-    decode_signal_recovery_state, decode_trace_block, stage_signal_group,
+    TelemetryError, TelemetryObjectTier, TelemetryRecordRef, TelemetryResult, TelemetryRouter,
+    TelemetrySignal, TierArtifactKind, TierCheckpoint, TierQueryRange, TraceApplyOutcome,
+    TraceQuery, TraceStripe, decode_metric_chunk, decode_signal_recovery_state, decode_trace_block,
+    stage_signal_group,
 };
 
 /// Immutable object-tier and bounded SSD-cache settings shared by sink stripes.
@@ -52,6 +55,8 @@ pub struct OtlpSinkConfig {
     pub stripe: StripeConfig,
     /// Per-signal partition, retention, head-memory, and query limits.
     pub signals: ShardTelemetryConfig,
+    /// Bounded stripe-local links across signal metadata and labels.
+    pub correlations: CorrelationConfig,
     /// Number of durable append batches waiting to be indexed per shard.
     pub queue_slots: usize,
     /// Directory containing crash-safe stripe-local sink journals.
@@ -69,6 +74,7 @@ impl Default for OtlpSinkConfig {
         Self {
             stripe: StripeConfig::default(),
             signals: ShardTelemetryConfig::default(),
+            correlations: CorrelationConfig::default(),
             queue_slots: 256,
             state_directory: None,
             max_journal_bytes: 64 * 1024 * 1024 * 1024,
@@ -80,6 +86,14 @@ impl Default for OtlpSinkConfig {
 impl OtlpSinkConfig {
     fn validate(&self) -> TelemetryResult<()> {
         self.signals.validate()?;
+        if self.correlations.max_keys == 0
+            || self.correlations.max_refs_per_key == 0
+            || self.correlations.max_total_refs == 0
+        {
+            return Err(TelemetryError::InvalidConfig(
+                "correlation index bounds must be nonzero",
+            ));
+        }
         if self.queue_slots == 0 {
             return Err(TelemetryError::InvalidConfig(
                 "log sink queue_slots must be nonzero",
@@ -150,6 +164,8 @@ struct TelemetryStripeState {
     logs: LogStripe,
     traces: TraceStripe,
     metrics: MetricStripe,
+    correlations: CorrelationIndex,
+    log_partitions: u16,
     signal_tiers: HashMap<TelemetrySignal, SignalTierState>,
     router: TelemetryRouter,
 }
@@ -381,6 +397,8 @@ impl TelemetrySinkFactory {
                 logs,
                 traces: TraceStripe::new(config.signals.traces.head_memory_bytes_per_stripe)?,
                 metrics,
+                correlations: CorrelationIndex::new(config.correlations),
+                log_partitions: config.signals.logs.logical_partitions.get(),
                 signal_tiers,
                 router: TelemetryRouter::from_config(&config.signals),
             };
@@ -560,6 +578,10 @@ enum SinkCommand {
         query: MetricQuery,
         response: SyncSender<TelemetryResult<Vec<DurableMetricPoint>>>,
     },
+    Correlate {
+        query: CorrelationQuery,
+        response: SyncSender<TelemetryResult<Vec<TelemetryRecordRef>>>,
+    },
     Flush {
         response: SyncSender<TelemetryResult<usize>>,
     },
@@ -676,6 +698,9 @@ fn run_sink_worker(
             SinkCommand::QueryMetrics { query, response } => {
                 let _ = response.send(query_metric_stripe(&stripe, &query));
             }
+            SinkCommand::Correlate { query, response } => {
+                let _ = response.send(query_correlation_stripe(&stripe, &query));
+            }
             SinkCommand::Flush { response } => {
                 let result = flush_object_tiers(&mut stripe, &checkpoints);
                 let _ = response.send(result);
@@ -774,6 +799,48 @@ impl TelemetryService {
         points.sort_unstable_by_key(|point| (point.timestamp_unix_nanos, point.record_ref.offset));
         points.truncate(query.limit.max(1));
         Ok(points)
+    }
+
+    /// Connects logs, spans, and metric exemplars through exact trace,
+    /// resource, scope, and typed-label identities.
+    pub fn query_correlations(
+        &self,
+        query: &CorrelationQuery,
+    ) -> TelemetryResult<Vec<TelemetryRecordRef>> {
+        if query.limit == 0 {
+            return Ok(Vec::new());
+        }
+        let workers = self.worker_senders()?;
+        let mut responses = Vec::with_capacity(workers.len());
+        for (shard_id, sender) in workers {
+            let (response, receiver) = sync_channel(1);
+            sender
+                .send(SinkCommand::Correlate {
+                    query: query.clone(),
+                    response,
+                })
+                .map_err(|_| {
+                    TelemetryError::QueryWorkerUnavailable(format!(
+                        "stripe {shard_id} stopped before accepting a correlation query"
+                    ))
+                })?;
+            responses.push((shard_id, receiver));
+        }
+        let mut refs = Vec::new();
+        for (shard_id, receiver) in responses {
+            refs.extend(receiver.recv().map_err(|_| {
+                TelemetryError::QueryWorkerUnavailable(format!(
+                    "stripe {shard_id} stopped while querying correlations"
+                ))
+            })??);
+        }
+        refs.sort_unstable();
+        refs.dedup();
+        if let Some(after) = query.after {
+            refs.retain(|record| *record > after);
+        }
+        refs.truncate(query.limit);
+        Ok(refs)
     }
 
     /// Forces every owner stripe to publish complete pending append boundaries.
@@ -1032,7 +1099,13 @@ fn index_payload(
                     absolute_offset(topic_partition, first_offset, record.record_ref.offset)?,
                 );
                 let append_time = record.end_time_unix_nanos().unwrap_or(u64::MAX);
-                stripe.traces.apply(record, append_time)?;
+                let outcome = stripe.traces.apply(record.clone(), append_time)?;
+                if matches!(
+                    outcome,
+                    TraceApplyOutcome::Inserted | TraceApplyOutcome::Replaced
+                ) {
+                    stripe.correlations.index_span(&record);
+                }
             }
         }
         TelemetrySignal::Metrics => {
@@ -1064,7 +1137,15 @@ fn index_payload(
                     topic_partition,
                     absolute_offset(topic_partition, first_offset, record.record_ref.offset)?,
                 );
-                stripe.metrics.apply(record, protocol)?;
+                let outcome = stripe.metrics.apply(record.clone(), protocol)?;
+                if matches!(
+                    outcome,
+                    MetricApplyOutcome::Inserted
+                        | MetricApplyOutcome::Replaced
+                        | MetricApplyOutcome::OutOfOrder
+                ) {
+                    stripe.correlations.index_metric(&record);
+                }
             }
         }
     }
@@ -1244,6 +1325,7 @@ fn read_signal_tier_payloads(
     state: &SignalTierState,
     partitions: &[TopicPartition],
     range: TierQueryRange,
+    correlation: Option<&CorrelationQuery>,
 ) -> TelemetryResult<Vec<Vec<u8>>> {
     let mut payloads = Vec::new();
     let expected_codec = match state.signal {
@@ -1267,15 +1349,34 @@ fn read_signal_tier_payloads(
             };
             for block in manifest.blocks.iter().filter(|block| {
                 block.compression_codec == expected_codec
-                    && range
-                        .signal_identity
-                        .is_none_or(|identity| block.signal_identity == Some(identity))
+                    && range.signal_identity.is_none_or(|identity| {
+                        block
+                            .min_signal_identity
+                            .zip(block.max_signal_identity)
+                            .is_some_and(|(minimum, maximum)| {
+                                identity >= minimum && identity <= maximum
+                            })
+                    })
                     && range
                         .min_timestamp_unix_nanos
                         .is_none_or(|minimum| block.max_timestamp_unix_nanos >= minimum)
                     && range
                         .max_timestamp_unix_nanos
                         .is_none_or(|maximum| block.min_timestamp_unix_nanos <= maximum)
+                    && correlation.is_none_or(|query| {
+                        block.correlation_filter.as_ref().is_some_and(|filter| {
+                            if state.signal == TelemetrySignal::Traces {
+                                block
+                                    .min_signal_identity
+                                    .zip(block.max_signal_identity)
+                                    .is_some_and(|(minimum, maximum)| {
+                                        filter.may_match_trace_block(query, minimum, maximum)
+                                    })
+                            } else {
+                                filter.may_match(query)
+                            }
+                        })
+                    })
             }) {
                 let end = block
                     .payload_offset
@@ -1328,6 +1429,7 @@ fn query_trace_stripe(
                 signal_identity: identity,
                 ..TierQueryRange::default()
             },
+            None,
         )? {
             for span in decode_trace_block(&payload)?
                 .into_iter()
@@ -1379,6 +1481,7 @@ fn query_metric_stripe(
                 signal_identity: query.series.map(crate::SeriesFingerprint::get),
                 ..TierQueryRange::default()
             },
+            None,
         )? {
             for point in decode_metric_chunk(&payload)?
                 .into_iter()
@@ -1400,6 +1503,137 @@ fn query_metric_stripe(
     points.sort_unstable_by_key(|point| (point.timestamp_unix_nanos, point.record_ref.offset));
     points.truncate(query.limit.max(1));
     Ok(points)
+}
+
+fn query_correlation_stripe(
+    stripe: &TelemetryStripeState,
+    query: &CorrelationQuery,
+) -> TelemetryResult<Vec<TelemetryRecordRef>> {
+    if query.limit == 0
+        || (query.trace_id.is_none()
+            && query.resource_id.is_none()
+            && query.scope_id.is_none()
+            && query.attributes.is_empty())
+    {
+        return Ok(Vec::new());
+    }
+    let mut refs = stripe.correlations.query(query);
+    if query
+        .signal
+        .is_none_or(|signal| signal == TelemetrySignal::Logs)
+        && query
+            .after
+            .is_none_or(|after| after.signal <= TelemetrySignal::Logs)
+        && query.attributes.len() == query.labels.len()
+        && (query.trace_id.is_some()
+            || query.resource_id.is_some()
+            || query.scope_id.is_some()
+            || !query.labels.is_empty())
+    {
+        let partitions = if let Some(trace_id) = query.trace_id {
+            vec![stripe.router.log(&query.tenant, Some(trace_id), &[])]
+        } else {
+            (0..stripe.log_partitions)
+                .map(|partition| {
+                    TopicPartition::new(
+                        TelemetrySignal::Logs.topic_id(),
+                        shard_stream_core::LogicalPartitionId::new(u32::from(partition)),
+                    )
+                })
+                .collect()
+        };
+        let label_predicates = query
+            .labels
+            .iter()
+            .map(|(key, value)| {
+                LogPredicate::or(
+                    [
+                        key.to_string(),
+                        format!("resource.{key}"),
+                        format!("scope.{key}"),
+                        format!("attr.{key}"),
+                        format!("resource.loki.label.{key}"),
+                        format!("attr.loki.metadata.{key}"),
+                    ]
+                    .into_iter()
+                    .map(|field| LogPredicate::field_equals(field, Arc::clone(value)))
+                    .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for partition in partitions {
+            if query.after.is_some_and(|after| {
+                after.signal == TelemetrySignal::Logs && partition < after.topic_partition
+            }) {
+                continue;
+            }
+            let mut log_query = LogQuery::new(partition)
+                .where_predicate(LogPredicate::and(label_predicates.clone()))
+                .with_limit(query.limit);
+            if let Some(after) = query.after.filter(|after| {
+                after.signal == TelemetrySignal::Logs && after.topic_partition == partition
+            }) {
+                let Some(start_offset) = after.offset.get().checked_add(1) else {
+                    continue;
+                };
+                log_query.start_offset = Some(shard_stream_core::LogicalOffset::new(start_offset));
+            }
+            if let Some(trace_id) = query.trace_id {
+                log_query = log_query.with_field("otel.trace_id", trace_id.to_string());
+            }
+            if let Some(resource_id) = query.resource_id {
+                log_query = log_query.with_field("otel.resource.id", resource_id.to_string());
+            }
+            if let Some(scope_id) = query.scope_id {
+                log_query = log_query.with_field("otel.scope.id", scope_id.to_string());
+            }
+            refs.extend(stripe.logs.query_refs(&log_query));
+        }
+    }
+    for signal in [TelemetrySignal::Traces, TelemetrySignal::Metrics] {
+        if query.signal.is_some_and(|requested| requested != signal)
+            || query.after.is_some_and(|after| after.signal > signal)
+        {
+            continue;
+        }
+        let Some(state) = stripe.signal_tiers.get(&signal) else {
+            continue;
+        };
+        let mut partitions = state.tiers.keys().copied().collect::<Vec<_>>();
+        partitions.sort_unstable();
+        for payload in
+            read_signal_tier_payloads(state, &partitions, TierQueryRange::default(), Some(query))?
+        {
+            match signal {
+                TelemetrySignal::Traces => refs.extend(
+                    decode_trace_block(&payload)?
+                        .into_iter()
+                        .filter(|span| span_matches_correlation(query, span))
+                        .map(|span| span.record_ref),
+                ),
+                TelemetrySignal::Metrics => refs.extend(
+                    decode_metric_chunk(&payload)?
+                        .into_iter()
+                        .filter(|point| metric_matches_correlation(query, point))
+                        .map(|point| point.record_ref),
+                ),
+                TelemetrySignal::Logs => unreachable!("loop contains only cold native signals"),
+            }
+            refs.sort_unstable();
+            refs.dedup();
+            if let Some(after) = query.after {
+                refs.retain(|record| *record > after);
+            }
+            refs.truncate(query.limit);
+        }
+    }
+    refs.sort_unstable();
+    refs.dedup();
+    if let Some(after) = query.after {
+        refs.retain(|record| *record > after);
+    }
+    refs.truncate(query.limit);
+    Ok(refs)
 }
 
 fn validate_relative_offsets(
@@ -1459,7 +1693,7 @@ mod tests {
         collector::trace::v1::ExportTraceServiceRequest,
         common::v1::{AnyValue, any_value::Value},
         logs::v1::{LogRecord, ResourceLogs, ScopeLogs},
-        trace::v1::{ResourceSpans, ScopeSpans, Span},
+        trace::v1::{ResourceSpans, ScopeSpans, Span, span::Link},
     };
     use prost::Message;
     use shard_stream_core::{
@@ -1473,9 +1707,9 @@ mod tests {
     use shard_stream_protocol::{AppendRequest, Durability};
 
     use crate::{
-        LocalObjectStore, MetricIdentity, MetricKind, MetricValue, NumberValue, OtlpMetricEvent,
-        OtlpTelemetryDecoder, ResourceContext, ScopeContext, SharedTelemetryObjectStore,
-        TelemetryRecordRef,
+        LocalObjectStore, MetricExemplar, MetricIdentity, MetricKind, MetricValue, NumberValue,
+        OtlpMetricEvent, OtlpTelemetryDecoder, ResourceContext, ScopeContext,
+        SharedTelemetryObjectStore, TelemetryRecordRef,
     };
 
     use super::*;
@@ -1801,6 +2035,7 @@ mod tests {
         let signals = ShardTelemetryConfig::default();
         let router = TelemetryRouter::from_config(&signals);
         let trace_id = crate::TraceId::from_bytes([1; 16]).expect("trace ID");
+        let linked_trace_id = crate::TraceId::from_bytes([9; 16]).expect("linked trace ID");
         let trace_partition = router.trace("tenant-a", trace_id);
 
         let trace_request = ExportTraceServiceRequest {
@@ -1812,6 +2047,11 @@ mod tests {
                         name: "cold trace".into(),
                         start_time_unix_nano: 10,
                         end_time_unix_nano: 20,
+                        links: vec![Link {
+                            trace_id: linked_trace_id.as_bytes().to_vec(),
+                            span_id: vec![3; 8],
+                            ..Link::default()
+                        }],
                         ..Span::default()
                     }],
                     ..ScopeSpans::default()
@@ -1851,7 +2091,13 @@ mod tests {
             timestamp_unix_nanos: 30,
             flags: 0,
             value: MetricValue::Gauge(NumberValue::Integer(7)),
-            exemplars: Arc::new(Vec::new()),
+            exemplars: Arc::new(vec![MetricExemplar {
+                filtered_attributes: Arc::new(Vec::new()),
+                timestamp_unix_nanos: 30,
+                value: NumberValue::Integer(7),
+                span_id: None,
+                trace_id: Some(trace_id),
+            }]),
         };
         let series = metric_point.series_fingerprint();
         let metric_partition = router.metric("tenant-a", series);
@@ -1951,5 +2197,27 @@ mod tests {
             .expect("cold metric query");
         assert_eq!(points.len(), 1);
         assert_eq!(points[0].value, MetricValue::Gauge(NumberValue::Integer(7)));
+        let correlated = service
+            .query_correlations(
+                &CorrelationQuery::new("tenant-a")
+                    .with_trace_id(trace_id)
+                    .with_limit(10),
+            )
+            .expect("cold correlation query");
+        assert_eq!(correlated.len(), 2);
+        assert!(
+            [TelemetrySignal::Traces, TelemetrySignal::Metrics]
+                .into_iter()
+                .all(|signal| correlated.iter().any(|record| record.signal == signal))
+        );
+        let linked = service
+            .query_correlations(
+                &CorrelationQuery::new("tenant-a")
+                    .with_trace_id(linked_trace_id)
+                    .with_limit(10),
+            )
+            .expect("cold linked-trace correlation query");
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].signal, TelemetrySignal::Traces);
     }
 }

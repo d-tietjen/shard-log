@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use shard_stream_core::{LogicalOffset, ShardId, TopicPartition};
 
-use crate::ingest_pack::prepare_ingest_pack;
+use crate::ingest_pack::{decode_ingest_pack, prepare_ingest_pack};
 use crate::{
     CompressionCohortId, LokiEntry, MetadataField, MetricIngestProtocol, OtlpLogEvent,
     OtlpMetricEvent, OtlpSpanEvent, ResourceContext, ScopeContext, TelemetryAttribute,
@@ -27,6 +27,26 @@ pub fn prepare_log_envelope(
         Arc::<[u8]>::from([]),
         Arc::<[u8]>::from(prepared.payload),
     )
+}
+
+/// Decodes and verifies the exact log records in one durable v1 envelope.
+///
+/// This is primarily useful for offline verification, compaction, and codec
+/// benchmarks. The live query path uses the embedded compressed-domain index
+/// and selectively reconstructs only matching records.
+pub fn decode_log_envelope(envelope: &TelemetryEnvelope) -> TelemetryResult<Vec<OtlpLogEvent>> {
+    if envelope.signal != TelemetrySignal::Logs {
+        return Err(TelemetryError::InvalidTelemetryEnvelope(
+            "log decoder received another telemetry signal",
+        ));
+    }
+    let records = decode_ingest_pack(&envelope.payload)?;
+    if records.len() != envelope.item_count as usize {
+        return Err(TelemetryError::InvalidTelemetryEnvelope(
+            "decoded log count disagrees with its envelope",
+        ));
+    }
+    Ok(records)
 }
 
 /// Converts Loki entries into the single typed log representation and STEL envelope.
@@ -86,6 +106,16 @@ pub fn prepare_loki_log_envelope(
                 .try_into()
                 .expect("BLAKE3 output contains eight bytes"),
         ));
+        let resource = Arc::new(ResourceContext {
+            attributes: Arc::new(resource_attributes),
+            ..ResourceContext::default()
+        });
+        let scope = Arc::new(ScopeContext::default());
+        fields.push(MetadataField::new(
+            "otel.resource.id",
+            resource.id().to_string(),
+        ));
+        fields.push(MetadataField::new("otel.scope.id", scope.id().to_string()));
         let message: Arc<str> = entry.line.into();
         events.push(OtlpLogEvent {
             timestamp_unix_nanos,
@@ -94,11 +124,8 @@ pub fn prepare_loki_log_envelope(
             message,
             fields: Arc::new(fields),
             attributes: Arc::new(attributes),
-            resource: Arc::new(ResourceContext {
-                attributes: Arc::new(resource_attributes),
-                ..ResourceContext::default()
-            }),
-            scope: Arc::new(ScopeContext::default()),
+            resource,
+            scope,
             compression_cohort,
             ..OtlpLogEvent::default()
         });

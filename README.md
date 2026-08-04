@@ -45,19 +45,49 @@ point; nested events, links, and exemplars remain part of their parent item.
 
 ## Native protocol
 
-The standalone server exposes native protocol v2 on TCP port `3101`. An
-`STB2` request carries one checksummed `STEL` envelope per resulting partition,
+The standalone server exposes the sole native protocol, v1, on TCP port `3101`. An
+`STB1` request carries one checksummed `STEL` v1 envelope per resulting partition,
 and the response returns one durable acknowledgement per partition. The server
 validates every envelope before any append and executes independent partitions
 in parallel. Multiple frames may be in flight; responses retain the caller's
 128-bit request ID and may complete out of order.
 
 This pre-release codebase has one durable format and one native append format.
-Historical grouped-log append payloads are not decoded. The grouped `STR2`
+Historical grouped-log append payloads are not decoded. The grouped `STR1`
 encoding is response-only for native log queries.
 
 See [NATIVE_PROTOCOL.md](NATIVE_PROTOCOL.md) for the wire layout, bounds,
 acknowledgement semantics, query primitive, and initial Adam ablation.
+
+## Cross-signal correlation
+
+Exact resource contexts, instrumentation scopes, and typed attributes have
+stable 128-bit content identities shared by logs, traces, and metrics. Each
+owner stripe keeps bounded postings from those identities and trace IDs to
+durable signal-aware record references. Metric exemplars and span links join
+the same trace graph; string labels use the same typed attribute identity.
+
+`TelemetryService::query_correlations` and
+`DurableTelemetryStore::query_correlations` expose the native Rust lookup. The
+HTTP endpoint
+`GET /api/shard-telemetry/v1/traces/{trace_id}/correlations` provides bounded
+cursor pagination. Optional correlation postings fail open when full: signal
+ingestion, exact reconstruction, and native log/trace/metric indexes do not
+depend on them.
+
+Cold trace and metric catalogs preserve the same behavior with compact
+per-block shared-identity filters. Filters select candidate object ranges;
+decoded records still undergo exact tenant, trace, resource, scope, and typed
+attribute comparison. Span-link and metric-exemplar relationships therefore
+remain queryable after restart without turning a hash collision into a false
+result.
+
+Bounded 8 MiB multi-trace blocks and per-series metric chunks remove repeated
+resource/scope/metadata serialization with local ordinals. Metric numeric lanes
+adapt between Pco integers and bit-exact Gorilla XOR floats; histogram and
+summary lanes use compact MessagePack plus Zstd-1. See
+[BENCHMARKS.md](BENCHMARKS.md) for the reproducible three-signal storage and
+lookup run.
 
 ## Stripe ownership
 

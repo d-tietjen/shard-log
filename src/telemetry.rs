@@ -54,7 +54,7 @@ impl TelemetrySignal {
 ///
 /// Floating-point values are represented by their IEEE-754 bits so NaN
 /// payloads, negative zero, and infinities survive every storage tier exactly.
-#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TelemetryValue {
     /// An explicitly present `AnyValue` with no selected variant.
     Empty,
@@ -162,7 +162,7 @@ impl fmt::Debug for TelemetryValue {
 }
 
 /// One exact OTLP key/value pair.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TelemetryAttribute {
     /// Literal key. It may be empty when `key_strindex` is populated.
     pub key: Arc<str>,
@@ -194,10 +194,19 @@ impl TelemetryAttribute {
             None => output.push(0),
         }
     }
+
+    /// Returns the stable, type-aware identity used to connect the same
+    /// metadata key/value across logs, traces, and metrics.
+    #[must_use]
+    pub fn fingerprint(&self) -> AttributeFingerprint {
+        let mut canonical = Vec::new();
+        self.append_canonical(&mut canonical);
+        AttributeFingerprint(fingerprint128(b"shard-telemetry/attribute/v1", &canonical))
+    }
 }
 
 /// An OTLP Resource entity reference.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TelemetryEntityRef {
     /// Schema URL for this entity.
     pub schema_url: Arc<str>,
@@ -210,7 +219,7 @@ pub struct TelemetryEntityRef {
 }
 
 /// Exact resource context shared by records from one OTLP resource group.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ResourceContext {
     /// Resource attributes in wire order.
     pub attributes: Arc<Vec<TelemetryAttribute>>,
@@ -223,8 +232,21 @@ pub struct ResourceContext {
 }
 
 impl ResourceContext {
+    /// Returns the exact, content-addressed resource identity shared by every
+    /// telemetry signal.
+    #[must_use]
+    pub fn id(&self) -> ResourceContextId {
+        let mut canonical = Vec::new();
+        self.append_identity(&mut canonical);
+        ResourceContextId(fingerprint128(
+            b"shard-telemetry/resource-context/v1",
+            &canonical,
+        ))
+    }
+
     pub(crate) fn append_identity(&self, output: &mut Vec<u8>) {
         append_bytes(output, self.schema_url.as_bytes());
+        output.extend_from_slice(&self.dropped_attributes_count.to_le_bytes());
         let mut attributes = self
             .attributes
             .iter()
@@ -239,11 +261,24 @@ impl ResourceContext {
         for attribute in attributes {
             append_bytes(output, &attribute);
         }
+        append_len(output, self.entity_refs.len());
+        for entity in self.entity_refs.iter() {
+            append_bytes(output, entity.schema_url.as_bytes());
+            append_bytes(output, entity.entity_type.as_bytes());
+            append_len(output, entity.id_keys.len());
+            for key in entity.id_keys.iter() {
+                append_bytes(output, key.as_bytes());
+            }
+            append_len(output, entity.description_keys.len());
+            for key in entity.description_keys.iter() {
+                append_bytes(output, key.as_bytes());
+            }
+        }
     }
 }
 
 /// Exact instrumentation scope context shared by records from one OTLP scope.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ScopeContext {
     /// Instrumentation scope name.
     pub name: Arc<str>,
@@ -258,10 +293,23 @@ pub struct ScopeContext {
 }
 
 impl ScopeContext {
+    /// Returns the exact, content-addressed instrumentation-scope identity
+    /// shared by every telemetry signal.
+    #[must_use]
+    pub fn id(&self) -> ScopeContextId {
+        let mut canonical = Vec::new();
+        self.append_identity(&mut canonical);
+        ScopeContextId(fingerprint128(
+            b"shard-telemetry/scope-context/v1",
+            &canonical,
+        ))
+    }
+
     pub(crate) fn append_identity(&self, output: &mut Vec<u8>) {
         append_bytes(output, self.name.as_bytes());
         append_bytes(output, self.version.as_bytes());
         append_bytes(output, self.schema_url.as_bytes());
+        output.extend_from_slice(&self.dropped_attributes_count.to_le_bytes());
         let mut attributes = self
             .attributes
             .iter()
@@ -278,6 +326,53 @@ impl ScopeContext {
         }
     }
 }
+
+macro_rules! context_identity {
+    ($name:ident, $description:literal) => {
+        #[doc = $description]
+        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        pub struct $name(u128);
+
+        impl $name {
+            /// Returns the process-independent identity bits.
+            #[must_use]
+            pub const fn get(self) -> u128 {
+                self.0
+            }
+
+            /// Reconstructs an identity previously returned by [`Self::get`].
+            #[must_use]
+            pub const fn from_raw(value: u128) -> Self {
+                Self(value)
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(formatter, "{:032x}", self.0)
+            }
+        }
+
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(formatter, "{:032x}", self.0)
+            }
+        }
+    };
+}
+
+context_identity!(
+    ResourceContextId,
+    "Stable 128-bit identity of an exact resource context."
+);
+context_identity!(
+    ScopeContextId,
+    "Stable 128-bit identity of an exact instrumentation scope context."
+);
+context_identity!(
+    AttributeFingerprint,
+    "Stable 128-bit identity of one exact typed metadata key/value."
+);
 
 /// A validated 128-bit OpenTelemetry trace ID.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -561,6 +656,20 @@ fn append_bytes(output: &mut Vec<u8>, bytes: &[u8]) {
     output.extend_from_slice(bytes);
 }
 
+fn fingerprint128(domain: &[u8], canonical: &[u8]) -> u128 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(domain);
+    hasher.update(&[0]);
+    hasher.update(&(canonical.len() as u64).to_le_bytes());
+    hasher.update(canonical);
+    let digest = hasher.finalize();
+    u128::from_le_bytes(
+        digest.as_bytes()[..16]
+            .try_into()
+            .expect("BLAKE3 digest contains 16 bytes"),
+    )
+}
+
 fn write_hex(formatter: &mut fmt::Formatter<'_>, bytes: &[u8]) -> fmt::Result {
     for byte in bytes {
         write!(formatter, "{byte:02x}")?;
@@ -629,5 +738,40 @@ mod tests {
             512 * 1024 * 1024
         );
         assert_eq!(config.max_otlp_request_bytes, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn context_and_attribute_identities_are_exact_and_order_independent() {
+        let service = TelemetryAttribute::new(
+            "service.name",
+            TelemetryValue::String(Arc::from("checkout")),
+        );
+        let region = TelemetryAttribute::new(
+            "cloud.region",
+            TelemetryValue::String(Arc::from("us-east-1")),
+        );
+        let left = ResourceContext {
+            attributes: Arc::new(vec![service.clone(), region.clone()]),
+            ..ResourceContext::default()
+        };
+        let right = ResourceContext {
+            attributes: Arc::new(vec![region, service.clone()]),
+            ..ResourceContext::default()
+        };
+        assert_eq!(left.id(), right.id());
+        assert_eq!(left.id().to_string().len(), 32);
+        assert_eq!(service.fingerprint(), service.clone().fingerprint());
+
+        let mut changed = right;
+        changed.dropped_attributes_count = 1;
+        assert_ne!(left.id(), changed.id());
+        assert_ne!(
+            service.fingerprint(),
+            TelemetryAttribute::new(
+                "service.name",
+                TelemetryValue::String(Arc::from("payments")),
+            )
+            .fingerprint()
+        );
     }
 }

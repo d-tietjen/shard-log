@@ -34,6 +34,8 @@ pub struct TempoApiConfig {
     pub max_metric_series: usize,
     /// Maximum exemplars returned by one trace-derived metric query.
     pub max_exemplars: usize,
+    /// Maximum cross-signal record links returned by one page.
+    pub max_correlations: usize,
 }
 
 impl Default for TempoApiConfig {
@@ -46,6 +48,7 @@ impl Default for TempoApiConfig {
             max_metric_steps: 11_000,
             max_metric_series: 100_000,
             max_exemplars: 100,
+            max_correlations: 1_000,
         }
     }
 }
@@ -58,6 +61,7 @@ impl TempoApiConfig {
             || self.max_metrics_duration.is_zero()
             || self.max_metric_steps == 0
             || self.max_metric_series == 0
+            || self.max_correlations == 0
         {
             return Err(TelemetryError::InvalidConfiguration(
                 "Tempo tenant and query limits must be nonempty".into(),
@@ -162,6 +166,10 @@ impl TempoService {
 /// Builds Tempo v2, search, tag-discovery, and TraceQL routes.
 pub fn tempo_router(service: TempoService) -> Router {
     Router::new()
+        .route(
+            "/api/shard-telemetry/v1/traces/{trace_id}/correlations",
+            get(trace_correlations),
+        )
         .route("/api/v2/traces/{trace_id}", get(trace_by_id))
         .route("/api/search", get(search))
         .route("/api/v2/search/tags", get(tags))
@@ -175,6 +183,12 @@ pub fn tempo_router(service: TempoService) -> Router {
 struct TraceByIdParameters {
     start: Option<u64>,
     end: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct CorrelationParameters {
+    limit: Option<usize>,
+    cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -256,6 +270,76 @@ async fn trace_by_id(
         response.encode_to_vec(),
     )
         .into_response()
+}
+
+async fn trace_correlations(
+    State(service): State<TempoService>,
+    headers: HeaderMap,
+    Path(trace_id): Path<String>,
+    Query(parameters): Query<CorrelationParameters>,
+) -> Response {
+    let _permit = match service.authorize(&headers) {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+    let trace_id = match parse_trace_id(&trace_id) {
+        Ok(trace_id) => trace_id,
+        Err(error) => return tempo_error(StatusCode::BAD_REQUEST, &error),
+    };
+    let limit = parameters
+        .limit
+        .unwrap_or(100)
+        .min(service.config.max_correlations);
+    if limit == 0 {
+        return tempo_error(StatusCode::BAD_REQUEST, "correlation limit must be nonzero");
+    }
+    let after = match parameters.cursor.as_deref().map(parse_correlation_cursor) {
+        Some(Ok(cursor)) => Some(cursor),
+        Some(Err(error)) => return tempo_error(StatusCode::BAD_REQUEST, &error),
+        None => None,
+    };
+    let mut query = crate::CorrelationQuery::new(Arc::clone(&service.config.tenant))
+        .with_trace_id(trace_id)
+        .with_limit(limit.saturating_add(1));
+    if let Some(after) = after {
+        query = query.after(after);
+    }
+    let store = Arc::clone(&service.store);
+    let result = tokio::task::spawn_blocking(move || store.query_correlations(&query)).await;
+    let mut records = match result {
+        Ok(Ok(records)) => records,
+        Ok(Err(error)) => {
+            return tempo_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
+        }
+        Err(error) => {
+            return tempo_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("correlation worker failed: {error}"),
+            );
+        }
+    };
+    let has_more = records.len() > limit;
+    records.truncate(limit);
+    let next_cursor = has_more
+        .then(|| records.last().copied())
+        .flatten()
+        .map(correlation_cursor);
+    tempo_success(json!({
+        "traceId": trace_id.to_string(),
+        "records": records
+            .iter()
+            .map(|record| json!({
+                "signal": match record.signal {
+                    crate::TelemetrySignal::Logs => "logs",
+                    crate::TelemetrySignal::Traces => "traces",
+                    crate::TelemetrySignal::Metrics => "metrics",
+                },
+                "partition": record.topic_partition.partition_id.get(),
+                "offset": record.offset.get().to_string(),
+            }))
+            .collect::<Vec<_>>(),
+        "nextCursor": next_cursor,
+    }))
 }
 
 async fn search(
@@ -680,6 +764,49 @@ fn parse_trace_id(value: &str) -> Result<TraceId, String> {
     TraceId::from_bytes(bytes).map_err(|error| error.to_string())
 }
 
+fn correlation_cursor(record: crate::TelemetryRecordRef) -> String {
+    format!(
+        "{}:{}:{}",
+        record.signal as u8,
+        record.topic_partition.partition_id.get(),
+        record.offset.get()
+    )
+}
+
+fn parse_correlation_cursor(value: &str) -> Result<crate::TelemetryRecordRef, String> {
+    let mut parts = value.split(':');
+    let signal = parts
+        .next()
+        .ok_or("correlation cursor has no signal")?
+        .parse::<u8>()
+        .map_err(|_| "correlation cursor signal is invalid")
+        .and_then(|value| {
+            crate::TelemetrySignal::from_wire(value)
+                .map_err(|_| "correlation cursor signal is invalid")
+        })?;
+    let partition = parts
+        .next()
+        .ok_or("correlation cursor has no partition")?
+        .parse::<u32>()
+        .map_err(|_| "correlation cursor partition is invalid")?;
+    let offset = parts
+        .next()
+        .ok_or("correlation cursor has no offset")?
+        .parse::<u64>()
+        .map_err(|_| "correlation cursor offset is invalid")?;
+    if parts.next().is_some() {
+        return Err("correlation cursor contains trailing fields".into());
+    }
+    Ok(crate::TelemetryRecordRef::for_signal(
+        signal,
+        shard_stream_core::TopicPartition::new(
+            signal.topic_id(),
+            shard_stream_core::LogicalPartitionId::new(partition),
+        ),
+        shard_stream_core::LogicalOffset::new(offset),
+    ))
+}
+
 fn tempo_success(data: Value) -> Response {
     (StatusCode::OK, axum::Json(data)).into_response()
 }
@@ -713,6 +840,23 @@ mod tests {
             parse_trace_id("01010101010101010101010101010101").unwrap(),
             TraceId::from_bytes([1; 16]).unwrap()
         );
+    }
+
+    #[test]
+    fn correlation_cursor_round_trips_and_rejects_trailing_fields() {
+        let record = crate::TelemetryRecordRef::for_signal(
+            crate::TelemetrySignal::Metrics,
+            shard_stream_core::TopicPartition::new(
+                crate::METRICS_TOPIC_ID,
+                shard_stream_core::LogicalPartitionId::new(17),
+            ),
+            shard_stream_core::LogicalOffset::new(42),
+        );
+        assert_eq!(
+            parse_correlation_cursor(&correlation_cursor(record)).unwrap(),
+            record
+        );
+        assert!(parse_correlation_cursor("3:17:42:extra").is_err());
     }
 
     #[test]

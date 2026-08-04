@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -30,6 +31,22 @@ const LOKI_TOPIC_ID: TopicId = crate::LOGS_TOPIC_ID;
 const LABEL_PREFIX: &str = "resource.loki.label.";
 const METADATA_PREFIX: &str = "attr.loki.metadata.";
 const TENANT_FIELD: &str = "resource.loki.tenant";
+
+fn object_tier_partitions(partition_count: u32) -> Vec<TopicPartition> {
+    let mut partitions = [
+        crate::LOGS_TOPIC_ID,
+        crate::TRACES_TOPIC_ID,
+        crate::METRICS_TOPIC_ID,
+    ]
+    .into_iter()
+    .flat_map(|topic_id| {
+        (0..partition_count)
+            .map(move |partition| TopicPartition::new(topic_id, LogicalPartitionId::new(partition)))
+    })
+    .collect::<Vec<_>>();
+    partitions.sort_unstable();
+    partitions
+}
 
 /// Standalone durable ShardTelemetry configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -138,6 +155,22 @@ impl DurableTelemetryStore {
     /// Opens or recovers a standalone durable store.
     pub fn open(config: DurableTelemetryConfig) -> Result<Self, LokiApiError> {
         config.validate()?;
+        let logical_partitions =
+            NonZeroU16::new(u16::try_from(config.tenant_partitions).map_err(|_| {
+                LokiApiError::configuration("tenant_partitions must fit the v1 u16 routing space")
+            })?)
+            .expect("configuration validation rejects zero partitions");
+        let physical_stripes = NonZeroU16::new(
+            u16::try_from(config.shard_count.min(config.tenant_partitions)).map_err(|_| {
+                LokiApiError::configuration("shard_count must fit the v1 u16 routing space")
+            })?,
+        )
+        .expect("configuration validation rejects zero shards");
+        let mut signals = crate::ShardTelemetryConfig::default();
+        for signal in [&mut signals.logs, &mut signals.traces, &mut signals.metrics] {
+            signal.logical_partitions = logical_partitions;
+            signal.physical_stripes = physical_stripes;
+        }
         let data_directory_lease = DataDirectoryLease::acquire(&config.data_directory)?;
         let deletes = DeleteCatalog::open(config.data_directory.join("delete-catalog-v1.json"))?;
         let engine_config = EngineConfig {
@@ -164,11 +197,7 @@ impl DurableTelemetryStore {
                     store: store.into(),
                     spool_directory: config.data_directory.join("tier-spool"),
                     cache_directory: config.data_directory.join("tier-cache"),
-                    partitions: (0..config.tenant_partitions)
-                        .map(|partition| {
-                            TopicPartition::new(LOKI_TOPIC_ID, LogicalPartitionId::new(partition))
-                        })
-                        .collect(),
+                    partitions: object_tier_partitions(config.tenant_partitions),
                     tier: ObjectTierConfig::default(),
                     cache: SsdCacheConfig::default(),
                 })
@@ -177,6 +206,7 @@ impl DurableTelemetryStore {
             .map_err(|error| LokiApiError::internal(error.to_string()))?;
         let sink_config = OtlpSinkConfig {
             stripe: config.stripe,
+            signals,
             state_directory: config
                 .recovery_journal
                 .then(|| config.data_directory.join("index-journal")),
@@ -450,7 +480,7 @@ impl DurableTelemetryStore {
         Ok(report)
     }
 
-    /// Appends every partition in one validated native v2 telemetry batch in parallel.
+    /// Appends every partition in one validated native v1 telemetry batch in parallel.
     ///
     /// The response retains request order and contains one acknowledgement per
     /// resulting partition. Any partition failure makes the request retryable;
@@ -550,6 +580,17 @@ impl DurableTelemetryStore {
     ) -> Result<Vec<crate::DurableMetricPoint>, LokiApiError> {
         self.service
             .query_metrics(query)
+            .map_err(|error| LokiApiError::internal(error.to_string()))
+    }
+
+    /// Returns bounded cross-signal record references for exact shared
+    /// trace, resource, scope, and typed-label identities.
+    pub fn query_correlations(
+        &self,
+        query: &crate::CorrelationQuery,
+    ) -> Result<Vec<crate::TelemetryRecordRef>, LokiApiError> {
+        self.service
+            .query_correlations(query)
             .map_err(|error| LokiApiError::internal(error.to_string()))
     }
 
@@ -1053,8 +1094,8 @@ mod tests {
             metrics::v1::ExportMetricsServiceRequest, trace::v1::ExportTraceServiceRequest,
         },
         metrics::v1::{
-            Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, metric,
-            number_data_point,
+            Exemplar, Gauge, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, exemplar,
+            metric, number_data_point,
         },
         trace::v1::{ResourceSpans, ScopeSpans, Span},
     };
@@ -1063,6 +1104,26 @@ mod tests {
 
     use super::*;
     use crate::ingest_pack::{decode_ingest_pack, validate_ingest_pack};
+
+    #[test]
+    fn object_tier_catalogs_cover_every_signal_partition() {
+        let partitions = object_tier_partitions(3);
+        assert_eq!(partitions.len(), 9);
+        for signal in [
+            crate::TelemetrySignal::Logs,
+            crate::TelemetrySignal::Traces,
+            crate::TelemetrySignal::Metrics,
+        ] {
+            assert_eq!(
+                partitions
+                    .iter()
+                    .filter(|partition| partition.topic_id == signal.topic_id())
+                    .count(),
+                3
+            );
+        }
+        assert!(partitions.windows(2).all(|pair| pair[0] < pair[1]));
+    }
 
     #[test]
     fn shared_durable_sink_indexes_trace_and_metric_partition_envelopes() {
@@ -1122,6 +1183,13 @@ mod tests {
                             data_points: vec![NumberDataPoint {
                                 time_unix_nano: 30,
                                 value: Some(number_data_point::Value::AsInt(7)),
+                                exemplars: vec![Exemplar {
+                                    time_unix_nano: 30,
+                                    value: Some(exemplar::Value::AsInt(7)),
+                                    trace_id: vec![1; 16],
+                                    span_id: vec![2; 8],
+                                    ..Exemplar::default()
+                                }],
                                 ..NumberDataPoint::default()
                             }],
                         })),
@@ -1139,9 +1207,30 @@ mod tests {
                 .unwrap(),
         );
         let (metric_partition, metric_events) = metric_partitions.pop_first().unwrap();
+        let trace_id = crate::TraceId::from_bytes([1; 16]).unwrap();
+        let log_partition = router.log("tenant-a", Some(trace_id), &[]);
+        let log_events = vec![crate::OtlpLogEvent {
+            timestamp_unix_nanos: 25,
+            body: Some(crate::TelemetryValue::String(Arc::from(
+                "checkout request complete",
+            ))),
+            message: Arc::from("checkout request complete"),
+            fields: Arc::new(vec![crate::MetadataField::new(
+                "otel.trace_id",
+                trace_id.to_string(),
+            )]),
+            trace_id: Some(trace_id),
+            span_id: Some(crate::SpanId::from_bytes([2; 8]).unwrap()),
+            compression_cohort: crate::CompressionCohortId::new(1),
+            ..crate::OtlpLogEvent::default()
+        }];
 
         let batch = crate::NativeTelemetryBatch {
             partitions: vec![
+                crate::NativePartitionAppend {
+                    topic_partition: log_partition,
+                    envelope: crate::prepare_log_envelope("tenant-a", &log_events).unwrap(),
+                },
                 crate::NativePartitionAppend {
                     topic_partition: trace_partition,
                     envelope: crate::prepare_trace_envelope(trace_partition, trace_events).unwrap(),
@@ -1154,7 +1243,7 @@ mod tests {
             ],
         };
         let acknowledgement = store.append_telemetry_batch(&batch, true).unwrap();
-        assert_eq!(acknowledgement.partitions.len(), 2);
+        assert_eq!(acknowledgement.partitions.len(), 3);
         let spans = store
             .query_traces(&crate::TraceQuery {
                 tenant: Arc::from("tenant-a"),
@@ -1177,6 +1266,23 @@ mod tests {
         assert_eq!(
             points[0].value,
             crate::MetricValue::Gauge(crate::NumberValue::Integer(7))
+        );
+        let correlated = store
+            .query_correlations(
+                &crate::CorrelationQuery::new("tenant-a")
+                    .with_trace_id(trace_id)
+                    .with_limit(10),
+            )
+            .unwrap();
+        assert_eq!(correlated.len(), 3);
+        assert!(
+            [
+                crate::TelemetrySignal::Logs,
+                crate::TelemetrySignal::Traces,
+                crate::TelemetrySignal::Metrics,
+            ]
+            .into_iter()
+            .all(|signal| correlated.iter().any(|record| record.signal == signal))
         );
         drop(store);
         fs::remove_dir_all(directory).expect("remove test store");

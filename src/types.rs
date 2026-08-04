@@ -109,6 +109,18 @@ pub struct DurableLog {
 }
 
 impl DurableLog {
+    /// Returns the cross-signal identity of this log's resource context.
+    #[must_use]
+    pub fn resource_id(&self) -> crate::ResourceContextId {
+        self.resource.id()
+    }
+
+    /// Returns the cross-signal identity of this log's instrumentation scope.
+    #[must_use]
+    pub fn scope_id(&self) -> crate::ScopeContextId {
+        self.scope.id()
+    }
+
     /// Constructs a durable log record with no extracted metadata.
     #[must_use]
     pub fn new(

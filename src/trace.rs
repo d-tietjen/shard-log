@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::hash::Hash;
 use std::sync::Arc;
 
 use pco::ChunkConfig;
@@ -7,19 +8,21 @@ use serde::{Deserialize, Serialize};
 use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicId, TopicPartition};
 
 use crate::{
-    ResourceContext, ScopeContext, SignalTierPayload, SpanId, TelemetryAttribute, TelemetryError,
-    TelemetryRecordRef, TelemetryResult, TelemetrySignal, TraceId,
+    CorrelationBlockFilter, ResourceContext, ScopeContext, SignalTierPayload, SpanId,
+    TelemetryAttribute, TelemetryError, TelemetryRecordRef, TelemetryResult, TelemetrySignal,
+    TraceId,
 };
 
 const TRACE_BLOCK_MAGIC: [u8; 4] = *b"STSP";
 const TRACE_BLOCK_VERSION: u8 = 1;
 const TRACE_PCO_LEVEL: usize = 8;
 const TRACE_SIDECAR_ZSTD_LEVEL: i32 = 1;
+const TARGET_TRACE_BLOCK_SOURCE_BYTES: usize = 8 * 1024 * 1024;
 const DEFAULT_TRACE_IDLE_NANOS: u64 = 30_000_000_000;
 const DEFAULT_LATE_TRACE_NANOS: u64 = 15 * 60 * 1_000_000_000;
 
 /// Final OpenTelemetry span status.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SpanStatus {
     /// Status message.
     pub message: Arc<str>,
@@ -28,7 +31,7 @@ pub struct SpanStatus {
 }
 
 /// One nested span event. It does not consume a shard-stream offset.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SpanEvent {
     /// Event timestamp in Unix nanoseconds.
     pub timestamp_unix_nanos: u64,
@@ -41,7 +44,7 @@ pub struct SpanEvent {
 }
 
 /// One nested link to another span. It does not consume a shard-stream offset.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SpanLink {
     /// Linked trace ID.
     pub trace_id: TraceId,
@@ -105,6 +108,18 @@ pub struct DurableSpan {
 }
 
 impl DurableSpan {
+    /// Returns the cross-signal identity of this span's resource context.
+    #[must_use]
+    pub fn resource_id(&self) -> crate::ResourceContextId {
+        self.resource.id()
+    }
+
+    /// Returns the cross-signal identity of this span's instrumentation scope.
+    #[must_use]
+    pub fn scope_id(&self) -> crate::ScopeContextId {
+        self.scope.id()
+    }
+
     /// Returns the exact end timestamp after checked duration reconstruction.
     #[must_use]
     pub fn end_time_unix_nanos(&self) -> Option<u64> {
@@ -117,42 +132,35 @@ impl DurableSpan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SpanSidecar {
-    tenant: Arc<str>,
-    resource: Arc<ResourceContext>,
-    scope: Arc<ScopeContext>,
-    trace_state: Arc<str>,
+struct PackedSpanSidecar {
+    tenant_id: u32,
+    resource_id: u32,
+    scope_id: u32,
+    trace_state_id: u32,
     flags: u32,
-    name: Arc<str>,
+    name_id: u32,
     kind: i32,
-    attributes: Arc<Vec<TelemetryAttribute>>,
+    attributes_id: u32,
     dropped_attributes_count: u32,
-    events: Arc<Vec<SpanEvent>>,
+    events_id: u32,
     dropped_events_count: u32,
-    links: Arc<Vec<SpanLink>>,
+    links_id: u32,
     dropped_links_count: u32,
-    status: Option<SpanStatus>,
+    status_id: u32,
 }
 
-impl From<&DurableSpan> for SpanSidecar {
-    fn from(span: &DurableSpan) -> Self {
-        Self {
-            tenant: Arc::clone(&span.tenant),
-            resource: Arc::clone(&span.resource),
-            scope: Arc::clone(&span.scope),
-            trace_state: Arc::clone(&span.trace_state),
-            flags: span.flags,
-            name: Arc::clone(&span.name),
-            kind: span.kind,
-            attributes: Arc::clone(&span.attributes),
-            dropped_attributes_count: span.dropped_attributes_count,
-            events: Arc::clone(&span.events),
-            dropped_events_count: span.dropped_events_count,
-            links: Arc::clone(&span.links),
-            dropped_links_count: span.dropped_links_count,
-            status: span.status.clone(),
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct TraceBlockSidecars {
+    tenants: Vec<Arc<str>>,
+    resources: Vec<Arc<ResourceContext>>,
+    scopes: Vec<Arc<ScopeContext>>,
+    trace_states: Vec<Arc<str>>,
+    names: Vec<Arc<str>>,
+    attribute_sets: Vec<Arc<Vec<TelemetryAttribute>>>,
+    event_sets: Vec<Arc<Vec<SpanEvent>>>,
+    link_sets: Vec<Arc<Vec<SpanLink>>>,
+    statuses: Vec<Option<SpanStatus>>,
+    spans: Vec<PackedSpanSidecar>,
 }
 
 /// Encodes one partition's spans into the signal-native columnar trace block.
@@ -197,11 +205,8 @@ pub fn encode_trace_block(records: &[DurableSpan]) -> TelemetryResult<Vec<u8>> {
         .map(|record| record.duration_nanos)
         .collect::<Vec<_>>();
     let id_lane = encode_span_ids(&sorted)?;
-    let sidecars = sorted
-        .iter()
-        .map(|record| SpanSidecar::from(*record))
-        .collect::<Vec<_>>();
-    let sidecar_bytes = rmp_serde::to_vec_named(&sidecars)
+    let sidecars = encode_trace_sidecars(&sorted)?;
+    let sidecar_bytes = rmp_serde::to_vec(&sidecars)
         .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
     let compressed_sidecars = zstd::bulk::compress(&sidecar_bytes, TRACE_SIDECAR_ZSTD_LEVEL)
         .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
@@ -278,53 +283,184 @@ pub fn decode_trace_block(encoded: &[u8]) -> TelemetryResult<Vec<DurableSpan>> {
             "trailing trace block sections",
         ));
     }
-    let sidecar_bytes =
-        zstd::bulk::decompress(compressed_sidecars, encoded.len().saturating_mul(64)).map_err(
-            |_| TelemetryError::InvalidBlockEncoding("invalid trace sidecar compression"),
-        )?;
-    let sidecars: Vec<SpanSidecar> = rmp_serde::from_slice(&sidecar_bytes)
+    let sidecar_bytes = zstd::bulk::decompress(compressed_sidecars, 256 * 1024 * 1024)
+        .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid trace sidecar compression"))?;
+    let sidecars: TraceBlockSidecars = rmp_serde::from_slice(&sidecar_bytes)
         .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid trace sidecars"))?;
-    if sidecars.len() != count {
+    if sidecars.spans.len() != count {
         return Err(TelemetryError::InvalidBlockEncoding(
             "trace sidecar count mismatch",
         ));
     }
-    Ok(offsets
+    offsets
         .into_iter()
         .zip(starts)
         .zip(durations)
         .zip(ids)
-        .zip(sidecars)
+        .zip(sidecars.spans)
         .map(
-            |((((offset, start_time_unix_nanos), duration_nanos), ids), sidecar)| DurableSpan {
-                stream_shard_id,
-                record_ref: TelemetryRecordRef::for_signal(
-                    TelemetrySignal::Traces,
-                    topic_partition,
-                    LogicalOffset::new(offset),
-                ),
-                tenant: sidecar.tenant,
-                resource: sidecar.resource,
-                scope: sidecar.scope,
-                trace_id: ids.0,
-                span_id: ids.1,
-                parent_span_id: ids.2,
-                trace_state: sidecar.trace_state,
-                flags: sidecar.flags,
-                name: sidecar.name,
-                kind: sidecar.kind,
-                start_time_unix_nanos,
-                duration_nanos,
-                attributes: sidecar.attributes,
-                dropped_attributes_count: sidecar.dropped_attributes_count,
-                events: sidecar.events,
-                dropped_events_count: sidecar.dropped_events_count,
-                links: sidecar.links,
-                dropped_links_count: sidecar.dropped_links_count,
-                status: sidecar.status,
+            |((((offset, start_time_unix_nanos), duration_nanos), ids), sidecar)| {
+                Ok(DurableSpan {
+                    stream_shard_id,
+                    record_ref: TelemetryRecordRef::for_signal(
+                        TelemetrySignal::Traces,
+                        topic_partition,
+                        LogicalOffset::new(offset),
+                    ),
+                    tenant: resolve_sidecar(&sidecars.tenants, sidecar.tenant_id, "tenant")?,
+                    resource: resolve_sidecar(
+                        &sidecars.resources,
+                        sidecar.resource_id,
+                        "resource",
+                    )?,
+                    scope: resolve_sidecar(&sidecars.scopes, sidecar.scope_id, "scope")?,
+                    trace_id: ids.0,
+                    span_id: ids.1,
+                    parent_span_id: ids.2,
+                    trace_state: resolve_sidecar(
+                        &sidecars.trace_states,
+                        sidecar.trace_state_id,
+                        "trace state",
+                    )?,
+                    flags: sidecar.flags,
+                    name: resolve_sidecar(&sidecars.names, sidecar.name_id, "name")?,
+                    kind: sidecar.kind,
+                    start_time_unix_nanos,
+                    duration_nanos,
+                    attributes: resolve_sidecar(
+                        &sidecars.attribute_sets,
+                        sidecar.attributes_id,
+                        "attributes",
+                    )?,
+                    dropped_attributes_count: sidecar.dropped_attributes_count,
+                    events: resolve_sidecar(&sidecars.event_sets, sidecar.events_id, "events")?,
+                    dropped_events_count: sidecar.dropped_events_count,
+                    links: resolve_sidecar(&sidecars.link_sets, sidecar.links_id, "links")?,
+                    dropped_links_count: sidecar.dropped_links_count,
+                    status: resolve_sidecar(&sidecars.statuses, sidecar.status_id, "status")?,
+                })
             },
         )
-        .collect())
+        .collect::<TelemetryResult<Vec<_>>>()
+}
+
+fn encode_trace_sidecars(records: &[&DurableSpan]) -> TelemetryResult<TraceBlockSidecars> {
+    let mut tenants = SidecarInterner::new(records.len());
+    let mut resources = SidecarInterner::new(records.len());
+    let mut scopes = SidecarInterner::new(records.len());
+    let mut trace_states = SidecarInterner::new(records.len());
+    let mut names = SidecarInterner::new(records.len());
+    let mut attribute_sets = SidecarInterner::new(records.len());
+    let mut event_sets = SidecarInterner::new(records.len());
+    let mut link_sets = SidecarInterner::new(records.len());
+    let mut statuses = SidecarInterner::new(records.len());
+    let mut spans = Vec::with_capacity(records.len());
+    for span in records {
+        spans.push(PackedSpanSidecar {
+            tenant_id: tenants.intern(&span.tenant)?,
+            resource_id: resources.intern(&span.resource)?,
+            scope_id: scopes.intern(&span.scope)?,
+            trace_state_id: trace_states.intern(&span.trace_state)?,
+            flags: span.flags,
+            name_id: names.intern(&span.name)?,
+            kind: span.kind,
+            attributes_id: attribute_sets.intern(&span.attributes)?,
+            dropped_attributes_count: span.dropped_attributes_count,
+            events_id: event_sets.intern(&span.events)?,
+            dropped_events_count: span.dropped_events_count,
+            links_id: link_sets.intern(&span.links)?,
+            dropped_links_count: span.dropped_links_count,
+            status_id: statuses.intern(&span.status)?,
+        });
+    }
+    Ok(TraceBlockSidecars {
+        tenants: tenants.into_values(),
+        resources: resources.into_values(),
+        scopes: scopes.into_values(),
+        trace_states: trace_states.into_values(),
+        names: names.into_values(),
+        attribute_sets: attribute_sets.into_values(),
+        event_sets: event_sets.into_values(),
+        link_sets: link_sets.into_values(),
+        statuses: statuses.into_values(),
+        spans,
+    })
+}
+
+struct SidecarInterner<T> {
+    values: Vec<T>,
+    ids: Option<HashMap<T, u32>>,
+    capacity: usize,
+}
+
+impl<T: Clone + Eq + Hash> SidecarInterner<T> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            values: Vec::new(),
+            ids: None,
+            capacity,
+        }
+    }
+
+    fn intern(&mut self, value: &T) -> TelemetryResult<u32> {
+        if let Some(ids) = &self.ids {
+            if let Some(index) = ids.get(value) {
+                return Ok(*index);
+            }
+        } else {
+            if let Some(index) = self.values.iter().position(|candidate| candidate == value) {
+                return u32::try_from(index).map_err(|_| TelemetryError::RecordTooLarge);
+            }
+            if self.values.len() == 16 {
+                self.ids = Some(
+                    self.values
+                        .iter()
+                        .cloned()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            Ok((
+                                value,
+                                u32::try_from(index).map_err(|_| TelemetryError::RecordTooLarge)?,
+                            ))
+                        })
+                        .collect::<TelemetryResult<HashMap<_, _>>>()?,
+                );
+                self.ids
+                    .as_mut()
+                    .expect("interner map was installed")
+                    .reserve(self.capacity.min(4_096).saturating_sub(16));
+            }
+        }
+        let index = u32::try_from(self.values.len()).map_err(|_| TelemetryError::RecordTooLarge)?;
+        let value = value.clone();
+        self.values.push(value.clone());
+        if let Some(ids) = &mut self.ids {
+            ids.insert(value, index);
+        }
+        Ok(index)
+    }
+
+    fn into_values(self) -> Vec<T> {
+        self.values
+    }
+}
+
+fn resolve_sidecar<T: Clone>(values: &[T], id: u32, lane: &'static str) -> TelemetryResult<T> {
+    values
+        .get(id as usize)
+        .cloned()
+        .ok_or(TelemetryError::InvalidBlockEncoding(match lane {
+            "tenant" => "trace tenant sidecar ID is out of range",
+            "resource" => "trace resource sidecar ID is out of range",
+            "scope" => "trace scope sidecar ID is out of range",
+            "trace state" => "trace state sidecar ID is out of range",
+            "name" => "trace name sidecar ID is out of range",
+            "attributes" => "trace attribute sidecar ID is out of range",
+            "events" => "trace event sidecar ID is out of range",
+            "links" => "trace link sidecar ID is out of range",
+            "status" => "trace status sidecar ID is out of range",
+            _ => "trace sidecar ID is out of range",
+        }))
 }
 
 fn encode_span_ids(records: &[&DurableSpan]) -> TelemetryResult<Vec<u8>> {
@@ -669,6 +805,13 @@ struct SealedTraceBlock {
     payload: Arc<[u8]>,
 }
 
+struct PreparedTrace {
+    spans: Vec<DurableSpan>,
+    summary_spans: Vec<DurableSpan>,
+    replaces_summary: bool,
+    source_bytes: usize,
+}
+
 impl TraceStripe {
     /// Creates a stripe-local trace head with production idle and late windows.
     pub fn new(head_budget_bytes: usize) -> TelemetryResult<Self> {
@@ -907,65 +1050,128 @@ impl TraceStripe {
 
     fn seal_keys(
         &mut self,
-        ready: Vec<(Arc<str>, TraceId)>,
+        mut ready: Vec<(Arc<str>, TraceId)>,
         now_nanos: u64,
     ) -> TelemetryResult<Vec<Vec<u8>>> {
-        let mut blocks = Vec::with_capacity(ready.len());
+        ready.sort_unstable();
+        let mut by_partition = BTreeMap::<TopicPartition, Vec<PreparedTrace>>::new();
         for key in ready {
             let trace = self.traces.remove(&key).expect("selected trace exists");
             self.head_bytes = self.head_bytes.saturating_sub(trace.bytes);
             let continued_recent_trace = trace.first_sealed_nanos.is_some();
             let first_sealed_nanos = trace.first_sealed_nanos.unwrap_or(now_nanos);
             let spans = trace.spans.into_values().collect::<Vec<_>>();
-            let block_id = self.next_block_id;
-            self.next_block_id = self.next_block_id.saturating_add(1);
-            let block = encode_trace_block(&spans)?;
             self.remember_recent(&key, &spans, first_sealed_nanos, now_nanos);
-            if continued_recent_trace && let Some(recent) = self.recently_sealed.get(&key) {
-                let current = recent.spans.values().cloned().collect::<Vec<_>>();
-                self.directory
-                    .publish_current(summarize_trace(&current, block_id)?);
+            let summary_spans = if continued_recent_trace {
+                self.recently_sealed
+                    .get(&key)
+                    .expect("continued trace was remembered")
+                    .spans
+                    .values()
+                    .cloned()
+                    .collect()
             } else {
-                self.directory.publish(summarize_trace(&spans, block_id)?);
+                spans.clone()
+            };
+            let partition = spans[0].record_ref.topic_partition;
+            by_partition
+                .entry(partition)
+                .or_default()
+                .push(PreparedTrace {
+                    spans,
+                    summary_spans,
+                    replaces_summary: continued_recent_trace,
+                    source_bytes: trace.bytes,
+                });
+        }
+        let mut blocks = Vec::new();
+        for traces in by_partition.into_values() {
+            let mut group = Vec::new();
+            let mut group_bytes = 0usize;
+            for trace in traces {
+                if !group.is_empty()
+                    && group_bytes.saturating_add(trace.source_bytes)
+                        > TARGET_TRACE_BLOCK_SOURCE_BYTES
+                {
+                    blocks.push(self.seal_prepared_block(std::mem::take(&mut group))?);
+                    group_bytes = 0;
+                }
+                group_bytes = group_bytes.saturating_add(trace.source_bytes);
+                group.push(trace);
             }
-            let payload = Arc::<[u8]>::from(block.clone());
-            let first_offset = spans
-                .iter()
-                .map(|span| span.record_ref.offset.get())
-                .min()
-                .expect("sealed trace is nonempty");
-            let last_offset = spans
-                .iter()
-                .map(|span| span.record_ref.offset.get())
-                .max()
-                .expect("sealed trace is nonempty");
-            let min_timestamp_unix_nanos = spans
-                .iter()
-                .map(|span| span.start_time_unix_nanos)
-                .min()
-                .expect("sealed trace is nonempty");
-            let max_timestamp_unix_nanos = spans
-                .iter()
-                .map(|span| span.end_time_unix_nanos().unwrap_or(u64::MAX))
-                .max()
-                .expect("sealed trace is nonempty");
-            self.pending_blocks.push(SignalTierPayload {
-                resident_id: block_id,
-                topic_partition: spans[0].record_ref.topic_partition,
-                signal_identity: u128::from_be_bytes(*spans[0].trace_id.as_bytes()),
-                first_offset,
-                last_offset,
-                record_count: u32::try_from(spans.len())
-                    .map_err(|_| TelemetryError::RecordTooLarge)?,
-                min_timestamp_unix_nanos,
-                max_timestamp_unix_nanos,
-                payload: Arc::clone(&payload),
-            });
-            self.sealed_blocks
-                .push(SealedTraceBlock { block_id, payload });
-            blocks.push(block);
+            if !group.is_empty() {
+                blocks.push(self.seal_prepared_block(group)?);
+            }
         }
         Ok(blocks)
+    }
+
+    fn seal_prepared_block(&mut self, traces: Vec<PreparedTrace>) -> TelemetryResult<Vec<u8>> {
+        let block_id = self.next_block_id;
+        self.next_block_id = self.next_block_id.saturating_add(1);
+        let span_count = traces.iter().map(|trace| trace.spans.len()).sum();
+        let mut spans = Vec::with_capacity(span_count);
+        let mut summaries = Vec::with_capacity(traces.len());
+        for trace in traces {
+            spans.extend(trace.spans);
+            summaries.push((trace.summary_spans, trace.replaces_summary));
+        }
+        let block = encode_trace_block(&spans)?;
+        for (summary_spans, replaces_summary) in summaries {
+            let summary = summarize_trace(&summary_spans, block_id)?;
+            if replaces_summary {
+                self.directory.publish_current(summary);
+            } else {
+                self.directory.publish(summary);
+            }
+        }
+        let payload = Arc::<[u8]>::from(block.clone());
+        let first_offset = spans
+            .iter()
+            .map(|span| span.record_ref.offset.get())
+            .min()
+            .expect("sealed trace block is nonempty");
+        let last_offset = spans
+            .iter()
+            .map(|span| span.record_ref.offset.get())
+            .max()
+            .expect("sealed trace block is nonempty");
+        let min_timestamp_unix_nanos = spans
+            .iter()
+            .map(|span| span.start_time_unix_nanos)
+            .min()
+            .expect("sealed trace block is nonempty");
+        let max_timestamp_unix_nanos = spans
+            .iter()
+            .map(|span| span.end_time_unix_nanos().unwrap_or(u64::MAX))
+            .max()
+            .expect("sealed trace block is nonempty");
+        let min_signal_identity = spans
+            .iter()
+            .map(|span| u128::from_be_bytes(*span.trace_id.as_bytes()))
+            .min()
+            .expect("sealed trace block is nonempty");
+        let max_signal_identity = spans
+            .iter()
+            .map(|span| u128::from_be_bytes(*span.trace_id.as_bytes()))
+            .max()
+            .expect("sealed trace block is nonempty");
+        self.pending_blocks.push(SignalTierPayload {
+            resident_id: block_id,
+            topic_partition: spans[0].record_ref.topic_partition,
+            min_signal_identity,
+            max_signal_identity,
+            first_offset,
+            last_offset,
+            record_count: u32::try_from(spans.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
+            min_timestamp_unix_nanos,
+            max_timestamp_unix_nanos,
+            payload: Arc::clone(&payload),
+            correlation_filter: CorrelationBlockFilter::for_spans(&spans),
+        });
+        self.sealed_blocks
+            .push(SealedTraceBlock { block_id, payload });
+        Ok(block)
     }
 
     pub(crate) fn pending_partition(&self, partition: TopicPartition) -> Vec<SignalTierPayload> {
@@ -1176,6 +1382,52 @@ mod tests {
         assert_eq!(decoded[0], records[2]);
         assert_eq!(decoded[1], records[1]);
         assert_eq!(decoded[2], records[0]);
+    }
+
+    #[test]
+    fn ready_traces_share_a_bounded_columnar_block() {
+        let mut stripe = TraceStripe::new(1024 * 1024).unwrap();
+        stripe.apply(span(1, 1, 1), 10).unwrap();
+        stripe.apply(span(2, 2, 2), 10).unwrap();
+        let blocks = stripe.seal_idle(10 + DEFAULT_TRACE_IDLE_NANOS).unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(decode_trace_block(&blocks[0]).unwrap().len(), 2);
+        assert_eq!(stripe.pending_blocks.len(), 1);
+        assert_eq!(
+            stripe.pending_blocks[0].min_signal_identity,
+            u128::from_be_bytes([1; 16])
+        );
+        assert_eq!(
+            stripe.pending_blocks[0].max_signal_identity,
+            u128::from_be_bytes([2; 16])
+        );
+        for trace_byte in [1, 2] {
+            let summaries = stripe.directory().query(&TraceQuery {
+                tenant: Arc::from("tenant-a"),
+                trace_id: Some(TraceId::from_bytes([trace_byte; 16]).unwrap()),
+                limit: 1,
+                ..TraceQuery::default()
+            });
+            assert_eq!(summaries[0].block_fragments.as_ref(), &[1]);
+        }
+    }
+
+    #[test]
+    fn trace_sidecar_interner_promotes_without_losing_high_cardinality_values() {
+        let records = (1..=40)
+            .map(|ordinal| {
+                let mut record = span(ordinal, ordinal as u8, ordinal as u8);
+                record.name = Arc::from(format!("operation-{ordinal}"));
+                record.attributes = Arc::new(vec![TelemetryAttribute::new(
+                    "request.id",
+                    crate::TelemetryValue::String(Arc::from(format!("request-{ordinal}"))),
+                )]);
+                record
+            })
+            .collect::<Vec<_>>();
+        let encoded = encode_trace_block(&records).unwrap();
+        let decoded = decode_trace_block(&encoded).unwrap();
+        assert_eq!(decoded, records);
     }
 
     #[test]
