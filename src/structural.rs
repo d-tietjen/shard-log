@@ -16,8 +16,6 @@ use crate::{
 
 const STRUCTURAL_BLOCK_MAGIC: &[u8; 4] = b"STLG";
 const EMBEDDED_INDEX_MAGIC: &[u8; 4] = b"SLI1";
-const RAW_BODY: u8 = 0;
-const TEMPLATE_BODY: u8 = 1;
 const DIRECT_ATTRIBUTE_VALUE: u8 = 0;
 const DICTIONARY_ATTRIBUTE_VALUE: u8 = 1;
 const TIMESTAMP_PCO_LEVEL: usize = 8;
@@ -1106,30 +1104,30 @@ pub fn decode_structural_block(encoded: &[u8]) -> TelemetryResult<Vec<DecodedStr
         encoded.len().saturating_sub(cursor),
         "record count",
     )?;
-    let offsets = decode_offsets(read_section(encoded, &mut cursor)?, record_count)?;
-    let timestamps = decode_timestamps(read_section(encoded, &mut cursor)?, record_count)?;
-    let templates = decode_templates(read_section(encoded, &mut cursor)?)?;
-    let messages = decode_bodies(
-        read_section(encoded, &mut cursor)?,
-        &templates,
-        record_count,
-    )?;
-    let attributes = decode_attribute_tables(read_section(encoded, &mut cursor)?)?;
-    let fields = decode_fields(
-        read_section(encoded, &mut cursor)?,
-        &attributes,
-        record_count,
-    )?;
-    let typed_metadata = decode_typed_metadata(read_section(encoded, &mut cursor)?, record_count)?;
-    let embedded_index = EmbeddedFrameIndex::decode(read_section(encoded, &mut cursor)?)?;
+    let offsets_section = read_section(encoded, &mut cursor)?;
+    let timestamps_section = read_section(encoded, &mut cursor)?;
+    let templates_section = read_section(encoded, &mut cursor)?;
+    let bodies_section = read_section(encoded, &mut cursor)?;
+    let attributes_section = read_section(encoded, &mut cursor)?;
+    let fields_section = read_section(encoded, &mut cursor)?;
+    let typed_metadata_section = read_section(encoded, &mut cursor)?;
+    let embedded_index_section = read_section(encoded, &mut cursor)?;
+    if cursor != encoded.len() {
+        return Err(TelemetryError::InvalidBlockEncoding("trailing bytes"));
+    }
+    let embedded_index = EmbeddedFrameIndex::decode(embedded_index_section)?;
     if embedded_index.record_count as usize != record_count {
         return Err(TelemetryError::InvalidBlockEncoding(
             "embedded index record count mismatch",
         ));
     }
-    if cursor != encoded.len() {
-        return Err(TelemetryError::InvalidBlockEncoding("trailing bytes"));
-    }
+    let offsets = decode_offsets(offsets_section, record_count)?;
+    let timestamps = decode_timestamps(timestamps_section, record_count)?;
+    let templates = decode_templates(templates_section)?;
+    let messages = decode_bodies(bodies_section, &templates, &embedded_index, record_count)?;
+    let attributes = decode_attribute_tables(attributes_section)?;
+    let fields = decode_fields(fields_section, &attributes, record_count)?;
+    let typed_metadata = decode_typed_metadata(typed_metadata_section, record_count)?;
     Ok(offsets
         .into_iter()
         .zip(timestamps)
@@ -1184,36 +1182,38 @@ pub fn decode_structural_records(
         "record count",
     )?;
     validate_selected_ordinals(record_ordinals, record_count)?;
-    let offsets = decode_offsets(read_section(encoded, &mut cursor)?, record_count)?;
-    let timestamps = decode_timestamps(read_section(encoded, &mut cursor)?, record_count)?;
-    let templates = decode_templates(read_section(encoded, &mut cursor)?)?;
-    let messages = decode_selected_bodies(
-        read_section(encoded, &mut cursor)?,
-        &templates,
-        record_count,
-        record_ordinals,
-    )?;
-    let attributes = decode_attribute_tables(read_section(encoded, &mut cursor)?)?;
-    let fields = decode_selected_fields(
-        read_section(encoded, &mut cursor)?,
-        &attributes,
-        record_count,
-        record_ordinals,
-    )?;
-    let typed_metadata = decode_selected_typed_metadata(
-        read_section(encoded, &mut cursor)?,
-        record_count,
-        record_ordinals,
-    )?;
-    let embedded_index = EmbeddedFrameIndex::decode(read_section(encoded, &mut cursor)?)?;
+    let offsets_section = read_section(encoded, &mut cursor)?;
+    let timestamps_section = read_section(encoded, &mut cursor)?;
+    let templates_section = read_section(encoded, &mut cursor)?;
+    let bodies_section = read_section(encoded, &mut cursor)?;
+    let attributes_section = read_section(encoded, &mut cursor)?;
+    let fields_section = read_section(encoded, &mut cursor)?;
+    let typed_metadata_section = read_section(encoded, &mut cursor)?;
+    let embedded_index_section = read_section(encoded, &mut cursor)?;
+    if cursor != encoded.len() {
+        return Err(TelemetryError::InvalidBlockEncoding("trailing bytes"));
+    }
+    let embedded_index = EmbeddedFrameIndex::decode(embedded_index_section)?;
     if embedded_index.record_count as usize != record_count {
         return Err(TelemetryError::InvalidBlockEncoding(
             "embedded index record count mismatch",
         ));
     }
-    if cursor != encoded.len() {
-        return Err(TelemetryError::InvalidBlockEncoding("trailing bytes"));
-    }
+    let offsets = decode_offsets(offsets_section, record_count)?;
+    let timestamps = decode_timestamps(timestamps_section, record_count)?;
+    let templates = decode_templates(templates_section)?;
+    let messages = decode_selected_bodies(
+        bodies_section,
+        &templates,
+        &embedded_index,
+        record_count,
+        record_ordinals,
+    )?;
+    let attributes = decode_attribute_tables(attributes_section)?;
+    let fields =
+        decode_selected_fields(fields_section, &attributes, record_count, record_ordinals)?;
+    let typed_metadata =
+        decode_selected_typed_metadata(typed_metadata_section, record_count, record_ordinals)?;
     let mut decoded = Vec::with_capacity(record_ordinals.len());
     for (((record_ordinal, message), fields), metadata) in record_ordinals
         .iter()
@@ -1522,18 +1522,12 @@ fn encode_body(
     encoded: &mut Vec<u8>,
 ) -> TelemetryResult<()> {
     match template_id {
-        Some(template_id) => {
-            encoded.push(TEMPLATE_BODY);
-            write_varint(
-                u64::try_from(*template_id).map_err(|_| TelemetryError::RecordTooLarge)?,
-                encoded,
-            );
+        Some(_) => {
             for value in &message.values {
                 append_bytes(encoded, &message.message[value.clone()])?;
             }
         }
         None => {
-            encoded.push(RAW_BODY);
             append_bytes(encoded, message.message)?;
         }
     }
@@ -1812,20 +1806,23 @@ fn decode_templates(encoded: &[u8]) -> TelemetryResult<Vec<Vec<Vec<u8>>>> {
 fn decode_bodies(
     encoded: &[u8],
     templates: &[Vec<Vec<u8>>],
+    index: &EmbeddedFrameIndex,
     record_count: usize,
 ) -> TelemetryResult<Vec<Arc<str>>> {
+    validate_body_layout(index, templates.len(), record_count)?;
     let lane = decode_seekable_record_lane(encoded, record_count)?;
     let mut cursor = 0usize;
     let mut messages = Vec::with_capacity(record_count);
     let mut exact_templates = vec![None::<Arc<str>>; templates.len()];
     let mut previous = None::<Arc<str>>;
     let mut previous_encoded = None::<Range<usize>>;
+    let mut previous_template_id = None::<usize>;
     for record_ordinal in 0..record_count {
         validate_checkpoint_cursor(&lane, record_ordinal, cursor)?;
         let record_start = cursor;
-        let body_kind = read_byte(lane.payload, &mut cursor)?;
-        let message = match body_kind {
-            RAW_BODY => {
+        let template_id = body_template_id(index, record_ordinal, templates.len())?;
+        let message = match template_id {
+            None => {
                 let bytes = read_bytes(lane.payload, &mut cursor)?;
                 if let Some(previous) = &previous
                     && previous.as_bytes() == bytes
@@ -1835,8 +1832,7 @@ fn decode_bodies(
                     decode_text(bytes.to_vec())?
                 }
             }
-            TEMPLATE_BODY => {
-                let template_id = read_usize(lane.payload, &mut cursor)?;
+            Some(template_id) => {
                 let literals = templates
                     .get(template_id)
                     .ok_or(TelemetryError::InvalidBlockEncoding("unknown template ID"))?;
@@ -1856,15 +1852,13 @@ fn decode_bodies(
                     }
                     let record_end = cursor;
                     if let (Some(previous), Some(previous_encoded)) = (&previous, &previous_encoded)
+                        && previous_template_id == Some(template_id)
                         && lane.payload[previous_encoded.clone()]
                             == lane.payload[record_start..record_end]
                     {
                         Arc::clone(previous)
                     } else {
                         let mut replay = record_start;
-                        let _ = read_byte(lane.payload, &mut replay)?;
-                        let replay_template_id = read_usize(lane.payload, &mut replay)?;
-                        debug_assert_eq!(replay_template_id, template_id);
                         let mut reconstructed = literals.first().cloned().ok_or(
                             TelemetryError::InvalidBlockEncoding("template has no first literal"),
                         )?;
@@ -1877,10 +1871,10 @@ fn decode_bodies(
                     }
                 }
             }
-            _ => return Err(TelemetryError::InvalidBlockEncoding("invalid body kind")),
         };
         previous = Some(Arc::clone(&message));
         previous_encoded = Some(record_start..cursor);
+        previous_template_id = template_id;
         messages.push(message);
     }
     require_consumed(lane.payload, cursor)?;
@@ -1890,9 +1884,11 @@ fn decode_bodies(
 fn decode_selected_bodies(
     encoded: &[u8],
     templates: &[Vec<Vec<u8>>],
+    index: &EmbeddedFrameIndex,
     record_count: usize,
     selected: &[u32],
 ) -> TelemetryResult<Vec<Arc<str>>> {
+    validate_body_layout(index, templates.len(), record_count)?;
     let lane = decode_seekable_record_lane(encoded, record_count)?;
     let mut selected_index = 0usize;
     let mut messages = Vec::with_capacity(selected.len());
@@ -1922,16 +1918,14 @@ fn decode_selected_bodies(
             let retain = usize::try_from(selected[retained])
                 .ok()
                 .is_some_and(|selected| selected == record_ordinal);
-            let body_kind = read_byte(checkpoint_payload, &mut cursor)?;
-            match body_kind {
-                RAW_BODY => {
+            match body_template_id(index, record_ordinal, templates.len())? {
+                None => {
                     let bytes = read_bytes(checkpoint_payload, &mut cursor)?;
                     if retain {
                         messages.push(decode_text(bytes.to_vec())?);
                     }
                 }
-                TEMPLATE_BODY => {
-                    let template_id = read_usize(checkpoint_payload, &mut cursor)?;
+                Some(template_id) => {
                     let literals = templates
                         .get(template_id)
                         .ok_or(TelemetryError::InvalidBlockEncoding("unknown template ID"))?;
@@ -1954,7 +1948,6 @@ fn decode_selected_bodies(
                         }
                     }
                 }
-                _ => return Err(TelemetryError::InvalidBlockEncoding("invalid body kind")),
             }
             if retain {
                 retained += 1;
@@ -1966,6 +1959,45 @@ fn decode_selected_bodies(
         selected_index = group_end;
     }
     Ok(messages)
+}
+
+fn validate_body_layout(
+    index: &EmbeddedFrameIndex,
+    template_count: usize,
+    record_count: usize,
+) -> TelemetryResult<()> {
+    let expected_layout_count = if record_count == 0 {
+        0
+    } else {
+        u32::try_from(template_count)
+            .map_err(|_| TelemetryError::RecordTooLarge)?
+            .checked_add(1)
+            .ok_or(TelemetryError::RecordTooLarge)?
+    };
+    if index.record_count as usize != record_count || index.layout_count != expected_layout_count {
+        return Err(TelemetryError::InvalidBlockEncoding(
+            "body layout dictionary disagrees with templates",
+        ));
+    }
+    Ok(())
+}
+
+fn body_template_id(
+    index: &EmbeddedFrameIndex,
+    record_ordinal: usize,
+    template_count: usize,
+) -> TelemetryResult<Option<usize>> {
+    let ordinal = u32::try_from(record_ordinal).map_err(|_| TelemetryError::RecordTooLarge)?;
+    let layout_id = packed_id(&index.layout_ids, ordinal) as usize;
+    if layout_id < template_count {
+        Ok(Some(layout_id))
+    } else if layout_id == template_count {
+        Ok(None)
+    } else {
+        Err(TelemetryError::InvalidBlockEncoding(
+            "body layout ID exceeds templates",
+        ))
+    }
 }
 
 fn decode_attribute_tables(encoded: &[u8]) -> TelemetryResult<DecodedAttributeTables> {
@@ -2218,7 +2250,7 @@ fn encode_seekable_record_lane(payload: &[u8], checkpoints: &[usize]) -> Telemet
     );
     let mut previous = 0usize;
     for (index, checkpoint) in checkpoints.iter().copied().enumerate() {
-        if (index == 0 && checkpoint != 0) || (index > 0 && checkpoint <= previous) {
+        if (index == 0 && checkpoint != 0) || (index > 0 && checkpoint < previous) {
             return Err(TelemetryError::InvalidBlockEncoding(
                 "record lane checkpoints are not ordered",
             ));
@@ -2284,7 +2316,7 @@ fn decode_seekable_record_lane(
                 .ok_or(TelemetryError::InvalidBlockEncoding(
                     "record lane checkpoint overflow",
                 ))?;
-        if (index == 0 && checkpoint != 0) || (index > 0 && checkpoint <= previous) {
+        if (index == 0 && checkpoint != 0) || (index > 0 && checkpoint < previous) {
             return Err(TelemetryError::InvalidBlockEncoding(
                 "record lane checkpoints are not ordered",
             ));
@@ -2295,7 +2327,7 @@ fn decode_seekable_record_lane(
     require_consumed(directory, cursor)?;
     if checkpoints
         .last()
-        .is_some_and(|checkpoint| *checkpoint >= payload.len())
+        .is_some_and(|checkpoint| *checkpoint > payload.len())
         || (record_count == 0 && !payload.is_empty())
     {
         return Err(TelemetryError::InvalidBlockEncoding(
@@ -3308,6 +3340,54 @@ mod tests {
         let (_, decoded) = decode_packed_column(&alternating_encoded, &mut cursor, 4_096).unwrap();
         assert_eq!(decoded, alternating);
         require_consumed(&alternating_encoded, cursor).unwrap();
+    }
+
+    #[test]
+    fn exact_template_bodies_reuse_index_ids_without_per_record_bytes() {
+        let records = (0..600u64)
+            .map(|offset| {
+                let message = if offset.is_multiple_of(2) {
+                    "static alpha message"
+                } else {
+                    "static beta message"
+                };
+                record(offset, message)
+            })
+            .collect::<Vec<_>>();
+        let structural = encode_structural_block(&records).expect("exact templates encode");
+        let mut cursor = STRUCTURAL_BLOCK_MAGIC.len();
+        assert_eq!(read_usize(&structural, &mut cursor).unwrap(), records.len());
+        for _ in 0..3 {
+            let _ = read_section(&structural, &mut cursor).unwrap();
+        }
+        let body_lane = decode_seekable_record_lane(
+            read_section(&structural, &mut cursor).unwrap(),
+            records.len(),
+        )
+        .expect("body lane opens");
+        assert!(body_lane.payload.is_empty());
+        assert!(
+            body_lane
+                .checkpoints
+                .iter()
+                .all(|checkpoint| *checkpoint == 0)
+        );
+
+        let decoded = decode_structural_block(&structural).expect("exact templates decode");
+        assert_eq!(decoded.len(), records.len());
+        assert!(
+            decoded
+                .iter()
+                .zip(&records)
+                .all(|(decoded, record)| decoded.message.as_ref() == record.message.as_ref())
+        );
+        let selected = [0, 255, 256, 511, 599];
+        let decoded = decode_structural_records(&structural, &selected)
+            .expect("exact templates selectively decode");
+        assert_eq!(decoded.len(), selected.len());
+        assert!(decoded.iter().zip(selected).all(|(decoded, ordinal)| {
+            decoded.message.as_ref() == records[ordinal as usize].message.as_ref()
+        }));
     }
 
     #[test]
