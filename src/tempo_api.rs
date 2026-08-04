@@ -351,6 +351,10 @@ async fn all_traces(
 }
 
 fn tempo_search_success(traces: Vec<TraceqlTrace>) -> Response {
+    tempo_success(tempo_search_value(traces))
+}
+
+fn tempo_search_value(traces: Vec<TraceqlTrace>) -> Value {
     let traces = traces
         .into_iter()
         .map(|trace| {
@@ -360,7 +364,7 @@ fn tempo_search_success(traces: Vec<TraceqlTrace>) -> Response {
                 "rootTraceName": trace.root_name.as_deref().unwrap_or(""),
                 "startTimeUnixNano": trace.start_time_unix_nanos.to_string(),
                 "durationMs": trace.end_time_unix_nanos.saturating_sub(trace.start_time_unix_nanos) as f64 / 1_000_000.0,
-                "spanSet": {
+                "spanSets": [{
                     "spans": trace.spans.iter().map(|span| json!({
                         "spanID": span.span_id.to_string(),
                         "startTimeUnixNano": span.start_time_unix_nanos.to_string(),
@@ -374,15 +378,15 @@ fn tempo_search_success(traces: Vec<TraceqlTrace>) -> Response {
                         }).collect::<Vec<_>>()
                     })).collect::<Vec<_>>(),
                     "matched": trace.spans.len()
-                }
+                }]
             })
         })
         .collect::<Vec<_>>();
     let inspected_traces = traces.len();
-    tempo_success(json!({
+    json!({
         "traces": traces,
         "metrics": {"inspectedBytes": 0, "inspectedTraces": inspected_traces}
-    }))
+    })
 }
 
 fn trace_tag_value(span: &DurableSpan, tag: &str) -> Option<String> {
@@ -471,5 +475,21 @@ mod tests {
             parse_trace_id("01010101010101010101010101010101").unwrap(),
             TraceId::from_bytes([1; 16]).unwrap()
         );
+    }
+
+    #[test]
+    fn search_response_uses_tempo_span_sets_shape() {
+        let value = tempo_search_value(vec![TraceqlTrace {
+            trace_id: TraceId::from_bytes([1; 16]).unwrap(),
+            spans: Vec::new(),
+            start_time_unix_nanos: 1,
+            end_time_unix_nanos: 2,
+            root_name: None,
+            root_service_name: None,
+            error_count: 0,
+            selected_fields: Arc::default(),
+        }]);
+        assert!(value["traces"][0]["spanSets"].is_array());
+        assert!(value["traces"][0].get("spanSet").is_none());
     }
 }
