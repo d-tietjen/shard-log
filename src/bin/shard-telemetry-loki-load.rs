@@ -3,6 +3,7 @@ use std::error::Error;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
+use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,9 +12,10 @@ use std::time::Instant;
 
 use clap::{Parser, ValueEnum};
 use serde::Deserialize;
-use shard_log::{
-    LokiEntry, NATIVE_FRAME_HEADER_BYTES, NativeAppendAck, NativeFrame, NativeFrameHeader,
-    NativeOpcode, NativeStatus, encode_native_log_batch,
+use shard_telemetry::{
+    LokiEntry, NATIVE_FRAME_HEADER_BYTES, NativeFrame, NativeFrameHeader, NativeOpcode,
+    NativePartitionAppend, NativeStatus, NativeTelemetryAppendAck, NativeTelemetryBatch,
+    TelemetryRouter, prepare_loki_log_envelope,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -24,16 +26,16 @@ enum LoadProtocol {
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "shard-log-loki-load",
+    name = "shard-telemetry-loki-load",
     about = "Pinned-core Loki push load generator for Docker JSON logs"
 )]
 struct Arguments {
     /// Immutable Docker json-file log corpus.
     source: PathBuf,
-    /// Loki or ShardLog host.
+    /// Loki or ShardTelemetry host.
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
-    /// Loki or ShardLog HTTP port.
+    /// Loki or ShardTelemetry HTTP port.
     #[arg(long, default_value_t = 3_100)]
     port: u16,
     /// Wire protocol used by the load generator.
@@ -385,7 +387,7 @@ impl HttpConnection {
         let content_length = prefix.len() + values.len() + suffix.len();
         write!(
             self.stream.get_mut(),
-            "POST /loki/api/v1/push HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-Scope-OrgID: {}\r\nX-ShardLog-Request-ID: {}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}{}{}",
+            "POST /loki/api/v1/push HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nX-Scope-OrgID: {}\r\nX-ShardTelemetry-Request-ID: {}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{}{}{}",
             self.host,
             tenant,
             request_id,
@@ -450,7 +452,25 @@ impl NativeConnection {
         next_request: &AtomicU64,
     ) -> Result<usize, Box<dyn Error + Send + Sync>> {
         let request_id = u128::from(next_request.fetch_add(1, Ordering::Relaxed));
-        let payload = encode_native_log_batch(tenant, entries)?;
+        let mut route_identity = Vec::new();
+        if let Some(entry) = entries.first() {
+            for (key, value) in &entry.labels {
+                route_identity.extend_from_slice(&(key.len() as u64).to_le_bytes());
+                route_identity.extend_from_slice(key.as_bytes());
+                route_identity.extend_from_slice(&(value.len() as u64).to_le_bytes());
+                route_identity.extend_from_slice(value.as_bytes());
+            }
+        }
+        let router = TelemetryRouter::new(NonZeroU16::new(256).expect("constant is nonzero"));
+        let topic_partition = router.log(tenant, None, &route_identity);
+        let envelope = prepare_loki_log_envelope(tenant, entries)?;
+        let payload = NativeTelemetryBatch {
+            partitions: vec![NativePartitionAppend {
+                topic_partition,
+                envelope,
+            }],
+        }
+        .encode()?;
         let request = NativeFrame::request(NativeOpcode::Append, request_id, payload)?;
         self.stream.write_all(&request.header.encode())?;
         self.stream.write_all(&request.payload)?;
@@ -488,7 +508,10 @@ impl NativeConnection {
             .into());
         };
         self.pending_request_ids.swap_remove(pending_index);
-        let _ = NativeAppendAck::decode(&response)?;
+        let acknowledgement = NativeTelemetryAppendAck::decode(&response)?;
+        if acknowledgement.partitions.len() != 1 {
+            return Err("native append returned an unexpected partition count".into());
+        }
         Ok(())
     }
 

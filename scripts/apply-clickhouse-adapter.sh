@@ -19,7 +19,7 @@ if [[ $OBSERVED_TAG != "$EXPECTED_TAG" ]]; then
     exit 2
 fi
 
-for adapter_file in StorageShardLog.h StorageShardLog.cpp; do
+for adapter_file in StorageShardTelemetry.h StorageShardTelemetry.cpp; do
     source_file=$ADAPTER_DIR/$adapter_file
     target_file=$CLICKHOUSE_SOURCE/src/Storages/$adapter_file
     if [[ -e $target_file ]] && ! cmp -s "$source_file" "$target_file"; then
@@ -28,12 +28,12 @@ for adapter_file in StorageShardLog.h StorageShardLog.cpp; do
     fi
 done
 
-if ! rg -q 'registerStorageShardLog' "$CLICKHOUSE_SOURCE/src/Storages/registerStorages.cpp"; then
-    git -C "$CLICKHOUSE_SOURCE" apply --check "$ADAPTER_DIR/register-storage-shardlog.patch"
-    git -C "$CLICKHOUSE_SOURCE" apply "$ADAPTER_DIR/register-storage-shardlog.patch"
+if ! rg -q 'registerStorageShardTelemetry' "$CLICKHOUSE_SOURCE/src/Storages/registerStorages.cpp"; then
+    git -C "$CLICKHOUSE_SOURCE" apply --check "$ADAPTER_DIR/register-storage-shardtelemetry.patch"
+    git -C "$CLICKHOUSE_SOURCE" apply "$ADAPTER_DIR/register-storage-shardtelemetry.patch"
 fi
 
-install -m 0644 "$ADAPTER_DIR/StorageShardLog.h" "$CLICKHOUSE_SOURCE/src/Storages/StorageShardLog.h"
-install -m 0644 "$ADAPTER_DIR/StorageShardLog.cpp" "$CLICKHOUSE_SOURCE/src/Storages/StorageShardLog.cpp"
+install -m 0644 "$ADAPTER_DIR/StorageShardTelemetry.h" "$CLICKHOUSE_SOURCE/src/Storages/StorageShardTelemetry.h"
+install -m 0644 "$ADAPTER_DIR/StorageShardTelemetry.cpp" "$CLICKHOUSE_SOURCE/src/Storages/StorageShardTelemetry.cpp"
 
-echo "Applied StorageShardLog to $CLICKHOUSE_SOURCE at $OBSERVED_TAG"
+echo "Applied StorageShardTelemetry to $CLICKHOUSE_SOURCE at $OBSERVED_TAG"

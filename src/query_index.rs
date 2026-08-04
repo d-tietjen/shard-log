@@ -5,10 +5,12 @@ use std::sync::Arc;
 
 use shard_stream_core::{LogicalOffset, LogicalPartitionId, TopicId, TopicPartition};
 
-use crate::{LogDbError, LogDbResult, LogQuery, QueryOrder, StructuralRecordView, analyze_message};
+use crate::{
+    LogQuery, QueryOrder, StructuralRecordView, TelemetryError, TelemetryResult, analyze_message,
+};
 
-const QUERY_INDEX_MAGIC: &[u8; 8] = b"SLOGQIX2";
-const COMPRESSED_QUERY_INDEX_MAGIC: &[u8; 8] = b"SLOGQIZ2";
+const QUERY_INDEX_MAGIC: &[u8; 8] = b"STLGQIX1";
+const COMPRESSED_QUERY_INDEX_MAGIC: &[u8; 8] = b"STLGQIZ1";
 const DELTA_POSTING: u8 = 0;
 const RUN_POSTING: u8 = 1;
 const MESSAGE_TERM_CACHE_ENTRIES: usize = 1_024;
@@ -44,18 +46,17 @@ impl MessageTrigramFilter {
         }
     }
 
-    fn from_bytes(encoded: &[u8]) -> LogDbResult<Self> {
+    fn from_bytes(encoded: &[u8]) -> TelemetryResult<Self> {
         if encoded.len() != MESSAGE_TRIGRAM_FILTER_BYTES {
-            return Err(LogDbError::InvalidBlockEncoding(
+            return Err(TelemetryError::InvalidBlockEncoding(
                 "invalid message trigram filter length",
             ));
         }
         let mut filter = Self::new();
         for (word, bytes) in filter.words.iter_mut().zip(encoded.chunks_exact(8)) {
-            *word =
-                u64::from_le_bytes(bytes.try_into().map_err(|_| {
-                    LogDbError::InvalidBlockEncoding("invalid trigram filter word")
-                })?);
+            *word = u64::from_le_bytes(bytes.try_into().map_err(|_| {
+                TelemetryError::InvalidBlockEncoding("invalid trigram filter word")
+            })?);
         }
         Ok(filter)
     }
@@ -161,12 +162,12 @@ enum PostingList {
 }
 
 impl PostingList {
-    fn from_ordinals(ordinals: Vec<u32>) -> LogDbResult<Self> {
+    fn from_ordinals(ordinals: Vec<u32>) -> TelemetryResult<Self> {
         if ordinals.is_empty() {
-            return Err(LogDbError::InvalidBlockEncoding("empty query posting"));
+            return Err(TelemetryError::InvalidBlockEncoding("empty query posting"));
         }
         if ordinals.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(LogDbError::InvalidBlockEncoding(
+            return Err(TelemetryError::InvalidBlockEncoding(
                 "query posting is not ordered",
             ));
         }
@@ -278,8 +279,9 @@ pub struct BlockQueryIndex {
 
 impl BlockQueryIndex {
     /// Builds exact record-ordinal postings from normalized structural records.
-    pub fn build<R: StructuralRecordView>(records: &[R]) -> LogDbResult<Self> {
-        let record_count = u32::try_from(records.len()).map_err(|_| LogDbError::RecordTooLarge)?;
+    pub fn build<R: StructuralRecordView>(records: &[R]) -> TelemetryResult<Self> {
+        let record_count =
+            u32::try_from(records.len()).map_err(|_| TelemetryError::RecordTooLarge)?;
         let mut term_ids = HashMap::<Arc<str>, usize>::new();
         let mut term_entries = Vec::<(Arc<str>, Vec<u32>)>::new();
         let mut message_cache = std::iter::repeat_with(|| None)
@@ -290,7 +292,7 @@ impl BlockQueryIndex {
         let mut field_postings = HashMap::<Arc<str>, HashMap<Arc<str>, Vec<u32>>>::new();
         for (record_ordinal, record) in records.iter().enumerate() {
             let record_ordinal =
-                u32::try_from(record_ordinal).map_err(|_| LogDbError::RecordTooLarge)?;
+                u32::try_from(record_ordinal).map_err(|_| TelemetryError::RecordTooLarge)?;
             let message = record.structural_message();
             let cache_slot = message_term_cache_slot(message.as_bytes());
             if let Some(cached) = &message_cache[cache_slot]
@@ -346,7 +348,9 @@ impl BlockQueryIndex {
 
             for field_index in 0..record.structural_field_count() {
                 let (key, value) = record.structural_field(field_index).ok_or(
-                    LogDbError::InvalidBlockEncoding("record field count changed while indexing"),
+                    TelemetryError::InvalidBlockEncoding(
+                        "record field count changed while indexing",
+                    ),
                 )?;
                 let values = match field_postings.get_mut(key) {
                     Some(values) => values,
@@ -370,17 +374,17 @@ impl BlockQueryIndex {
         let term_postings = term_entries
             .into_iter()
             .map(|(term, posting)| Ok((term, PostingList::from_ordinals(posting)?)))
-            .collect::<LogDbResult<HashMap<_, _>>>()?;
+            .collect::<TelemetryResult<HashMap<_, _>>>()?;
         let field_postings = field_postings
             .into_iter()
             .map(|(key, values)| {
                 let values = values
                     .into_iter()
                     .map(|(value, posting)| Ok((value, PostingList::from_ordinals(posting)?)))
-                    .collect::<LogDbResult<HashMap<_, _>>>()?;
+                    .collect::<TelemetryResult<HashMap<_, _>>>()?;
                 Ok((key, values))
             })
-            .collect::<LogDbResult<HashMap<_, _>>>()?;
+            .collect::<TelemetryResult<HashMap<_, _>>>()?;
         Ok(Self {
             record_count,
             message_trigrams,
@@ -469,13 +473,13 @@ impl PersistentQueryIndex {
     /// Builds one immutable directory from block-local exact postings.
     pub fn from_blocks(
         mut blocks: Vec<(QueryBlockMetadata, BlockQueryIndex)>,
-    ) -> LogDbResult<Self> {
+    ) -> TelemetryResult<Self> {
         blocks.sort_unstable_by_key(|(metadata, _)| metadata.block_ordinal);
         if blocks
             .windows(2)
             .any(|pair| pair[0].0.block_ordinal == pair[1].0.block_ordinal)
         {
-            return Err(LogDbError::InvalidBlockEncoding(
+            return Err(TelemetryError::InvalidBlockEncoding(
                 "duplicate query block ordinal",
             ));
         }
@@ -494,7 +498,7 @@ impl PersistentQueryIndex {
                 || metadata.first_offset > metadata.last_offset
                 || metadata.min_timestamp_unix_nanos > metadata.max_timestamp_unix_nanos
             {
-                return Err(LogDbError::InvalidBlockEncoding(
+                return Err(TelemetryError::InvalidBlockEncoding(
                     "invalid query block metadata",
                 ));
             }
@@ -886,11 +890,11 @@ impl PersistentQueryIndex {
     }
 
     /// Encodes the complete immutable directory with hybrid delta/run postings.
-    pub fn encode(&self) -> LogDbResult<Vec<u8>> {
+    pub fn encode(&self) -> TelemetryResult<Vec<u8>> {
         let mut encoded = Vec::new();
         encoded.extend_from_slice(QUERY_INDEX_MAGIC);
         write_varint(
-            u64::try_from(self.blocks.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+            u64::try_from(self.blocks.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
             &mut encoded,
         );
         for (block_index, metadata) in self.blocks.iter().enumerate() {
@@ -921,7 +925,7 @@ impl PersistentQueryIndex {
                 .collect::<Vec<_>>();
             terms.sort_unstable_by(|left, right| left.0.cmp(right.0));
             write_varint(
-                u64::try_from(terms.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+                u64::try_from(terms.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
                 &mut encoded,
             );
             for (term, posting) in terms {
@@ -945,7 +949,7 @@ impl PersistentQueryIndex {
                 left.0.cmp(right.0).then_with(|| left.1.cmp(right.1))
             });
             write_varint(
-                u64::try_from(fields.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+                u64::try_from(fields.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
                 &mut encoded,
             );
             for (key, value, posting) in fields {
@@ -958,9 +962,9 @@ impl PersistentQueryIndex {
     }
 
     /// Decodes and validates one immutable query directory.
-    pub fn decode(encoded: &[u8]) -> LogDbResult<Self> {
+    pub fn decode(encoded: &[u8]) -> TelemetryResult<Self> {
         if encoded.get(..QUERY_INDEX_MAGIC.len()) != Some(QUERY_INDEX_MAGIC) {
-            return Err(LogDbError::InvalidBlockEncoding(
+            return Err(TelemetryError::InvalidBlockEncoding(
                 "missing query index magic",
             ));
         }
@@ -972,26 +976,31 @@ impl PersistentQueryIndex {
             let block_ordinal = read_u32(encoded, &mut cursor)?;
             let topic_end = cursor
                 .checked_add(16)
-                .ok_or(LogDbError::InvalidBlockEncoding("query topic overflow"))?;
+                .ok_or(TelemetryError::InvalidBlockEncoding("query topic overflow"))?;
             let topic_id = TopicId::new(u128::from_le_bytes(
                 encoded
                     .get(cursor..topic_end)
-                    .ok_or(LogDbError::InvalidBlockEncoding("truncated query topic"))?
+                    .ok_or(TelemetryError::InvalidBlockEncoding(
+                        "truncated query topic",
+                    ))?
                     .try_into()
-                    .map_err(|_| LogDbError::InvalidBlockEncoding("invalid query topic"))?,
+                    .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid query topic"))?,
             ));
             cursor = topic_end;
-            let partition_end = cursor
-                .checked_add(4)
-                .ok_or(LogDbError::InvalidBlockEncoding("query partition overflow"))?;
+            let partition_end =
+                cursor
+                    .checked_add(4)
+                    .ok_or(TelemetryError::InvalidBlockEncoding(
+                        "query partition overflow",
+                    ))?;
             let partition_id = LogicalPartitionId::new(u32::from_le_bytes(
                 encoded
                     .get(cursor..partition_end)
-                    .ok_or(LogDbError::InvalidBlockEncoding(
+                    .ok_or(TelemetryError::InvalidBlockEncoding(
                         "truncated query partition",
                     ))?
                     .try_into()
-                    .map_err(|_| LogDbError::InvalidBlockEncoding("invalid query partition"))?,
+                    .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid query partition"))?,
             ));
             cursor = partition_end;
             let first_offset = LogicalOffset::new(read_varint(encoded, &mut cursor)?);
@@ -1000,11 +1009,11 @@ impl PersistentQueryIndex {
             let max_timestamp_unix_nanos = read_varint(encoded, &mut cursor)?;
             let record_count = read_u32(encoded, &mut cursor)?;
             let trigram_end = cursor.checked_add(MESSAGE_TRIGRAM_FILTER_BYTES).ok_or(
-                LogDbError::InvalidBlockEncoding("message trigram filter overflow"),
+                TelemetryError::InvalidBlockEncoding("message trigram filter overflow"),
             )?;
             let message_trigrams =
                 MessageTrigramFilter::from_bytes(encoded.get(cursor..trigram_end).ok_or(
-                    LogDbError::InvalidBlockEncoding("truncated message trigram filter"),
+                    TelemetryError::InvalidBlockEncoding("truncated message trigram filter"),
                 )?)?;
             cursor = trigram_end;
             let term_count = read_usize(encoded, &mut cursor)?;
@@ -1014,7 +1023,9 @@ impl PersistentQueryIndex {
                 let term = decode_text(read_bytes(encoded, &mut cursor)?)?;
                 let posting = decode_posting(encoded, &mut cursor, record_count)?;
                 if term_postings.insert(term, posting).is_some() {
-                    return Err(LogDbError::InvalidBlockEncoding("duplicate indexed term"));
+                    return Err(TelemetryError::InvalidBlockEncoding(
+                        "duplicate indexed term",
+                    ));
                 }
             }
             let field_count = read_usize(encoded, &mut cursor)?;
@@ -1030,7 +1041,9 @@ impl PersistentQueryIndex {
                     .insert(value, posting)
                     .is_some()
                 {
-                    return Err(LogDbError::InvalidBlockEncoding("duplicate indexed field"));
+                    return Err(TelemetryError::InvalidBlockEncoding(
+                        "duplicate indexed field",
+                    ));
                 }
             }
             blocks.push((
@@ -1052,7 +1065,7 @@ impl PersistentQueryIndex {
             ));
         }
         if cursor != encoded.len() {
-            return Err(LogDbError::InvalidBlockEncoding(
+            return Err(TelemetryError::InvalidBlockEncoding(
                 "trailing query index bytes",
             ));
         }
@@ -1060,16 +1073,16 @@ impl PersistentQueryIndex {
     }
 
     /// Encodes and wraps the query directory in one zstd frame.
-    pub fn encode_compressed(&self, level: i32) -> LogDbResult<Vec<u8>> {
+    pub fn encode_compressed(&self, level: i32) -> TelemetryResult<Vec<u8>> {
         let uncompressed = self.encode()?;
         let compressed = zstd::bulk::compress(&uncompressed, level)
-            .map_err(|error| LogDbError::CompressionFailed(error.to_string()))?;
+            .map_err(|error| TelemetryError::CompressionFailed(error.to_string()))?;
         let mut encoded =
             Vec::with_capacity(COMPRESSED_QUERY_INDEX_MAGIC.len() + 8 + compressed.len());
         encoded.extend_from_slice(COMPRESSED_QUERY_INDEX_MAGIC);
         encoded.extend_from_slice(
             &u64::try_from(uncompressed.len())
-                .map_err(|_| LogDbError::RecordTooLarge)?
+                .map_err(|_| TelemetryError::RecordTooLarge)?
                 .to_le_bytes(),
         );
         encoded.extend_from_slice(&compressed);
@@ -1077,9 +1090,9 @@ impl PersistentQueryIndex {
     }
 
     /// Decodes a zstd-wrapped immutable query directory.
-    pub fn decode_compressed(encoded: &[u8]) -> LogDbResult<Self> {
+    pub fn decode_compressed(encoded: &[u8]) -> TelemetryResult<Self> {
         if encoded.get(..COMPRESSED_QUERY_INDEX_MAGIC.len()) != Some(COMPRESSED_QUERY_INDEX_MAGIC) {
-            return Err(LogDbError::InvalidBlockEncoding(
+            return Err(TelemetryError::InvalidBlockEncoding(
                 "missing compressed query index magic",
             ));
         }
@@ -1087,22 +1100,24 @@ impl PersistentQueryIndex {
         let uncompressed_len = usize::try_from(u64::from_le_bytes(
             encoded
                 .get(COMPRESSED_QUERY_INDEX_MAGIC.len()..length_end)
-                .ok_or(LogDbError::InvalidBlockEncoding(
+                .ok_or(TelemetryError::InvalidBlockEncoding(
                     "truncated query index length",
                 ))?
                 .try_into()
-                .map_err(|_| LogDbError::InvalidBlockEncoding("invalid query index length"))?,
+                .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid query index length"))?,
         ))
-        .map_err(|_| LogDbError::InvalidBlockEncoding("query index length does not fit usize"))?;
+        .map_err(|_| {
+            TelemetryError::InvalidBlockEncoding("query index length does not fit usize")
+        })?;
         let uncompressed = zstd::bulk::decompress(
             encoded
                 .get(length_end..)
-                .ok_or(LogDbError::InvalidBlockEncoding(
+                .ok_or(TelemetryError::InvalidBlockEncoding(
                     "truncated compressed query index",
                 ))?,
             uncompressed_len,
         )
-        .map_err(|_| LogDbError::InvalidBlockEncoding("invalid compressed query index"))?;
+        .map_err(|_| TelemetryError::InvalidBlockEncoding("invalid compressed query index"))?;
         Self::decode(&uncompressed)
     }
 
@@ -1341,7 +1356,7 @@ fn posting_runs(posting: &[u32]) -> Vec<OrdinalRun> {
     runs
 }
 
-fn encode_posting(posting: &PostingList, encoded: &mut Vec<u8>) -> LogDbResult<()> {
+fn encode_posting(posting: &PostingList, encoded: &mut Vec<u8>) -> TelemetryResult<()> {
     if let PostingList::Runs { runs, .. } = posting {
         return encode_run_posting(runs, encoded);
     }
@@ -1351,13 +1366,13 @@ fn encode_posting(posting: &PostingList, encoded: &mut Vec<u8>) -> LogDbResult<(
     let mut delta = Vec::new();
     delta.push(DELTA_POSTING);
     write_varint(
-        u64::try_from(posting.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+        u64::try_from(posting.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
         &mut delta,
     );
     let mut previous = 0u32;
     for (index, ordinal) in posting.iter().copied().enumerate() {
         if index > 0 && ordinal <= previous {
-            return Err(LogDbError::InvalidBlockEncoding(
+            return Err(TelemetryError::InvalidBlockEncoding(
                 "query posting is not ordered",
             ));
         }
@@ -1368,13 +1383,13 @@ fn encode_posting(posting: &PostingList, encoded: &mut Vec<u8>) -> LogDbResult<(
     Ok(())
 }
 
-fn encode_run_posting(runs: &[OrdinalRun], encoded: &mut Vec<u8>) -> LogDbResult<()> {
+fn encode_run_posting(runs: &[OrdinalRun], encoded: &mut Vec<u8>) -> TelemetryResult<()> {
     if runs.is_empty() {
-        return Err(LogDbError::InvalidBlockEncoding("empty query posting"));
+        return Err(TelemetryError::InvalidBlockEncoding("empty query posting"));
     }
     encoded.push(RUN_POSTING);
     write_varint(
-        u64::try_from(runs.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+        u64::try_from(runs.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
         encoded,
     );
     let mut previous_end = 0u32;
@@ -1390,7 +1405,7 @@ fn decode_posting(
     encoded: &[u8],
     cursor: &mut usize,
     record_count: u32,
-) -> LogDbResult<PostingList> {
+) -> TelemetryResult<PostingList> {
     match read_byte(encoded, cursor)? {
         DELTA_POSTING => {
             let count = read_usize(encoded, cursor)?;
@@ -1402,11 +1417,11 @@ fn decode_posting(
                 let ordinal =
                     previous
                         .checked_add(delta)
-                        .ok_or(LogDbError::InvalidBlockEncoding(
+                        .ok_or(TelemetryError::InvalidBlockEncoding(
                             "query posting delta overflow",
                         ))?;
                 if ordinal >= record_count || (index > 0 && ordinal <= previous) {
-                    return Err(LogDbError::InvalidBlockEncoding(
+                    return Err(TelemetryError::InvalidBlockEncoding(
                         "invalid query posting ordinal",
                     ));
                 }
@@ -1414,7 +1429,7 @@ fn decode_posting(
                 previous = ordinal;
             }
             if posting.is_empty() {
-                return Err(LogDbError::InvalidBlockEncoding("empty query posting"));
+                return Err(TelemetryError::InvalidBlockEncoding("empty query posting"));
             }
             Ok(PostingList::Ordinals(posting))
         }
@@ -1426,37 +1441,37 @@ fn decode_posting(
             let mut previous_end = 0u32;
             for _ in 0..run_count {
                 let start = previous_end.checked_add(read_u32(encoded, cursor)?).ok_or(
-                    LogDbError::InvalidBlockEncoding("query posting run overflow"),
+                    TelemetryError::InvalidBlockEncoding("query posting run overflow"),
                 )?;
                 let length = read_u32(encoded, cursor)?;
                 let end = start
                     .checked_add(length)
-                    .ok_or(LogDbError::InvalidBlockEncoding(
+                    .ok_or(TelemetryError::InvalidBlockEncoding(
                         "query posting run overflow",
                     ))?;
                 if length == 0 || end > record_count {
-                    return Err(LogDbError::InvalidBlockEncoding(
+                    return Err(TelemetryError::InvalidBlockEncoding(
                         "invalid query posting run",
                     ));
                 }
                 cardinality = cardinality
                     .checked_add(usize::try_from(length).map_err(|_| {
-                        LogDbError::InvalidBlockEncoding(
+                        TelemetryError::InvalidBlockEncoding(
                             "query posting cardinality does not fit usize",
                         )
                     })?)
-                    .ok_or(LogDbError::InvalidBlockEncoding(
+                    .ok_or(TelemetryError::InvalidBlockEncoding(
                         "query posting cardinality overflow",
                     ))?;
                 runs.push(OrdinalRun { start, length });
                 previous_end = end;
             }
             if runs.is_empty() {
-                return Err(LogDbError::InvalidBlockEncoding("empty query posting"));
+                return Err(TelemetryError::InvalidBlockEncoding("empty query posting"));
             }
             Ok(PostingList::Runs { runs, cardinality })
         }
-        _ => Err(LogDbError::InvalidBlockEncoding(
+        _ => Err(TelemetryError::InvalidBlockEncoding(
             "unknown query posting encoding",
         )),
     }
@@ -1470,9 +1485,9 @@ fn normalize_term(term: &str) -> Cow<'_, str> {
     }
 }
 
-fn append_bytes(bytes: &[u8], encoded: &mut Vec<u8>) -> LogDbResult<()> {
+fn append_bytes(bytes: &[u8], encoded: &mut Vec<u8>) -> TelemetryResult<()> {
     write_varint(
-        u64::try_from(bytes.len()).map_err(|_| LogDbError::RecordTooLarge)?,
+        u64::try_from(bytes.len()).map_err(|_| TelemetryError::RecordTooLarge)?,
         encoded,
     );
     encoded.extend_from_slice(bytes);
@@ -1487,14 +1502,14 @@ fn write_varint(mut value: u64, encoded: &mut Vec<u8>) {
     encoded.push(value as u8);
 }
 
-fn read_varint(encoded: &[u8], cursor: &mut usize) -> LogDbResult<u64> {
+fn read_varint(encoded: &[u8], cursor: &mut usize) -> TelemetryResult<u64> {
     let mut value = 0u64;
     let mut shift = 0u32;
     loop {
         let byte = read_byte(encoded, cursor)?;
         let payload = u64::from(byte & 0x7f);
         if shift > 63 || (shift == 63 && payload > 1) {
-            return Err(LogDbError::InvalidBlockEncoding(
+            return Err(TelemetryError::InvalidBlockEncoding(
                 "query index varint overflow",
             ));
         }
@@ -1504,62 +1519,64 @@ fn read_varint(encoded: &[u8], cursor: &mut usize) -> LogDbResult<u64> {
         }
         shift = shift.saturating_add(7);
         if shift > 63 {
-            return Err(LogDbError::InvalidBlockEncoding(
+            return Err(TelemetryError::InvalidBlockEncoding(
                 "query index varint too long",
             ));
         }
     }
 }
 
-fn read_byte(encoded: &[u8], cursor: &mut usize) -> LogDbResult<u8> {
+fn read_byte(encoded: &[u8], cursor: &mut usize) -> TelemetryResult<u8> {
     let byte = *encoded
         .get(*cursor)
-        .ok_or(LogDbError::InvalidBlockEncoding("truncated query index"))?;
+        .ok_or(TelemetryError::InvalidBlockEncoding(
+            "truncated query index",
+        ))?;
     *cursor = cursor
         .checked_add(1)
-        .ok_or(LogDbError::InvalidBlockEncoding(
+        .ok_or(TelemetryError::InvalidBlockEncoding(
             "query index cursor overflow",
         ))?;
     Ok(byte)
 }
 
-fn read_u32(encoded: &[u8], cursor: &mut usize) -> LogDbResult<u32> {
+fn read_u32(encoded: &[u8], cursor: &mut usize) -> TelemetryResult<u32> {
     u32::try_from(read_varint(encoded, cursor)?)
-        .map_err(|_| LogDbError::InvalidBlockEncoding("query index value does not fit u32"))
+        .map_err(|_| TelemetryError::InvalidBlockEncoding("query index value does not fit u32"))
 }
 
-fn read_usize(encoded: &[u8], cursor: &mut usize) -> LogDbResult<usize> {
+fn read_usize(encoded: &[u8], cursor: &mut usize) -> TelemetryResult<usize> {
     usize::try_from(read_varint(encoded, cursor)?)
-        .map_err(|_| LogDbError::InvalidBlockEncoding("query index value does not fit usize"))
+        .map_err(|_| TelemetryError::InvalidBlockEncoding("query index value does not fit usize"))
 }
 
-fn read_bytes<'a>(encoded: &'a [u8], cursor: &mut usize) -> LogDbResult<&'a [u8]> {
+fn read_bytes<'a>(encoded: &'a [u8], cursor: &mut usize) -> TelemetryResult<&'a [u8]> {
     let length = read_usize(encoded, cursor)?;
     let end = cursor
         .checked_add(length)
-        .ok_or(LogDbError::InvalidBlockEncoding(
+        .ok_or(TelemetryError::InvalidBlockEncoding(
             "query index byte length overflow",
         ))?;
     let bytes = encoded
         .get(*cursor..end)
-        .ok_or(LogDbError::InvalidBlockEncoding(
+        .ok_or(TelemetryError::InvalidBlockEncoding(
             "truncated query index bytes",
         ))?;
     *cursor = end;
     Ok(bytes)
 }
 
-fn decode_text(bytes: &[u8]) -> LogDbResult<Arc<str>> {
+fn decode_text(bytes: &[u8]) -> TelemetryResult<Arc<str>> {
     std::str::from_utf8(bytes)
         .map(Arc::<str>::from)
-        .map_err(|_| LogDbError::InvalidBlockEncoding("query index text is not UTF-8"))
+        .map_err(|_| TelemetryError::InvalidBlockEncoding("query index text is not UTF-8"))
 }
 
-fn ensure_count(count: usize, remaining: usize) -> LogDbResult<()> {
+fn ensure_count(count: usize, remaining: usize) -> TelemetryResult<()> {
     if count <= remaining {
         Ok(())
     } else {
-        Err(LogDbError::InvalidBlockEncoding(
+        Err(TelemetryError::InvalidBlockEncoding(
             "query index count exceeds remaining bytes",
         ))
     }
@@ -1571,16 +1588,16 @@ mod tests {
 
     use super::*;
     use crate::{
-        CaseSensitivity, CompressionCohortId, DurableLogRecord, LogPredicate, LogStripe,
-        MetadataField, NumericComparison, StripeConfig, TextMatchKind, TextMatcher,
-        decode_structural_block, encode_structural_records,
+        CaseSensitivity, CompressionCohortId, DurableLog, LogPredicate, LogStripe, MetadataField,
+        NumericComparison, StripeConfig, TextMatchKind, TextMatcher, decode_structural_block,
+        encode_structural_records,
     };
 
     fn partition() -> TopicPartition {
         TopicPartition::new(TopicId::new(9), LogicalPartitionId::new(3))
     }
 
-    fn records(start: u64, count: u64) -> Vec<DurableLogRecord> {
+    fn records(start: u64, count: u64) -> Vec<DurableLog> {
         (start..start + count)
             .map(|offset| {
                 let mut message = format!("common request_id={offset}");
@@ -1590,7 +1607,7 @@ mod tests {
                 if offset % 100 == 0 {
                     message.push_str(" rare");
                 }
-                DurableLogRecord::new(
+                DurableLog::new(
                     ShardId::new(1),
                     partition(),
                     LogicalOffset::new(offset),
@@ -1603,7 +1620,7 @@ mod tests {
             .collect()
     }
 
-    fn compatibility_records(count: u64) -> Vec<DurableLogRecord> {
+    fn compatibility_records(count: u64) -> Vec<DurableLog> {
         (0..count)
             .map(|offset| {
                 let message = match offset % 4 {
@@ -1612,7 +1629,7 @@ mod tests {
                     2 => format!("WARN request {offset} timed out after 250ms"),
                     _ => format!("DEBUG heartbeat node-{offset}"),
                 };
-                DurableLogRecord::new(
+                DurableLog::new(
                     ShardId::new(1),
                     partition(),
                     LogicalOffset::new(offset),
@@ -1643,10 +1660,7 @@ mod tests {
             .collect()
     }
 
-    fn compatibility_index(
-        records: &[DurableLogRecord],
-        block_records: usize,
-    ) -> PersistentQueryIndex {
+    fn compatibility_index(records: &[DurableLog], block_records: usize) -> PersistentQueryIndex {
         PersistentQueryIndex::from_blocks(
             records
                 .chunks(block_records)
@@ -1661,10 +1675,10 @@ mod tests {
 
     fn cold_matches(
         index: &PersistentQueryIndex,
-        records: &[DurableLogRecord],
+        records: &[DurableLog],
         block_records: usize,
         query: &LogQuery,
-    ) -> Vec<DurableLogRecord> {
+    ) -> Vec<DurableLog> {
         let candidates = index.candidate_hits(query).into_iter().map(|hit| {
             let index = usize::try_from(hit.block_ordinal).expect("block fits") * block_records
                 + usize::try_from(hit.record_ordinal).expect("record fits");
@@ -1675,7 +1689,7 @@ mod tests {
 
     fn indexed_block(
         block_ordinal: u32,
-        records: &[DurableLogRecord],
+        records: &[DurableLog],
     ) -> (QueryBlockMetadata, BlockQueryIndex) {
         let (min_timestamp_unix_nanos, max_timestamp_unix_nanos) =
             records
@@ -1792,7 +1806,7 @@ mod tests {
 
     #[test]
     fn duplicate_metadata_fields_are_indexed_once() {
-        let record = DurableLogRecord {
+        let record = DurableLog {
             fields: vec![
                 MetadataField::new("service", "api"),
                 MetadataField::new("service", "api"),
@@ -2097,7 +2111,7 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(offset, message)| {
-                DurableLogRecord::new(
+                DurableLog::new(
                     ShardId::new(1),
                     partition(),
                     LogicalOffset::new(u64::try_from(offset).expect("offset fits")),
@@ -2191,7 +2205,7 @@ mod tests {
         let (stored, queried) = collision.expect("the bounded hash has a printable collision");
         let stored = String::from_utf8(stored.to_vec()).expect("printable bytes are UTF-8");
         let queried = String::from_utf8(queried.to_vec()).expect("printable bytes are UTF-8");
-        let record = DurableLogRecord::new(
+        let record = DurableLog::new(
             ShardId::new(1),
             partition(),
             LogicalOffset::new(0),

@@ -9,8 +9,8 @@ fi
 RESULT_DIR=$1
 shift
 INPUTS=("$@")
-INTERLEAVE_BIN=${INTERLEAVE_BIN:-target/release/shard-log-interleave}
-SHARD_LOG_BIN=${SHARD_LOG_BIN:-target/release/shard-log-structural-bench}
+INTERLEAVE_BIN=${INTERLEAVE_BIN:-target/release/shard-telemetry-interleave}
+SHARD_TELEMETRY_BIN=${SHARD_TELEMETRY_BIN:-target/release/shard-telemetry-structural-bench}
 CPU_SET=${CPU_SET:-0-15}
 WORKERS=${WORKERS:-16}
 BLOCK_BYTES=${BLOCK_BYTES:-8MiB}
@@ -24,8 +24,8 @@ LIMIT_BYTES=${LIMIT_BYTES:-85899345920}
     echo "interleave binary is not executable: $INTERLEAVE_BIN" >&2
     exit 2
 }
-[[ -x $SHARD_LOG_BIN ]] || {
-    echo "structural benchmark binary is not executable: $SHARD_LOG_BIN" >&2
+[[ -x $SHARD_TELEMETRY_BIN ]] || {
+    echo "structural benchmark binary is not executable: $SHARD_TELEMETRY_BIN" >&2
     exit 2
 }
 for input in "${INPUTS[@]}"; do
@@ -53,7 +53,7 @@ for mode in disabled enabled; do
     dd if="$INTERLEAVED" of=/dev/null bs=64M status=none
     /usr/bin/time -f 'wall_seconds=%e\nuser_seconds=%U\nsystem_seconds=%S\nmax_rss_kib=%M' \
         -o "$RESULT_DIR/${mode}-time.txt" \
-        taskset -c "$CPU_SET" "$SHARD_LOG_BIN" "$INTERLEAVED" \
+        taskset -c "$CPU_SET" "$SHARD_TELEMETRY_BIN" "$INTERLEAVED" \
         --limit-bytes "$(stat -c %s "$INTERLEAVED")" \
         --block-bytes "$BLOCK_BYTES" \
         --workers "$WORKERS" \

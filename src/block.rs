@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use shard_stream_core::{LogicalOffset, ShardId, TopicPartition};
 
-use crate::{CompressionCohortId, CompressionPlacementId, DictionaryId, LogDbError, LogDbResult};
+use crate::{
+    CompressionCohortId, CompressionPlacementId, DictionaryId, TelemetryError, TelemetryResult,
+};
 
 /// Compression format used for one sealed log block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,7 +138,7 @@ impl BlockCatalog {
         &mut self,
         block_id: BlockId,
         object_key: impl Into<Arc<str>>,
-    ) -> LogDbResult<()> {
+    ) -> TelemetryResult<()> {
         self.mark_offloaded_range(block_id, object_key, 0)
     }
 
@@ -146,11 +148,11 @@ impl BlockCatalog {
         block_id: BlockId,
         object_key: impl Into<Arc<str>>,
         object_offset: u64,
-    ) -> LogDbResult<()> {
+    ) -> TelemetryResult<()> {
         let block = self
             .blocks
             .get_mut(&block_id)
-            .ok_or_else(|| LogDbError::UnknownBlock(block_id.get()))?;
+            .ok_or_else(|| TelemetryError::UnknownBlock(block_id.get()))?;
         block.object_key = Some(object_key.into());
         block.object_offset = Some(object_offset);
         self.staged_payloads.remove(&block_id);

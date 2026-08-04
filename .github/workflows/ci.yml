@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  quality:
+    name: Rust quality gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.93.0 --profile minimal --component rustfmt,clippy
+      - name: Verify formatting
+        run: cargo fmt --all -- --check
+      - name: Lint every target
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Test every target
+        run: cargo test --workspace --all-targets --all-features --locked
+      - name: Build release artifacts
+        run: cargo build --workspace --all-targets --all-features --release --locked
+      - name: Verify public documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps --locked
+
+  supply-chain:
+    name: Dependency and license gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.93.0 --profile minimal
+      - name: Install audit tools
+        run: |
+          cargo install cargo-audit --version 0.22.2 --locked
+          cargo install cargo-deny --version 0.20.2 --locked
+      - name: Reject vulnerable dependencies
+        run: cargo audit --deny warnings
+      - name: Enforce licenses, sources, and dependency policy
+        run: cargo deny check
+      - name: Verify distribution license files
+        run: |
+          test -s LICENSE
+          test -s NOTICE
+          grep -q '^                                 Apache License$' LICENSE
+          grep -q '^license = "Apache-2.0"$' Cargo.toml
+
+  minimum-supported-rust:
+    name: Rust 1.93 contract
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install minimum supported Rust
+        run: rustup toolchain install 1.93.0 --profile minimal
+      - name: Check with declared MSRV
+        run: cargo check --workspace --all-targets --all-features --locked

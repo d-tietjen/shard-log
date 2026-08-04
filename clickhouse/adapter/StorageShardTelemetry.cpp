@@ -1,4 +1,4 @@
-#include <Storages/StorageShardLog.h>
+#include <Storages/StorageShardTelemetry.h>
 
 #include <Columns/IColumn.h>
 #include <Common/Exception.h>
@@ -271,7 +271,7 @@ bool addMapEquality(
         value = constantString(left);
     }
     /// ClickHouse returns the String default ("") for a missing Map key.
-    /// ShardLog's exact-field index distinguishes missing from stored empty,
+    /// ShardTelemetry's exact-field index distinguishes missing from stored empty,
     /// so empty equality must remain a residual predicate.
     if (!element || !value || value->empty())
         return false;
@@ -310,15 +310,15 @@ void collectPushdown(const ActionsDAG::Node * node, const InputColumns & inputs,
     pushdown.fully_supported = false;
 }
 
-bool isShardLogColumn(const String & name)
+bool isShardTelemetryColumn(const String & name)
 {
     return name == "tenant" || name == "timestamp" || name == "partition" || name == "offset"
         || name == "message" || name == "labels" || name == "metadata";
 }
 
-std::optional<String> physicalShardLogColumn(const String & name)
+std::optional<String> physicalShardTelemetryColumn(const String & name)
 {
-    if (isShardLogColumn(name))
+    if (isShardTelemetryColumn(name))
         return name;
     if (name.starts_with("labels."))
         return "labels";
@@ -336,7 +336,7 @@ std::optional<String> projection(const Names & column_names)
     String result;
     for (const auto & name : column_names)
     {
-        auto physical_name = physicalShardLogColumn(name);
+        auto physical_name = physicalShardTelemetryColumn(name);
         if (!physical_name)
             return std::nullopt;
         if (!seen.emplace(*physical_name).second)
@@ -352,7 +352,7 @@ std::optional<String> projection(const Names & column_names)
 
 }
 
-std::vector<std::pair<std::string, std::string>> StorageShardLog::getReadURIParams(
+std::vector<std::pair<std::string, std::string>> StorageShardTelemetry::getReadURIParams(
     const Names & column_names,
     const StorageSnapshotPtr &,
     const SelectQueryInfo & query_info,
@@ -386,19 +386,19 @@ std::vector<std::pair<std::string, std::string>> StorageShardLog::getReadURIPara
     return params;
 }
 
-void registerStorageShardLog(StorageFactory & factory)
+void registerStorageShardTelemetry(StorageFactory & factory)
 {
     factory.registerStorage(
-        "ShardLog",
+        "ShardTelemetry",
         [](const StorageFactory::Arguments & args)
         {
             ASTs & engine_args = args.engine_args;
             auto configuration = StorageURL::getConfiguration(engine_args, args.getLocalContext(), &args.table_id);
             if (configuration.format != "ArrowStream")
-                throw Exception(ErrorCodes::BAD_ARGUMENTS, "ShardLog storage requires the ArrowStream format");
+                throw Exception(ErrorCodes::BAD_ARGUMENTS, "ShardTelemetry storage requires the ArrowStream format");
 
             auto context = args.getLocalContext();
-            return std::make_shared<StorageShardLog>(
+            return std::make_shared<StorageShardTelemetry>(
                 configuration.url,
                 args.table_id,
                 configuration.format,

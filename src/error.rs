@@ -4,14 +4,33 @@ use shard_stream_core::{LogicalOffset, ShardId, TopicPartition};
 
 use crate::DictionaryId;
 
-/// Result returned by shard-logdb operations.
-pub type LogDbResult<T> = Result<T, LogDbError>;
+/// Result returned by ShardTelemetry operations.
+pub type TelemetryResult<T> = Result<T, TelemetryError>;
 
-/// Error returned by shard-logdb operations.
+/// Error returned by ShardTelemetry operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LogDbError {
+pub enum TelemetryError {
     /// A required size limit was configured as zero.
     InvalidConfig(&'static str),
+    /// A signal-native bounded configuration is invalid.
+    InvalidConfiguration(String),
+    /// A checksummed STEL envelope is malformed.
+    InvalidTelemetryEnvelope(&'static str),
+    /// A durable STEL envelope exceeds the protocol safety limit.
+    TelemetryEnvelopeTooLarge,
+    /// An OTLP trace ID is not exactly 16 nonzero bytes.
+    InvalidTraceId,
+    /// An OTLP span ID is not exactly 8 nonzero bytes.
+    InvalidSpanId,
+    /// A metric point violates signal or temporal invariants.
+    InvalidMetricSample(String),
+    /// Remote Write supplied a different value at an existing timestamp.
+    MetricSampleConflict {
+        /// Canonical series fingerprint.
+        series: u128,
+        /// Conflicting sample timestamp.
+        timestamp_unix_nanos: u64,
+    },
     /// The same shard-stream shard was configured more than once.
     DuplicateStripe(ShardId),
     /// A record was routed to a stripe that is not configured.
@@ -109,10 +128,31 @@ pub enum LogDbError {
     MissingStagedPayload(u64),
 }
 
-impl fmt::Display for LogDbError {
+impl fmt::Display for TelemetryError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidConfig(message) => write!(formatter, "invalid configuration: {message}"),
+            Self::InvalidConfiguration(message) => {
+                write!(formatter, "invalid telemetry configuration: {message}")
+            }
+            Self::InvalidTelemetryEnvelope(message) => {
+                write!(formatter, "invalid STEL telemetry envelope: {message}")
+            }
+            Self::TelemetryEnvelopeTooLarge => {
+                formatter.write_str("STEL telemetry envelope exceeds the 64 MiB safety limit")
+            }
+            Self::InvalidTraceId => formatter.write_str("trace ID must be 16 nonzero bytes"),
+            Self::InvalidSpanId => formatter.write_str("span ID must be 8 nonzero bytes"),
+            Self::InvalidMetricSample(message) => {
+                write!(formatter, "invalid metric sample: {message}")
+            }
+            Self::MetricSampleConflict {
+                series,
+                timestamp_unix_nanos,
+            } => write!(
+                formatter,
+                "conflicting Remote Write sample for series {series:032x} at {timestamp_unix_nanos}"
+            ),
             Self::DuplicateStripe(shard_id) => {
                 write!(formatter, "duplicate stripe for shard {shard_id}")
             }
@@ -219,4 +259,4 @@ impl fmt::Display for LogDbError {
     }
 }
 
-impl std::error::Error for LogDbError {}
+impl std::error::Error for TelemetryError {}

@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BASELINE_RUN=${BASELINE_RUN:-/home/dtietjen/shard-log-query-head-to-head/80gib-v7-20260730T205000Z}
-SHARD_PACKS=${SHARD_PACKS:-$BASELINE_RUN/shard-log-packs}
+BASELINE_RUN=${BASELINE_RUN:-/home/dtietjen/shard-telemetry-query-head-to-head/80gib-v7-20260730T205000Z}
+SHARD_PACKS=${SHARD_PACKS:-$BASELINE_RUN/shard-telemetry-packs}
 CLICKHOUSE_SOURCE_DATA=${CLICKHOUSE_SOURCE_DATA:-$BASELINE_RUN/clickhouse-data}
-SHARD_LOG_QUERY_BIN=${SHARD_LOG_QUERY_BIN:-/home/dtietjen/shard-log-cold-query-20260730-v2/shard-log/target/release/shard-log-pack-query-bench}
-SOURCE_ARCHIVE=${SOURCE_ARCHIVE:-/home/dtietjen/shard-log-cold-query-20260730-v2.tar.gz}
-SHARD_STREAM_SOURCE=${SHARD_STREAM_SOURCE:-/home/dtietjen/shard-log-query-head-to-head-20260730-v7/shard-stream}
+SHARD_TELEMETRY_QUERY_BIN=${SHARD_TELEMETRY_QUERY_BIN:-/home/dtietjen/shard-telemetry-cold-query-20260730-v2/shard-telemetry/target/release/shard-telemetry-pack-query-bench}
+SOURCE_ARCHIVE=${SOURCE_ARCHIVE:-/home/dtietjen/shard-telemetry-cold-query-20260730-v2.tar.gz}
+SHARD_STREAM_SOURCE=${SHARD_STREAM_SOURCE:-/home/dtietjen/shard-telemetry-query-head-to-head-20260730-v7/shard-stream}
 SHARD_STREAM_REVISION=${SHARD_STREAM_REVISION:-13ee7903d42cabe9bd5c0df0fa8e4a4fdc660ea7}
 DSIM_REPOSITORY=${DSIM_REPOSITORY:-/home/dtietjen/deterministic-simulation}
-RESULT_ROOT=${RESULT_ROOT:-/home/dtietjen/shard-log-query-head-to-head}
+RESULT_ROOT=${RESULT_ROOT:-/home/dtietjen/shard-telemetry-query-head-to-head}
 RUN_ID=${RUN_ID:-cold-current-$(date -u +%Y%m%dT%H%M%SZ)}
 CORE_COUNT=${CORE_COUNT:-16}
 WARM_ITERATIONS=${WARM_ITERATIONS:-20}
@@ -32,7 +32,7 @@ done
 for path in \
     "$SHARD_PACKS" \
     "$CLICKHOUSE_SOURCE_DATA" \
-    "$SHARD_LOG_QUERY_BIN" \
+    "$SHARD_TELEMETRY_QUERY_BIN" \
     "$SOURCE_ARCHIVE" \
     "$SHARD_STREAM_SOURCE" \
     "$DSIM_REPOSITORY" \
@@ -61,7 +61,7 @@ RUN_DIR=$RESULT_ROOT/$RUN_ID
 mkdir -p "$RUN_DIR"
 exec > >(tee "$RUN_DIR/harness.log") 2>&1
 
-CH_CONTAINER="shard-log-cold-query-${RUN_ID//[^a-zA-Z0-9_.-]/-}"
+CH_CONTAINER="shard-telemetry-cold-query-${RUN_ID//[^a-zA-Z0-9_.-]/-}"
 CH_STARTED=0
 cleanup() {
     if [[ $CH_STARTED -eq 1 ]]; then
@@ -86,15 +86,15 @@ IMAGE_ID=$(docker image inspect "$CLICKHOUSE_IMAGE" --format '{{.Id}}')
     echo "shard_packs=$SHARD_PACKS"
     echo "shard_manifest_sha256=$(sha256sum "$SHARD_PACKS/manifest.bin" | awk '{ print $1 }')"
     echo "shard_index_sha256=$(sha256sum "$SHARD_PACKS/query-index.bin" | awk '{ print $1 }')"
-    echo "shard_query_binary=$SHARD_LOG_QUERY_BIN"
-    echo "shard_query_binary_sha256=$(sha256sum "$SHARD_LOG_QUERY_BIN" | awk '{ print $1 }')"
-    echo "shard_log_product_revision=unborn"
-    echo "shard_log_source_archive=$SOURCE_ARCHIVE"
-    echo "shard_log_source_archive_sha256=$(sha256sum "$SOURCE_ARCHIVE" | awk '{ print $1 }')"
+    echo "shard_query_binary=$SHARD_TELEMETRY_QUERY_BIN"
+    echo "shard_query_binary_sha256=$(sha256sum "$SHARD_TELEMETRY_QUERY_BIN" | awk '{ print $1 }')"
+    echo "shard_telemetry_product_revision=unborn"
+    echo "shard_telemetry_source_archive=$SOURCE_ARCHIVE"
+    echo "shard_telemetry_source_archive_sha256=$(sha256sum "$SOURCE_ARCHIVE" | awk '{ print $1 }')"
     echo "harness_script_sha256=$(sha256sum "$0" | awk '{ print $1 }')"
     echo "shard_stream_revision=$SHARD_STREAM_REVISION"
     echo "deterministic_simulation_revision=$(git -C "$DSIM_REPOSITORY" rev-parse HEAD)"
-    echo "provenance_gap=ShardLog repository is pre-release and has no commit; source is identified by archive and binary SHA-256"
+    echo "provenance_gap=ShardTelemetry repository is pre-release and has no commit; source is identified by archive and binary SHA-256"
     echo "clickhouse_source_data=$CLICKHOUSE_SOURCE_DATA"
     echo "clickhouse_image=$CLICKHOUSE_IMAGE"
     echo "physical_cpu_set=$CPU_SET"
@@ -185,8 +185,8 @@ run_shard_query() {
     local iterations=$2
     local cold_iterations=$3
     shift 3
-    echo "ShardLog: $name"
-    taskset -c "$CPU_SET" "$SHARD_LOG_QUERY_BIN" "$SHARD_PACKS" \
+    echo "ShardTelemetry: $name"
+    taskset -c "$CPU_SET" "$SHARD_TELEMETRY_QUERY_BIN" "$SHARD_PACKS" \
         --limit 100 \
         --iterations "$iterations" \
         --cold-iterations "$cold_iterations" \
@@ -262,8 +262,8 @@ run_pair error-and "$WARM_ITERATIONS" "$COLD_ITERATIONS" \
     "SELECT toUnixTimestamp64Nano(time),hex(stream),hex(log) FROM benchmark.logs WHERE hasAllTokens(log, 'cannot exception file access error') ORDER BY time DESC LIMIT 100" \
     --term cannot --term exception --term file --term access --term error
 run_pair term-miss "$WARM_ITERATIONS" "$COLD_ITERATIONS" \
-    "SELECT toUnixTimestamp64Nano(time),hex(stream),hex(log) FROM benchmark.logs WHERE hasToken(log, 'shardlogtermthatdoesnotexist') ORDER BY time DESC LIMIT 100" \
-    --term shardlogtermthatdoesnotexist
+    "SELECT toUnixTimestamp64Nano(time),hex(stream),hex(log) FROM benchmark.logs WHERE hasToken(log, 'shardtelemetrytermthatdoesnotexist') ORDER BY time DESC LIMIT 100" \
+    --term shardtelemetrytermthatdoesnotexist
 run_pair contains "$WARM_ITERATIONS" "$COLD_ITERATIONS" \
     "SELECT toUnixTimestamp64Nano(time),hex(stream),hex(log) FROM benchmark.logs WHERE positionCaseInsensitiveUTF8(log, 'Cannot log message') > 0 ORDER BY time DESC LIMIT 100" \
     --contains "Cannot log message"
@@ -271,8 +271,8 @@ run_pair regex "$WARM_ITERATIONS" "$COLD_ITERATIONS" \
     "SELECT toUnixTimestamp64Nano(time),hex(stream),hex(log) FROM benchmark.logs WHERE match(log, '^Cannot log message.*Poco::Exception') ORDER BY time DESC LIMIT 100" \
     --regex '^Cannot log message.*Poco::Exception'
 run_pair contains-miss "$MISS_ITERATIONS" "$MISS_ITERATIONS" \
-    "SELECT toUnixTimestamp64Nano(time),hex(stream),hex(log) FROM benchmark.logs WHERE positionCaseInsensitiveUTF8(log, 'shardlogsubstringthatdoesnotexist') > 0 ORDER BY time DESC LIMIT 100" \
-    --contains shardlogsubstringthatdoesnotexist
+    "SELECT toUnixTimestamp64Nano(time),hex(stream),hex(log) FROM benchmark.logs WHERE positionCaseInsensitiveUTF8(log, 'shardtelemetrysubstringthatdoesnotexist') > 0 ORDER BY time DESC LIMIT 100" \
+    --contains shardtelemetrysubstringthatdoesnotexist
 
 docker exec "$CH_CONTAINER" clickhouse-client --query 'SYSTEM FLUSH LOGS'
 docker exec "$CH_CONTAINER" clickhouse-client --query "

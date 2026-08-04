@@ -1,6 +1,6 @@
 # Query architecture
 
-ShardLog has two exact query tiers that share one `LogQuery` contract:
+ShardTelemetry has two exact query tiers that share one `LogQuery` contract:
 
 - the mutable stripe-local hot index for records still resident on the ingest
   shard; and
@@ -23,7 +23,7 @@ Positive metadata predicates use existential semantics when a record contains
 the same key more than once. `NOT` negates the complete child predicate, so
 negated field equality also matches a record where the field is absent.
 Regular expressions compile when the query is constructed and invalid
-expressions return `LogDbError::InvalidQuery`.
+expressions return `TelemetryError::InvalidQuery`.
 
 Queries are scoped to one `TopicPartition`. Cross-partition query language,
 aggregations, grouping, and faceting are coordinator/analytics features rather
@@ -43,11 +43,11 @@ Each stripe owns ordered postings per partition. A hot lookup:
 5. evaluates exact residual predicates when needed;
 6. applies deterministic ordering and limits before cloning complete records.
 
-`LogStripe::query_refs` returns only durable `RecordRef`s. `LogStripe::query`
+`LogStripe::query_refs` returns only durable `TelemetryRecordRef`s. `LogStripe::query`
 uses those references to clone complete visible records. Empty-filter queries
 use the partition's ordered record vector and materialize only the requested
 limit rather than allocating a full-range ordinal vector.
-`ShardLogDb::query_all` and `query_stripes` merge per-stripe top results and
+`ShardTelemetry::query_all` and `query_stripes` merge per-stripe top results and
 apply the global limit in the same deterministic order.
 
 All hot query state remains stripe-local. A lookup takes no cross-stripe lock,
@@ -55,7 +55,7 @@ channel, or global mutable counter.
 
 The ingest representation is ordinal-based. Each partition keeps append-only
 records and dense vectors of posting slots; postings contain `u32` record
-ordinals instead of full `RecordRef` values. Hash tables are touched only when
+ordinals instead of full `TelemetryRecordRef` values. Hash tables are touched only when
 a term or field pair is first interned and when a query resolves its borrowed
 constraint. Repeated messages reuse a bounded direct-mapped term-ID vector.
 Repeated immutable metadata vectors use a second bounded exact cache. The
@@ -192,7 +192,7 @@ evicted immutable record payload pages with `POSIX_FADV_DONTNEED` before every
 cold sample. This models a long-lived query process reading sealed data from
 local SSD; it does not include remote object-store request latency.
 
-With the trigram directory, indexed ShardLog lookups returning 100 records
+With the trigram directory, indexed ShardTelemetry lookups returning 100 records
 measured 1.34-2.18 ms warm and 1.78-2.62 ms cold at p50. Positive substring
 and regex lookups filtered one 59,299-record block in 79-86 ms. The
 cache-temperature penalty is small because checksum, decompression, and
@@ -206,11 +206,11 @@ Regex does not yet extract safe literal fragments, so the next residual-query
 optimizations are body-lane-only decode, regex literal-prefix extraction, and
 allocation-free vectorized evaluation inside surviving blocks.
 
-The monolithic persistent index remains a separate cold-start problem. Loading
-it takes about 23.1 seconds and expands 114,420,962 compressed bytes into
-15.90 GiB of posting arrays plus 80 MiB of trigram filters. Segmenting and
-mmap-querying compressed postings is required before process cold start can be
-considered production-ready.
+The monolithic benchmark index remains a useful cold-start baseline. Loading it
+takes about 23.1 seconds and expands 114,420,962 compressed bytes into 15.90
+GiB of posting arrays plus 80 MiB of trigram filters. The production path now
+uses independent object-tier query-index segments and loads only catalog groups
+selected by coarse bounds, avoiding that mandatory whole-corpus expansion.
 
 The persistent index is derived data. Its durable offset watermark must not
 advance until the corresponding block and index segment are durable. Recovery
@@ -245,16 +245,13 @@ expansion and startup cost is now the primary query-architecture priority.
 See [BENCHMARKS.md](BENCHMARKS.md) for the hot-index and real-pack tables,
 provenance, and evidence locations.
 
-## Remaining work
+## Remaining optimization work
 
-The object-tier catalog now requires one immutable query-index artifact per
-bounded block group and prunes catalog pages and groups before that artifact is
-loaded. The production worker still needs to construct and publish those
-segments when it closes each group. Inside a selected segment, planning should
-intersect compressed run/delta postings without materializing every ordinal
-array. The metadata SSD cache should retain only active roots, pages, and index
-directories. That preserves exact behavior while avoiding the measured 15.90
-GiB global expansion and mandatory whole-corpus index load. The monolithic
+The production worker constructs and publishes one immutable query-index
+artifact per bounded append-aligned group. Catalog pages and groups are pruned
+before that artifact is loaded, and candidate frames are range-read through the
+SSD cache. A future optimization can intersect compressed run/delta postings
+without materializing each selected segment's ordinal arrays. The monolithic
 benchmark file remains useful only for reproducible single-host comparisons.
 
 See [TIERED_STORAGE_ARCHITECTURE.md](TIERED_STORAGE_ARCHITECTURE.md) for the

@@ -402,7 +402,10 @@ fn build_loki_router(
         router
     };
     let router = if analytics_enabled {
-        router.route("/shardlog/api/v1/clickhouse/scan", get(clickhouse_scan))
+        router.route(
+            "/shardtelemetry/api/v1/clickhouse/scan",
+            get(clickhouse_scan),
+        )
     } else {
         router
     };
@@ -433,7 +436,7 @@ async fn production_gate(State(state): State<ApiState>, request: Request, next: 
     if matches!(path, "/ready" | "/metrics") {
         return next.run(request).await;
     }
-    let analytics = path == "/shardlog/api/v1/clickhouse/scan";
+    let analytics = path == "/shardtelemetry/api/v1/clickhouse/scan";
     if !analytics {
         let observed = bearer_token(request.headers());
         let authenticated = observed.is_some_and(|observed| runtime.authenticates(observed));
@@ -920,16 +923,86 @@ async fn query_range(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(params): Query<QueryParams>,
+    body: Bytes,
 ) -> Result<Json<Value>, LokiApiError> {
-    execute_stream_query(state, headers, params).await
+    let params = merge_form_query_params(&headers, params, &body)?;
+    execute_query(state, headers, params, QueryMode::Range).await
 }
 
 async fn query_instant(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(params): Query<QueryParams>,
+    body: Bytes,
 ) -> Result<Json<Value>, LokiApiError> {
-    execute_stream_query(state, headers, params).await
+    let params = merge_form_query_params(&headers, params, &body)?;
+    execute_query(state, headers, params, QueryMode::Instant).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryMode {
+    Instant,
+    Range,
+}
+
+async fn execute_query(
+    state: ApiState,
+    headers: HeaderMap,
+    params: QueryParams,
+    mode: QueryMode,
+) -> Result<Json<Value>, LokiApiError> {
+    let expression = params
+        .query
+        .as_deref()
+        .ok_or_else(|| LokiApiError::bad_request("query parameter is required"))?;
+    if expression.trim_start().starts_with('{') {
+        execute_stream_query(state, headers, params).await
+    } else {
+        execute_metric_query(state, headers, params, mode).await
+    }
+}
+
+fn merge_form_query_params(
+    headers: &HeaderMap,
+    mut url: QueryParams,
+    body: &[u8],
+) -> Result<QueryParams, LokiApiError> {
+    if body.is_empty() {
+        return Ok(url);
+    }
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    if content_type
+        .split(';')
+        .next()
+        .is_none_or(|value| value.trim() != "application/x-www-form-urlencoded")
+    {
+        return Err(LokiApiError::bad_request(
+            "POST query bodies must use application/x-www-form-urlencoded",
+        ));
+    }
+    let form: QueryParams = serde_urlencoded::from_bytes(body)
+        .map_err(|error| LokiApiError::bad_request(format!("invalid form body: {error}")))?;
+    macro_rules! overlay {
+        ($($field:ident),+ $(,)?) => {
+            $(if form.$field.is_some() { url.$field = form.$field; })+
+        };
+    }
+    overlay!(
+        query,
+        start,
+        end,
+        time,
+        since,
+        limit,
+        direction,
+        step,
+        line_limit,
+        field_limit,
+    );
+    Ok(url)
 }
 
 async fn execute_stream_query(
@@ -955,10 +1028,10 @@ async fn execute_stream_query(
     let total_bytes_processed = scanned.iter().map(|entry| entry.line.len()).sum::<usize>();
     let mut entries = scanned
         .into_iter()
-        .filter(|entry| {
-            entry.timestamp_unix_nanos >= start
-                && entry.timestamp_unix_nanos <= end
-                && selector.matches(entry)
+        .filter_map(|entry| {
+            (entry.timestamp_unix_nanos >= start && entry.timestamp_unix_nanos <= end)
+                .then(|| selector.process(entry))
+                .flatten()
         })
         .collect::<Vec<_>>();
     entries.sort_unstable_by_key(|entry| entry.timestamp_unix_nanos);
@@ -1000,6 +1073,1224 @@ async fn execute_stream_query(
             elapsed,
         ),
     )))
+}
+
+#[derive(Debug, Clone)]
+enum MetricExpression {
+    Scalar(f64),
+    Range {
+        operation: RangeOperation,
+        selector: LogSelector,
+        window_nanos: i64,
+        parameter: Option<f64>,
+    },
+    Aggregate {
+        operation: AggregateOperation,
+        grouping: Option<MetricGrouping>,
+        parameter: Option<usize>,
+        expression: Box<Self>,
+    },
+    Binary {
+        operation: BinaryOperation,
+        bool_mode: bool,
+        matching: VectorMatching,
+        left: Box<Self>,
+        right: Box<Self>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RangeOperation {
+    Count,
+    Rate,
+    Bytes,
+    BytesRate,
+    Absent,
+    Sum,
+    Average,
+    Minimum,
+    Maximum,
+    Stddev,
+    Stdvar,
+    Quantile,
+    First,
+    Last,
+    RateCounter,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AggregateOperation {
+    Sum,
+    Average,
+    Minimum,
+    Maximum,
+    Count,
+    Stddev,
+    Stdvar,
+    TopK,
+    BottomK,
+    Sort,
+    SortDescending,
+}
+
+#[derive(Debug, Clone)]
+enum MetricGrouping {
+    By(Vec<String>),
+    Without(Vec<String>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BinaryOperation {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    Modulo,
+    Power,
+    Equal,
+    NotEqual,
+    Greater,
+    GreaterEqual,
+    Less,
+    LessEqual,
+    And,
+    Or,
+    Unless,
+}
+
+#[derive(Debug, Clone, Default)]
+struct VectorMatching {
+    on: Option<Vec<String>>,
+    ignoring: Vec<String>,
+    cardinality: VectorCardinality,
+    include: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum VectorCardinality {
+    #[default]
+    OneToOne,
+    ManyToOne,
+    OneToMany,
+}
+
+#[derive(Debug, Clone)]
+struct MetricSample {
+    labels: BTreeMap<String, String>,
+    value: f64,
+}
+
+#[derive(Debug, Clone)]
+enum MetricValue {
+    Scalar(f64),
+    Vector(Vec<MetricSample>),
+}
+
+async fn execute_metric_query(
+    state: ApiState,
+    headers: HeaderMap,
+    params: QueryParams,
+    mode: QueryMode,
+) -> Result<Json<Value>, LokiApiError> {
+    let started = std::time::Instant::now();
+    let expression = parse_metric_expression(
+        params
+            .query
+            .as_deref()
+            .ok_or_else(|| LokiApiError::bad_request("query parameter is required"))?,
+    )?;
+    let tenant = tenant(&headers, &state.config);
+    let entries = entries_for(&state, &tenant).await?;
+    let total_lines_processed = entries.len();
+    let total_bytes_processed = entries.iter().map(|entry| entry.line.len()).sum::<usize>();
+    let (_, end) = query_range_bounds(&params)?;
+    let evaluation_times = match mode {
+        QueryMode::Instant => vec![end],
+        QueryMode::Range => metric_evaluation_times(&params, state.config.max_query_limit)?,
+    };
+    let limit = params
+        .limit
+        .unwrap_or(state.config.max_query_limit)
+        .min(state.config.max_query_limit);
+    let mut series = BTreeMap::<BTreeMap<String, String>, Vec<Value>>::new();
+    let mut scalar = None;
+    for timestamp in evaluation_times {
+        match evaluate_metric_expression(&expression, &entries, timestamp)? {
+            MetricValue::Scalar(value) => scalar = Some((timestamp, value)),
+            MetricValue::Vector(mut values) => {
+                values.sort_by(|left, right| left.labels.cmp(&right.labels));
+                values.truncate(limit);
+                for sample in values {
+                    series.entry(sample.labels).or_default().push(json!([
+                        timestamp as f64 / 1_000_000_000.0,
+                        format_metric_value(sample.value)
+                    ]));
+                }
+            }
+        }
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    let returned = series.values().map(Vec::len).sum();
+    let stats = query_stats(
+        total_bytes_processed,
+        total_lines_processed,
+        returned,
+        elapsed,
+    );
+    if let Some((timestamp, value)) = scalar {
+        return Ok(Json(json!({
+            "status": "success",
+            "data": {
+                "resultType": "scalar",
+                "result": [
+                    timestamp as f64 / 1_000_000_000.0,
+                    format_metric_value(value)
+                ],
+                "stats": stats
+            }
+        })));
+    }
+    let result_type = if mode == QueryMode::Instant {
+        "vector"
+    } else {
+        "matrix"
+    };
+    let result = series
+        .into_iter()
+        .map(|(metric, mut values)| {
+            if mode == QueryMode::Instant {
+                json!({"metric": metric, "value": values.pop().unwrap_or(Value::Null)})
+            } else {
+                json!({"metric": metric, "values": values})
+            }
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(success(result_type, result, stats)))
+}
+
+fn metric_evaluation_times(
+    params: &QueryParams,
+    maximum_points: usize,
+) -> Result<Vec<i64>, LokiApiError> {
+    let (start, end) = query_range_bounds(params)?;
+    let span = end.saturating_sub(start);
+    let default_step = (span / 250).max(1_000_000_000);
+    let step = match params.step.as_deref() {
+        Some(value) => parse_positive_step(value)?,
+        None => default_step,
+    };
+    let point_count = usize::try_from(span.div_euclid(step).saturating_add(1))
+        .map_err(|_| LokiApiError::bad_request("metric query has too many evaluation points"))?;
+    if point_count > maximum_points {
+        return Err(LokiApiError::bad_request(format!(
+            "metric query exceeds the {maximum_points}-point limit"
+        )));
+    }
+    Ok((0..point_count)
+        .map(|index| {
+            start.saturating_add(step.saturating_mul(i64::try_from(index).unwrap_or(i64::MAX)))
+        })
+        .collect())
+}
+
+fn parse_positive_step(value: &str) -> Result<i64, LokiApiError> {
+    let step = parse_duration_nanos(value)
+        .or_else(|| {
+            value
+                .parse::<f64>()
+                .ok()
+                .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+                .map(|seconds| (seconds * 1_000_000_000.0) as i64)
+        })
+        .filter(|step| *step > 0)
+        .ok_or_else(|| LokiApiError::bad_request("step must be a positive duration"))?;
+    Ok(step)
+}
+
+fn parse_metric_expression(input: &str) -> Result<MetricExpression, LokiApiError> {
+    let input = strip_outer_parentheses(input.trim());
+    if let Some((index, operator)) = find_top_level_binary_operator(input) {
+        let left = parse_metric_expression(&input[..index])?;
+        let (bool_mode, matching, right) = parse_vector_matching(
+            &input[index + operator.len()..],
+            binary_operation(operator)?,
+        )?;
+        return Ok(MetricExpression::Binary {
+            operation: binary_operation(operator)?,
+            bool_mode,
+            matching,
+            left: Box::new(left),
+            right: Box::new(parse_metric_expression(right)?),
+        });
+    }
+    if let Some(expression) = parse_aggregate_expression(input)? {
+        return Ok(expression);
+    }
+    if let Some(expression) = parse_range_expression(input)? {
+        return Ok(expression);
+    }
+    if let Ok(value) = input.parse::<f64>()
+        && value.is_finite()
+    {
+        return Ok(MetricExpression::Scalar(value));
+    }
+    Err(LokiApiError::bad_request(
+        "unsupported or invalid metric LogQL expression",
+    ))
+}
+
+fn parse_aggregate_expression(input: &str) -> Result<Option<MetricExpression>, LokiApiError> {
+    const OPERATIONS: [(&str, AggregateOperation); 13] = [
+        ("sort_desc", AggregateOperation::SortDescending),
+        ("bottomk", AggregateOperation::BottomK),
+        ("stddev", AggregateOperation::Stddev),
+        ("stdvar", AggregateOperation::Stdvar),
+        ("topk", AggregateOperation::TopK),
+        ("count", AggregateOperation::Count),
+        ("average", AggregateOperation::Average),
+        ("avg", AggregateOperation::Average),
+        ("maximum", AggregateOperation::Maximum),
+        ("max", AggregateOperation::Maximum),
+        ("minimum", AggregateOperation::Minimum),
+        ("min", AggregateOperation::Minimum),
+        ("sum", AggregateOperation::Sum),
+    ];
+    for (name, operation) in OPERATIONS {
+        let Some(mut rest) = input.strip_prefix(name) else {
+            continue;
+        };
+        if rest
+            .chars()
+            .next()
+            .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            continue;
+        }
+        rest = rest.trim_start();
+        let grouping = if let Some(after) = rest.strip_prefix("by") {
+            let (labels, remaining) = parse_grouping_clause(after)?;
+            rest = remaining;
+            Some(MetricGrouping::By(labels))
+        } else if let Some(after) = rest.strip_prefix("without") {
+            let (labels, remaining) = parse_grouping_clause(after)?;
+            rest = remaining;
+            Some(MetricGrouping::Without(labels))
+        } else {
+            None
+        };
+        let (arguments, trailing) = extract_parenthesized(rest.trim_start())?;
+        if !trailing.trim().is_empty() {
+            return Err(LokiApiError::bad_request(
+                "aggregation expression has trailing input",
+            ));
+        }
+        let (parameter, expression) = if matches!(
+            operation,
+            AggregateOperation::TopK | AggregateOperation::BottomK
+        ) {
+            let (parameter, expression) = split_top_level_once(arguments, ',')
+                .ok_or_else(|| LokiApiError::bad_request("topk/bottomk requires k and a vector"))?;
+            let parameter = parameter
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| LokiApiError::bad_request("topk/bottomk k must be positive"))?;
+            (Some(parameter), expression)
+        } else {
+            (None, arguments)
+        };
+        return Ok(Some(MetricExpression::Aggregate {
+            operation,
+            grouping,
+            parameter,
+            expression: Box::new(parse_metric_expression(expression)?),
+        }));
+    }
+    if let Some(arguments) = function_arguments(input, "sort")? {
+        return Ok(Some(MetricExpression::Aggregate {
+            operation: AggregateOperation::Sort,
+            grouping: None,
+            parameter: None,
+            expression: Box::new(parse_metric_expression(arguments)?),
+        }));
+    }
+    Ok(None)
+}
+
+fn parse_range_expression(input: &str) -> Result<Option<MetricExpression>, LokiApiError> {
+    const OPERATIONS: [(&str, RangeOperation); 13] = [
+        ("count_over_time", RangeOperation::Count),
+        ("bytes_over_time", RangeOperation::Bytes),
+        ("bytes_rate", RangeOperation::BytesRate),
+        ("absent_over_time", RangeOperation::Absent),
+        ("sum_over_time", RangeOperation::Sum),
+        ("avg_over_time", RangeOperation::Average),
+        ("min_over_time", RangeOperation::Minimum),
+        ("max_over_time", RangeOperation::Maximum),
+        ("stddev_over_time", RangeOperation::Stddev),
+        ("stdvar_over_time", RangeOperation::Stdvar),
+        ("first_over_time", RangeOperation::First),
+        ("last_over_time", RangeOperation::Last),
+        ("rate_counter", RangeOperation::RateCounter),
+    ];
+    if let Some(arguments) = function_arguments(input, "rate")? {
+        return parse_range_source(arguments, RangeOperation::Rate, None).map(Some);
+    }
+    if let Some(arguments) = function_arguments(input, "quantile_over_time")? {
+        let (quantile, source) = split_top_level_once(arguments, ',').ok_or_else(|| {
+            LokiApiError::bad_request("quantile_over_time requires q and a range")
+        })?;
+        let quantile = quantile
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && (0.0..=1.0).contains(value))
+            .ok_or_else(|| LokiApiError::bad_request("quantile must be between zero and one"))?;
+        return parse_range_source(source, RangeOperation::Quantile, Some(quantile)).map(Some);
+    }
+    for (name, operation) in OPERATIONS {
+        if let Some(arguments) = function_arguments(input, name)? {
+            return parse_range_source(arguments, operation, None).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+fn parse_range_source(
+    input: &str,
+    operation: RangeOperation,
+    parameter: Option<f64>,
+) -> Result<MetricExpression, LokiApiError> {
+    let input = input.trim();
+    let open = find_range_open(input)
+        .ok_or_else(|| LokiApiError::bad_request("range function requires [duration]"))?;
+    if !input.ends_with(']') {
+        return Err(LokiApiError::bad_request("range duration is unterminated"));
+    }
+    let window_nanos = parse_duration_nanos(input[open + 1..input.len() - 1].trim())
+        .filter(|duration| *duration > 0)
+        .ok_or_else(|| LokiApiError::bad_request("range duration must be positive"))?;
+    let selector = parse_log_query(input[..open].trim())?;
+    let unwrap = selector
+        .stages
+        .iter()
+        .any(|stage| matches!(stage, PipelineStage::Unwrap(_)));
+    if matches!(
+        operation,
+        RangeOperation::Sum
+            | RangeOperation::Average
+            | RangeOperation::Minimum
+            | RangeOperation::Maximum
+            | RangeOperation::Stddev
+            | RangeOperation::Stdvar
+            | RangeOperation::Quantile
+            | RangeOperation::First
+            | RangeOperation::Last
+            | RangeOperation::RateCounter
+    ) && !unwrap
+    {
+        return Err(LokiApiError::bad_request(
+            "unwrapped range function requires an unwrap stage",
+        ));
+    }
+    Ok(MetricExpression::Range {
+        operation,
+        selector,
+        window_nanos,
+        parameter,
+    })
+}
+
+fn evaluate_metric_expression(
+    expression: &MetricExpression,
+    entries: &[LokiEntry],
+    timestamp: i64,
+) -> Result<MetricValue, LokiApiError> {
+    match expression {
+        MetricExpression::Scalar(value) => Ok(MetricValue::Scalar(*value)),
+        MetricExpression::Range {
+            operation,
+            selector,
+            window_nanos,
+            parameter,
+        } => evaluate_range_metric(
+            *operation,
+            selector,
+            *window_nanos,
+            *parameter,
+            entries,
+            timestamp,
+        ),
+        MetricExpression::Aggregate {
+            operation,
+            grouping,
+            parameter,
+            expression,
+        } => evaluate_aggregate(
+            *operation,
+            grouping.as_ref(),
+            *parameter,
+            evaluate_metric_expression(expression, entries, timestamp)?,
+        ),
+        MetricExpression::Binary {
+            operation,
+            bool_mode,
+            matching,
+            left,
+            right,
+        } => evaluate_binary(
+            *operation,
+            *bool_mode,
+            matching,
+            evaluate_metric_expression(left, entries, timestamp)?,
+            evaluate_metric_expression(right, entries, timestamp)?,
+        ),
+    }
+}
+
+fn evaluate_range_metric(
+    operation: RangeOperation,
+    selector: &LogSelector,
+    window_nanos: i64,
+    parameter: Option<f64>,
+    entries: &[LokiEntry],
+    timestamp: i64,
+) -> Result<MetricValue, LokiApiError> {
+    let start = timestamp.saturating_sub(window_nanos);
+    let unwrap_label = selector.stages.iter().find_map(|stage| match stage {
+        PipelineStage::Unwrap(label) => Some(label.as_str()),
+        _ => None,
+    });
+    let mut groups = BTreeMap::<BTreeMap<String, String>, Vec<(i64, f64)>>::new();
+    for entry in entries {
+        if entry.timestamp_unix_nanos <= start || entry.timestamp_unix_nanos > timestamp {
+            continue;
+        }
+        let Some(processed) = selector.process(entry.clone()) else {
+            continue;
+        };
+        let value = match operation {
+            RangeOperation::Count | RangeOperation::Rate | RangeOperation::Absent => 1.0,
+            RangeOperation::Bytes | RangeOperation::BytesRate => processed.line.len() as f64,
+            _ => {
+                let label = unwrap_label.expect("validated unwrapped operation");
+                let Some(raw) = processed
+                    .labels
+                    .get(label)
+                    .or_else(|| processed.structured_metadata.get(label))
+                else {
+                    continue;
+                };
+                let Some(value) = parse_unwrapped_value(raw) else {
+                    continue;
+                };
+                value
+            }
+        };
+        groups
+            .entry(processed.labels)
+            .or_default()
+            .push((processed.timestamp_unix_nanos, value));
+    }
+    if matches!(operation, RangeOperation::Absent) {
+        return Ok(MetricValue::Vector(if groups.is_empty() {
+            vec![MetricSample {
+                labels: BTreeMap::new(),
+                value: 1.0,
+            }]
+        } else {
+            Vec::new()
+        }));
+    }
+    let seconds = window_nanos as f64 / 1_000_000_000.0;
+    let samples = groups
+        .into_iter()
+        .filter_map(|(labels, mut values)| {
+            values.sort_unstable_by_key(|(timestamp, _)| *timestamp);
+            let numeric = values.iter().map(|(_, value)| *value).collect::<Vec<_>>();
+            let value = match operation {
+                RangeOperation::Count => numeric.len() as f64,
+                RangeOperation::Rate => numeric.len() as f64 / seconds,
+                RangeOperation::Bytes => numeric.iter().sum(),
+                RangeOperation::BytesRate => numeric.iter().sum::<f64>() / seconds,
+                RangeOperation::Sum => numeric.iter().sum(),
+                RangeOperation::Average => mean(&numeric)?,
+                RangeOperation::Minimum => numeric.iter().copied().reduce(f64::min)?,
+                RangeOperation::Maximum => numeric.iter().copied().reduce(f64::max)?,
+                RangeOperation::Stddev => variance(&numeric)?.sqrt(),
+                RangeOperation::Stdvar => variance(&numeric)?,
+                RangeOperation::Quantile => quantile(&numeric, parameter.unwrap_or(0.5))?,
+                RangeOperation::First => values.first()?.1,
+                RangeOperation::Last => values.last()?.1,
+                RangeOperation::RateCounter => counter_increase(&numeric) / seconds,
+                RangeOperation::Absent => unreachable!(),
+            };
+            Some(MetricSample { labels, value })
+        })
+        .collect();
+    Ok(MetricValue::Vector(samples))
+}
+
+fn evaluate_aggregate(
+    operation: AggregateOperation,
+    grouping: Option<&MetricGrouping>,
+    parameter: Option<usize>,
+    value: MetricValue,
+) -> Result<MetricValue, LokiApiError> {
+    let MetricValue::Vector(samples) = value else {
+        return Err(LokiApiError::bad_request(
+            "vector aggregation cannot consume a scalar",
+        ));
+    };
+    if matches!(
+        operation,
+        AggregateOperation::Sort | AggregateOperation::SortDescending
+    ) {
+        let mut samples = samples;
+        samples.sort_by(|left, right| left.value.total_cmp(&right.value));
+        if matches!(operation, AggregateOperation::SortDescending) {
+            samples.reverse();
+        }
+        return Ok(MetricValue::Vector(samples));
+    }
+    if matches!(
+        operation,
+        AggregateOperation::TopK | AggregateOperation::BottomK
+    ) {
+        let mut groups = BTreeMap::<BTreeMap<String, String>, Vec<MetricSample>>::new();
+        for sample in samples {
+            groups
+                .entry(group_metric_labels(&sample.labels, grouping))
+                .or_default()
+                .push(sample);
+        }
+        let mut output = Vec::new();
+        for mut samples in groups.into_values() {
+            samples.sort_by(|left, right| right.value.total_cmp(&left.value));
+            if matches!(operation, AggregateOperation::BottomK) {
+                samples.reverse();
+            }
+            samples.truncate(parameter.unwrap_or(1));
+            output.extend(samples);
+        }
+        return Ok(MetricValue::Vector(output));
+    }
+    let mut groups = BTreeMap::<BTreeMap<String, String>, Vec<f64>>::new();
+    for sample in samples {
+        groups
+            .entry(group_metric_labels(&sample.labels, grouping))
+            .or_default()
+            .push(sample.value);
+    }
+    Ok(MetricValue::Vector(
+        groups
+            .into_iter()
+            .filter_map(|(labels, values)| {
+                let value = match operation {
+                    AggregateOperation::Sum => values.iter().sum(),
+                    AggregateOperation::Average => mean(&values)?,
+                    AggregateOperation::Minimum => values.iter().copied().reduce(f64::min)?,
+                    AggregateOperation::Maximum => values.iter().copied().reduce(f64::max)?,
+                    AggregateOperation::Count => values.len() as f64,
+                    AggregateOperation::Stddev => variance(&values)?.sqrt(),
+                    AggregateOperation::Stdvar => variance(&values)?,
+                    AggregateOperation::TopK
+                    | AggregateOperation::BottomK
+                    | AggregateOperation::Sort
+                    | AggregateOperation::SortDescending => unreachable!(),
+                };
+                Some(MetricSample { labels, value })
+            })
+            .collect(),
+    ))
+}
+
+fn evaluate_binary(
+    operation: BinaryOperation,
+    bool_mode: bool,
+    matching: &VectorMatching,
+    left: MetricValue,
+    right: MetricValue,
+) -> Result<MetricValue, LokiApiError> {
+    match (left, right) {
+        (MetricValue::Scalar(left), MetricValue::Scalar(right)) => Ok(MetricValue::Scalar(
+            apply_binary_number(operation, bool_mode, left, right).unwrap_or(f64::NAN),
+        )),
+        (MetricValue::Vector(samples), MetricValue::Scalar(scalar)) => Ok(MetricValue::Vector(
+            samples
+                .into_iter()
+                .filter_map(|sample| {
+                    apply_binary_number(operation, bool_mode, sample.value, scalar).map(|value| {
+                        MetricSample {
+                            labels: sample.labels,
+                            value,
+                        }
+                    })
+                })
+                .collect(),
+        )),
+        (MetricValue::Scalar(scalar), MetricValue::Vector(samples)) => Ok(MetricValue::Vector(
+            samples
+                .into_iter()
+                .filter_map(|sample| {
+                    apply_binary_number(operation, bool_mode, scalar, sample.value).map(|value| {
+                        MetricSample {
+                            labels: sample.labels,
+                            value,
+                        }
+                    })
+                })
+                .collect(),
+        )),
+        (MetricValue::Vector(left), MetricValue::Vector(right)) => {
+            evaluate_vector_binary(operation, bool_mode, matching, left, right)
+        }
+    }
+}
+
+fn evaluate_vector_binary(
+    operation: BinaryOperation,
+    bool_mode: bool,
+    matching: &VectorMatching,
+    left: Vec<MetricSample>,
+    right: Vec<MetricSample>,
+) -> Result<MetricValue, LokiApiError> {
+    if matches!(
+        operation,
+        BinaryOperation::And | BinaryOperation::Or | BinaryOperation::Unless
+    ) {
+        let left_keys = left
+            .iter()
+            .map(|sample| metric_match_key(&sample.labels, matching))
+            .collect::<BTreeSet<_>>();
+        let right_keys = right
+            .iter()
+            .map(|sample| metric_match_key(&sample.labels, matching))
+            .collect::<BTreeSet<_>>();
+        let mut output = match operation {
+            BinaryOperation::And => left
+                .into_iter()
+                .filter(|sample| right_keys.contains(&metric_match_key(&sample.labels, matching)))
+                .collect::<Vec<_>>(),
+            BinaryOperation::Unless => left
+                .into_iter()
+                .filter(|sample| !right_keys.contains(&metric_match_key(&sample.labels, matching)))
+                .collect::<Vec<_>>(),
+            BinaryOperation::Or => left,
+            _ => unreachable!(),
+        };
+        if operation == BinaryOperation::Or {
+            output.extend(
+                right.into_iter().filter(|sample| {
+                    !left_keys.contains(&metric_match_key(&sample.labels, matching))
+                }),
+            );
+        }
+        return Ok(MetricValue::Vector(output));
+    }
+    if matching.cardinality == VectorCardinality::OneToMany {
+        return evaluate_one_to_many_binary(operation, bool_mode, matching, left, right);
+    }
+    let mut right_by_key = BTreeMap::<BTreeMap<String, String>, MetricSample>::new();
+    for sample in right {
+        let key = metric_match_key(&sample.labels, matching);
+        if right_by_key.insert(key, sample).is_some() {
+            return Err(LokiApiError::bad_request(
+                "many-to-many vector matching is not allowed",
+            ));
+        }
+    }
+    let mut output = Vec::new();
+    let mut left_keys = BTreeSet::new();
+    for sample in left {
+        let key = metric_match_key(&sample.labels, matching);
+        if matching.cardinality == VectorCardinality::OneToOne && !left_keys.insert(key.clone()) {
+            return Err(LokiApiError::bad_request(
+                "many-to-many vector matching is not allowed",
+            ));
+        }
+        let other = right_by_key.get(&key);
+        if let Some(other) = other
+            && let Some(value) =
+                apply_binary_number(operation, bool_mode, sample.value, other.value)
+        {
+            let mut labels = sample.labels;
+            for name in &matching.include {
+                if let Some(included) = other.labels.get(name) {
+                    labels.insert(name.clone(), included.clone());
+                }
+            }
+            output.push(MetricSample { labels, value });
+        }
+    }
+    Ok(MetricValue::Vector(output))
+}
+
+fn evaluate_one_to_many_binary(
+    operation: BinaryOperation,
+    bool_mode: bool,
+    matching: &VectorMatching,
+    left: Vec<MetricSample>,
+    right: Vec<MetricSample>,
+) -> Result<MetricValue, LokiApiError> {
+    if matches!(
+        operation,
+        BinaryOperation::And | BinaryOperation::Or | BinaryOperation::Unless
+    ) {
+        return Err(LokiApiError::bad_request(
+            "group_left/group_right cannot be used with set operators",
+        ));
+    }
+    let mut left_by_key = BTreeMap::<BTreeMap<String, String>, MetricSample>::new();
+    for sample in left {
+        let key = metric_match_key(&sample.labels, matching);
+        if left_by_key.insert(key, sample).is_some() {
+            return Err(LokiApiError::bad_request(
+                "many-to-many vector matching is not allowed",
+            ));
+        }
+    }
+    let mut output = Vec::new();
+    for sample in right {
+        let key = metric_match_key(&sample.labels, matching);
+        let Some(other) = left_by_key.get(&key) else {
+            continue;
+        };
+        let Some(value) = apply_binary_number(operation, bool_mode, other.value, sample.value)
+        else {
+            continue;
+        };
+        let mut labels = sample.labels;
+        for name in &matching.include {
+            if let Some(included) = other.labels.get(name) {
+                labels.insert(name.clone(), included.clone());
+            }
+        }
+        output.push(MetricSample { labels, value });
+    }
+    Ok(MetricValue::Vector(output))
+}
+
+fn apply_binary_number(
+    operation: BinaryOperation,
+    bool_mode: bool,
+    left: f64,
+    right: f64,
+) -> Option<f64> {
+    let comparison = match operation {
+        BinaryOperation::Equal => Some(left == right),
+        BinaryOperation::NotEqual => Some(left != right),
+        BinaryOperation::Greater => Some(left > right),
+        BinaryOperation::GreaterEqual => Some(left >= right),
+        BinaryOperation::Less => Some(left < right),
+        BinaryOperation::LessEqual => Some(left <= right),
+        _ => None,
+    };
+    if let Some(matches) = comparison {
+        return if bool_mode {
+            Some(f64::from(u8::from(matches)))
+        } else {
+            matches.then_some(left)
+        };
+    }
+    match operation {
+        BinaryOperation::Add => Some(left + right),
+        BinaryOperation::Subtract => Some(left - right),
+        BinaryOperation::Multiply => Some(left * right),
+        BinaryOperation::Divide => Some(left / right),
+        BinaryOperation::Modulo => Some(left % right),
+        BinaryOperation::Power => Some(left.powf(right)),
+        BinaryOperation::And | BinaryOperation::Or | BinaryOperation::Unless => None,
+        _ => unreachable!(),
+    }
+}
+
+fn group_metric_labels(
+    labels: &BTreeMap<String, String>,
+    grouping: Option<&MetricGrouping>,
+) -> BTreeMap<String, String> {
+    match grouping {
+        Some(MetricGrouping::By(names)) => labels
+            .iter()
+            .filter(|(name, _)| names.contains(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+        Some(MetricGrouping::Without(names)) => labels
+            .iter()
+            .filter(|(name, _)| !names.contains(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+        None => BTreeMap::new(),
+    }
+}
+
+fn metric_match_key(
+    labels: &BTreeMap<String, String>,
+    matching: &VectorMatching,
+) -> BTreeMap<String, String> {
+    if let Some(on) = &matching.on {
+        labels
+            .iter()
+            .filter(|(name, _)| on.contains(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect()
+    } else {
+        labels
+            .iter()
+            .filter(|(name, _)| !matching.ignoring.contains(name))
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect()
+    }
+}
+
+fn parse_unwrapped_value(value: &str) -> Option<f64> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .or_else(|| parse_duration_nanos(value).map(|value| value as f64 / 1_000_000_000.0))
+        .or_else(|| parse_byte_quantity(value).map(|value| value as f64))
+}
+
+fn mean(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+}
+
+fn variance(values: &[f64]) -> Option<f64> {
+    let mean = mean(values)?;
+    Some(
+        values
+            .iter()
+            .map(|value| {
+                let deviation = value - mean;
+                deviation * deviation
+            })
+            .sum::<f64>()
+            / values.len() as f64,
+    )
+}
+
+fn quantile(values: &[f64], quantile: f64) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut values = values.to_vec();
+    values.sort_by(f64::total_cmp);
+    let rank = quantile * (values.len().saturating_sub(1)) as f64;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    let fraction = rank - lower as f64;
+    Some(values[lower] + (values[upper] - values[lower]) * fraction)
+}
+
+fn counter_increase(values: &[f64]) -> f64 {
+    values.windows(2).fold(0.0, |increase, pair| {
+        if pair[1] >= pair[0] {
+            increase + pair[1] - pair[0]
+        } else {
+            increase + pair[1].max(0.0)
+        }
+    })
+}
+
+fn format_metric_value(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".to_owned()
+    } else if value == f64::INFINITY {
+        "+Inf".to_owned()
+    } else if value == f64::NEG_INFINITY {
+        "-Inf".to_owned()
+    } else {
+        value.to_string()
+    }
+}
+
+fn parse_grouping_clause(input: &str) -> Result<(Vec<String>, &str), LokiApiError> {
+    let (labels, remaining) = extract_parenthesized(input.trim_start())?;
+    let labels = labels
+        .split(',')
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    labels
+        .iter()
+        .try_for_each(|label| validate_label_name(label))?;
+    Ok((labels, remaining))
+}
+
+fn function_arguments<'a>(input: &'a str, name: &str) -> Result<Option<&'a str>, LokiApiError> {
+    let Some(rest) = input.strip_prefix(name) else {
+        return Ok(None);
+    };
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return Ok(None);
+    }
+    let (arguments, trailing) = extract_parenthesized(rest.trim_start())?;
+    if !trailing.trim().is_empty() {
+        return Err(LokiApiError::bad_request(format!(
+            "{name} has trailing input"
+        )));
+    }
+    Ok(Some(arguments))
+}
+
+fn extract_parenthesized(input: &str) -> Result<(&str, &str), LokiApiError> {
+    if !input.starts_with('(') {
+        return Err(LokiApiError::bad_request(
+            "expected parenthesized expression",
+        ));
+    }
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut depth = 0usize;
+    for (index, character) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quoted {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+        } else if !quoted && character == '(' {
+            depth += 1;
+        } else if !quoted && character == ')' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Ok((&input[1..index], &input[index + 1..]));
+            }
+        }
+    }
+    Err(LokiApiError::bad_request(
+        "unterminated parenthesized expression",
+    ))
+}
+
+fn strip_outer_parentheses(mut input: &str) -> &str {
+    loop {
+        let Ok((inner, trailing)) = extract_parenthesized(input) else {
+            return input;
+        };
+        if !trailing.trim().is_empty() {
+            return input;
+        }
+        input = inner.trim();
+    }
+}
+
+fn split_top_level_once(input: &str, separator: char) -> Option<(&str, &str)> {
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut parentheses = 0usize;
+    let mut braces = 0usize;
+    let mut brackets = 0usize;
+    for (index, character) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quoted {
+            escaped = true;
+            continue;
+        }
+        if character == '"' {
+            quoted = !quoted;
+            continue;
+        }
+        if quoted {
+            continue;
+        }
+        match character {
+            '(' => parentheses += 1,
+            ')' => parentheses = parentheses.saturating_sub(1),
+            '{' => braces += 1,
+            '}' => braces = braces.saturating_sub(1),
+            '[' => brackets += 1,
+            ']' => brackets = brackets.saturating_sub(1),
+            _ if character == separator && parentheses == 0 && braces == 0 && brackets == 0 => {
+                return Some((&input[..index], &input[index + character.len_utf8()..]));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_range_open(input: &str) -> Option<usize> {
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut candidate = None;
+    for (index, character) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quoted {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+        } else if character == '[' && !quoted {
+            candidate = Some(index);
+        }
+    }
+    candidate
+}
+
+fn find_top_level_binary_operator(input: &str) -> Option<(usize, &'static str)> {
+    const PRECEDENCE: [&[&str]; 6] = [
+        &[" or ", " unless ", " and "],
+        &["==", "!=", ">=", "<=", ">", "<"],
+        &["+", "-"],
+        &["*", "/", "%"],
+        &["^"],
+        &[],
+    ];
+    for operators in PRECEDENCE {
+        let mut found = None;
+        walk_top_level(input, |index| {
+            for operator in operators {
+                if input[index..].starts_with(operator)
+                    && !(matches!(*operator, "+" | "-") && input[..index].trim().is_empty())
+                {
+                    found = Some((index, *operator));
+                    break;
+                }
+            }
+        });
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+fn walk_top_level(mut input: &str, mut visit: impl FnMut(usize)) {
+    let original_length = input.len();
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut parentheses = 0usize;
+    let mut braces = 0usize;
+    let mut brackets = 0usize;
+    while !input.is_empty() {
+        let index = original_length - input.len();
+        let character = input.chars().next().expect("nonempty input");
+        if escaped {
+            escaped = false;
+        } else if character == '\\' && quoted {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+        } else if !quoted {
+            match character {
+                '(' => parentheses += 1,
+                ')' => parentheses = parentheses.saturating_sub(1),
+                '{' => braces += 1,
+                '}' => braces = braces.saturating_sub(1),
+                '[' => brackets += 1,
+                ']' => brackets = brackets.saturating_sub(1),
+                _ => {}
+            }
+            if parentheses == 0 && braces == 0 && brackets == 0 {
+                visit(index);
+            }
+        }
+        input = &input[character.len_utf8()..];
+    }
+}
+
+fn binary_operation(operator: &str) -> Result<BinaryOperation, LokiApiError> {
+    match operator.trim() {
+        "+" => Ok(BinaryOperation::Add),
+        "-" => Ok(BinaryOperation::Subtract),
+        "*" => Ok(BinaryOperation::Multiply),
+        "/" => Ok(BinaryOperation::Divide),
+        "%" => Ok(BinaryOperation::Modulo),
+        "^" => Ok(BinaryOperation::Power),
+        "==" => Ok(BinaryOperation::Equal),
+        "!=" => Ok(BinaryOperation::NotEqual),
+        ">" => Ok(BinaryOperation::Greater),
+        ">=" => Ok(BinaryOperation::GreaterEqual),
+        "<" => Ok(BinaryOperation::Less),
+        "<=" => Ok(BinaryOperation::LessEqual),
+        "and" => Ok(BinaryOperation::And),
+        "or" => Ok(BinaryOperation::Or),
+        "unless" => Ok(BinaryOperation::Unless),
+        _ => Err(LokiApiError::bad_request("invalid binary operator")),
+    }
+}
+
+fn parse_vector_matching(
+    input: &str,
+    operation: BinaryOperation,
+) -> Result<(bool, VectorMatching, &str), LokiApiError> {
+    let mut input = input.trim_start();
+    let mut bool_mode = false;
+    let mut matching = VectorMatching::default();
+    loop {
+        if let Some(rest) = input.strip_prefix("bool")
+            && rest.chars().next().is_none_or(char::is_whitespace)
+        {
+            if !matches!(
+                operation,
+                BinaryOperation::Equal
+                    | BinaryOperation::NotEqual
+                    | BinaryOperation::Greater
+                    | BinaryOperation::GreaterEqual
+                    | BinaryOperation::Less
+                    | BinaryOperation::LessEqual
+            ) {
+                return Err(LokiApiError::bad_request(
+                    "bool is valid only for comparison operators",
+                ));
+            }
+            bool_mode = true;
+            input = rest.trim_start();
+            continue;
+        }
+        if let Some(rest) = input.strip_prefix("on") {
+            let (labels, trailing) = parse_grouping_clause(rest)?;
+            matching.on = Some(labels);
+            input = trailing.trim_start();
+            continue;
+        }
+        if let Some(rest) = input.strip_prefix("ignoring") {
+            let (labels, trailing) = parse_grouping_clause(rest)?;
+            matching.ignoring = labels;
+            input = trailing.trim_start();
+            continue;
+        }
+        if let Some(rest) = input.strip_prefix("group_left") {
+            matching.cardinality = VectorCardinality::ManyToOne;
+            let (include, rest) = parse_optional_grouping_clause(rest)?;
+            matching.include = include;
+            input = rest.trim_start();
+            continue;
+        }
+        if let Some(rest) = input.strip_prefix("group_right") {
+            matching.cardinality = VectorCardinality::OneToMany;
+            let (include, rest) = parse_optional_grouping_clause(rest)?;
+            matching.include = include;
+            input = rest.trim_start();
+            continue;
+        }
+        break;
+    }
+    Ok((bool_mode, matching, input))
+}
+
+fn parse_optional_grouping_clause(input: &str) -> Result<(Vec<String>, &str), LokiApiError> {
+    let input = input.trim_start();
+    if input.starts_with('(') {
+        parse_grouping_clause(input)
+    } else {
+        Ok((Vec::new(), input))
+    }
 }
 
 fn normalize_stream_labels(mut labels: BTreeMap<String, String>) -> BTreeMap<String, String> {
@@ -1047,18 +2338,28 @@ fn detected_level(labels: &BTreeMap<String, String>, line: &str) -> String {
 #[derive(Debug, Clone)]
 struct LogSelector {
     matchers: Vec<LabelMatcher>,
-    line_filters: Vec<LineFilter>,
+    stages: Vec<PipelineStage>,
 }
 
 impl LogSelector {
     fn matches(&self, entry: &LokiEntry) -> bool {
-        self.matchers
+        self.process(entry.clone()).is_some()
+    }
+
+    fn process(&self, mut entry: LokiEntry) -> Option<LokiEntry> {
+        if !self
+            .matchers
             .iter()
             .all(|matcher| matcher.matches(&entry.labels))
-            && self
-                .line_filters
-                .iter()
-                .all(|filter| filter.matches(&entry.line))
+        {
+            return None;
+        }
+        for stage in &self.stages {
+            if !stage.apply(&mut entry) {
+                return None;
+            }
+        }
+        Some(entry)
     }
 }
 
@@ -1162,15 +2463,197 @@ impl LineFilter {
     }
 }
 
+#[derive(Debug, Clone)]
+enum PipelineStage {
+    Line(LineFilter),
+    Json(Vec<(String, Vec<String>)>),
+    Logfmt,
+    Regexp(Regex),
+    Pattern(Regex),
+    LabelFilter(LabelFilter),
+    LineFormat(String),
+    LabelFormat(Vec<(String, LabelFormatValue)>),
+    Drop(Vec<String>),
+    Keep(Vec<String>),
+    Decolorize,
+    Unpack,
+    Unwrap(String),
+}
+
+#[derive(Debug, Clone)]
+struct LabelFilter {
+    name: String,
+    operation: LabelFilterOperation,
+    value: String,
+    regex: Option<Regex>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LabelFilterOperation {
+    Equal,
+    NotEqual,
+    Regex,
+    NotRegex,
+    Greater,
+    GreaterEqual,
+    Less,
+    LessEqual,
+}
+
+#[derive(Debug, Clone)]
+enum LabelFormatValue {
+    Rename(String),
+    Template(String),
+}
+
+impl PipelineStage {
+    fn apply(&self, entry: &mut LokiEntry) -> bool {
+        match self {
+            Self::Line(filter) => filter.matches(&entry.line),
+            Self::Json(expressions) => {
+                match serde_json::from_str::<Value>(&entry.line) {
+                    Ok(Value::Object(object)) => {
+                        if expressions.is_empty() {
+                            flatten_json_object("", &object, &mut entry.labels);
+                        } else {
+                            for (label, path) in expressions {
+                                if let Some(value) = json_path(&Value::Object(object.clone()), path)
+                                    && let Some(value) = scalar_label_value(value)
+                                {
+                                    insert_extracted_label(&mut entry.labels, label, value);
+                                }
+                            }
+                        }
+                    }
+                    Ok(_) | Err(_) => set_parser_error(entry, "JSONParserErr"),
+                }
+                true
+            }
+            Self::Logfmt => {
+                let parsed = parse_logfmt_labels(&entry.line);
+                if parsed.is_empty() {
+                    set_parser_error(entry, "LogfmtParserErr");
+                } else {
+                    for (name, value) in parsed {
+                        insert_extracted_label(&mut entry.labels, &name, value);
+                    }
+                }
+                true
+            }
+            Self::Regexp(regex) | Self::Pattern(regex) => {
+                let Some(captures) = regex.captures(&entry.line) else {
+                    set_parser_error(entry, "RegexpParserErr");
+                    return true;
+                };
+                for name in regex.capture_names().flatten() {
+                    if let Some(value) = captures.name(name) {
+                        insert_extracted_label(&mut entry.labels, name, value.as_str().to_owned());
+                    }
+                }
+                true
+            }
+            Self::LabelFilter(filter) => filter.matches(entry),
+            Self::LineFormat(template) => {
+                entry.line = render_logql_template(template, entry);
+                true
+            }
+            Self::LabelFormat(assignments) => {
+                for (target, value) in assignments {
+                    let rendered = match value {
+                        LabelFormatValue::Rename(source) => {
+                            entry.labels.remove(source).unwrap_or_default()
+                        }
+                        LabelFormatValue::Template(template) => {
+                            render_logql_template(template, entry)
+                        }
+                    };
+                    entry.labels.insert(target.clone(), rendered);
+                }
+                true
+            }
+            Self::Drop(names) => {
+                for name in names {
+                    entry.labels.remove(name);
+                }
+                true
+            }
+            Self::Keep(names) => {
+                entry
+                    .labels
+                    .retain(|name, _| names.iter().any(|candidate| candidate == name));
+                true
+            }
+            Self::Decolorize => {
+                entry.line = strip_ansi(&entry.line);
+                true
+            }
+            Self::Unpack => {
+                match serde_json::from_str::<Value>(&entry.line) {
+                    Ok(Value::Object(mut object)) => {
+                        let unpacked = object
+                            .remove("_entry")
+                            .and_then(|value| value.as_str().map(str::to_owned));
+                        for (name, value) in object {
+                            if let Some(value) = scalar_label_value(&value) {
+                                insert_extracted_label(&mut entry.labels, &name, value);
+                            }
+                        }
+                        if let Some(unpacked) = unpacked {
+                            entry.line = unpacked;
+                        } else {
+                            set_parser_error(entry, "JSONParserErr");
+                        }
+                    }
+                    Ok(_) | Err(_) => set_parser_error(entry, "JSONParserErr"),
+                }
+                true
+            }
+            Self::Unwrap(label) => {
+                let _ = label;
+                true
+            }
+        }
+    }
+}
+
+impl LabelFilter {
+    fn matches(&self, entry: &LokiEntry) -> bool {
+        let observed = entry
+            .labels
+            .get(&self.name)
+            .or_else(|| entry.structured_metadata.get(&self.name))
+            .map(String::as_str)
+            .unwrap_or("");
+        match self.operation {
+            LabelFilterOperation::Equal => observed == self.value,
+            LabelFilterOperation::NotEqual => observed != self.value,
+            LabelFilterOperation::Regex => self
+                .regex
+                .as_ref()
+                .is_some_and(|regex| regex.is_match(observed)),
+            LabelFilterOperation::NotRegex => self
+                .regex
+                .as_ref()
+                .is_some_and(|regex| !regex.is_match(observed)),
+            operation => {
+                compare_typed_label(observed, &self.value).is_some_and(|ordering| match operation {
+                    LabelFilterOperation::Greater => ordering.is_gt(),
+                    LabelFilterOperation::GreaterEqual => ordering.is_ge(),
+                    LabelFilterOperation::Less => ordering.is_lt(),
+                    LabelFilterOperation::LessEqual => ordering.is_le(),
+                    _ => false,
+                })
+            }
+        }
+    }
+}
+
 fn parse_log_query(expression: &str) -> Result<LogSelector, LokiApiError> {
     let end = matching_brace(expression)
         .ok_or_else(|| LokiApiError::bad_request("LogQL query requires a stream selector"))?;
     let matchers = parse_selector_matchers(&expression[..=end])?;
-    let line_filters = parse_line_filters(&expression[end + 1..])?;
-    Ok(LogSelector {
-        matchers,
-        line_filters,
-    })
+    let stages = parse_pipeline_stages(&expression[end + 1..])?;
+    Ok(LogSelector { matchers, stages })
 }
 
 fn parse_selector_matchers(input: &str) -> Result<Vec<LabelMatcher>, LokiApiError> {
@@ -1228,38 +2711,561 @@ fn parse_selector_matchers(input: &str) -> Result<Vec<LabelMatcher>, LokiApiErro
     Ok(matchers)
 }
 
-fn parse_line_filters(mut input: &str) -> Result<Vec<LineFilter>, LokiApiError> {
-    let mut filters = Vec::new();
+fn parse_pipeline_stages(mut input: &str) -> Result<Vec<PipelineStage>, LokiApiError> {
+    let mut stages = Vec::new();
     loop {
         input = input.trim_start();
         if input.is_empty() {
-            return Ok(filters);
+            return Ok(stages);
         }
         let (operation, rest) = if let Some(rest) = input.strip_prefix("|=") {
-            (MatchOperation::Equal, rest)
+            (Some(MatchOperation::Equal), rest)
         } else if let Some(rest) = input.strip_prefix("!=") {
-            (MatchOperation::NotEqual, rest)
+            (Some(MatchOperation::NotEqual), rest)
         } else if let Some(rest) = input.strip_prefix("|~") {
-            (MatchOperation::Regex, rest)
+            (Some(MatchOperation::Regex), rest)
         } else if let Some(rest) = input.strip_prefix("!~") {
-            (MatchOperation::NotRegex, rest)
+            (Some(MatchOperation::NotRegex), rest)
         } else {
+            (None, input)
+        };
+        if let Some(operation) = operation {
+            let (value, rest) = parse_quoted(rest.trim_start())?;
+            let regex = matches!(operation, MatchOperation::Regex | MatchOperation::NotRegex)
+                .then(|| Regex::new(&value))
+                .transpose()
+                .map_err(|error| LokiApiError::bad_request(format!("invalid regex: {error}")))?;
+            stages.push(PipelineStage::Line(LineFilter {
+                operation,
+                value,
+                regex,
+            }));
+            input = rest;
+            continue;
+        }
+        let Some(rest) = input.strip_prefix('|') else {
             return Err(LokiApiError::bad_request(
                 "unsupported or invalid LogQL pipeline stage",
             ));
         };
-        let (value, rest) = parse_quoted(rest.trim_start())?;
-        let regex = matches!(operation, MatchOperation::Regex | MatchOperation::NotRegex)
-            .then(|| Regex::new(&value))
-            .transpose()
-            .map_err(|error| LokiApiError::bad_request(format!("invalid regex: {error}")))?;
-        filters.push(LineFilter {
-            operation,
-            value,
-            regex,
-        });
-        input = rest;
+        let (segment, remaining) = take_pipeline_segment(rest.trim_start());
+        let (name, arguments) = segment
+            .trim()
+            .split_once(char::is_whitespace)
+            .map_or((segment.trim(), ""), |(name, arguments)| {
+                (name, arguments.trim())
+            });
+        match name {
+            "json" => stages.push(PipelineStage::Json(parse_json_expressions(arguments)?)),
+            "logfmt" => stages.push(PipelineStage::Logfmt),
+            "regexp" => {
+                let (expression, trailing) = parse_quoted(arguments)?;
+                if !trailing.trim().is_empty() {
+                    return Err(LokiApiError::bad_request("regexp stage has trailing input"));
+                }
+                stages.push(PipelineStage::Regexp(Regex::new(&expression).map_err(
+                    |error| LokiApiError::bad_request(format!("invalid regexp stage: {error}")),
+                )?));
+            }
+            "pattern" => {
+                let (expression, trailing) = parse_quoted(arguments)?;
+                if !trailing.trim().is_empty() {
+                    return Err(LokiApiError::bad_request(
+                        "pattern stage has trailing input",
+                    ));
+                }
+                stages.push(PipelineStage::Pattern(compile_pattern_parser(&expression)?));
+            }
+            "line_format" => {
+                let (template, trailing) = parse_quoted(arguments)?;
+                if !trailing.trim().is_empty() {
+                    return Err(LokiApiError::bad_request(
+                        "line_format stage has trailing input",
+                    ));
+                }
+                stages.push(PipelineStage::LineFormat(template));
+            }
+            "label_format" => stages.push(PipelineStage::LabelFormat(
+                parse_label_format_assignments(arguments)?,
+            )),
+            "drop" => stages.push(PipelineStage::Drop(parse_label_list(arguments)?)),
+            "keep" => stages.push(PipelineStage::Keep(parse_label_list(arguments)?)),
+            "decolorize" if arguments.is_empty() => stages.push(PipelineStage::Decolorize),
+            "unpack" if arguments.is_empty() => stages.push(PipelineStage::Unpack),
+            "unwrap" => {
+                let label = arguments
+                    .split_ascii_whitespace()
+                    .next()
+                    .filter(|label| validate_label_name(label).is_ok())
+                    .ok_or_else(|| LokiApiError::bad_request("unwrap requires a label name"))?;
+                stages.push(PipelineStage::Unwrap(label.to_owned()));
+            }
+            _ => {
+                stages.extend(parse_label_filter_expression(segment.trim())?);
+            }
+        }
+        input = remaining;
     }
+}
+
+fn take_pipeline_segment(input: &str) -> (&str, &str) {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quoted {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+        } else if character == '|' && !quoted {
+            return (&input[..index], &input[index..]);
+        }
+    }
+    (input, "")
+}
+
+fn parse_json_expressions(input: &str) -> Result<Vec<(String, Vec<String>)>, LokiApiError> {
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+    split_unquoted(input, ',')
+        .into_iter()
+        .map(|assignment| {
+            let (label, path) = assignment
+                .split_once('=')
+                .ok_or_else(|| LokiApiError::bad_request("invalid json extraction expression"))?;
+            let label = label.trim();
+            validate_label_name(label)?;
+            let (path, trailing) = parse_quoted(path.trim())?;
+            if !trailing.trim().is_empty() || path.is_empty() {
+                return Err(LokiApiError::bad_request("invalid json extraction path"));
+            }
+            Ok((
+                label.to_owned(),
+                path.trim_start_matches('.')
+                    .split('.')
+                    .map(str::to_owned)
+                    .collect(),
+            ))
+        })
+        .collect()
+}
+
+fn parse_label_format_assignments(
+    input: &str,
+) -> Result<Vec<(String, LabelFormatValue)>, LokiApiError> {
+    let assignments = split_unquoted(input, ',');
+    if assignments.is_empty() {
+        return Err(LokiApiError::bad_request(
+            "label_format requires at least one assignment",
+        ));
+    }
+    assignments
+        .into_iter()
+        .map(|assignment| {
+            let (target, value) = assignment
+                .split_once('=')
+                .ok_or_else(|| LokiApiError::bad_request("invalid label_format assignment"))?;
+            let target = target.trim();
+            validate_label_name(target)?;
+            let value = value.trim();
+            let value = if value.starts_with('"') {
+                let (template, trailing) = parse_quoted(value)?;
+                if !trailing.trim().is_empty() {
+                    return Err(LokiApiError::bad_request(
+                        "label_format template has trailing input",
+                    ));
+                }
+                LabelFormatValue::Template(template)
+            } else {
+                validate_label_name(value)?;
+                LabelFormatValue::Rename(value.to_owned())
+            };
+            Ok((target.to_owned(), value))
+        })
+        .collect()
+}
+
+fn parse_label_list(input: &str) -> Result<Vec<String>, LokiApiError> {
+    let labels = input
+        .split([',', ' '])
+        .filter(|label| !label.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if labels.is_empty() {
+        return Err(LokiApiError::bad_request(
+            "label list stage requires at least one label",
+        ));
+    }
+    labels
+        .iter()
+        .try_for_each(|label| validate_label_name(label))?;
+    Ok(labels)
+}
+
+fn parse_label_filter_expression(input: &str) -> Result<Vec<PipelineStage>, LokiApiError> {
+    split_keyword_unquoted(input, "and")
+        .into_iter()
+        .map(|condition| parse_label_filter(condition).map(PipelineStage::LabelFilter))
+        .collect()
+}
+
+fn parse_label_filter(input: &str) -> Result<LabelFilter, LokiApiError> {
+    let (index, operator) = ["=~", "!~", ">=", "<=", "!=", "=", ">", "<"]
+        .into_iter()
+        .filter_map(|operator| find_unquoted(input, operator).map(|index| (index, operator)))
+        .min_by_key(|(index, _)| *index)
+        .ok_or_else(|| LokiApiError::bad_request("invalid label filter"))?;
+    let name = input[..index].trim();
+    validate_label_name(name)?;
+    let raw_value = input[index + operator.len()..].trim();
+    let value = if raw_value.starts_with('"') {
+        let (value, trailing) = parse_quoted(raw_value)?;
+        if !trailing.trim().is_empty() {
+            return Err(LokiApiError::bad_request("label filter has trailing input"));
+        }
+        value
+    } else if !raw_value.is_empty() {
+        raw_value.to_owned()
+    } else {
+        return Err(LokiApiError::bad_request("label filter value is missing"));
+    };
+    let operation = match operator {
+        "=" => LabelFilterOperation::Equal,
+        "!=" => LabelFilterOperation::NotEqual,
+        "=~" => LabelFilterOperation::Regex,
+        "!~" => LabelFilterOperation::NotRegex,
+        ">" => LabelFilterOperation::Greater,
+        ">=" => LabelFilterOperation::GreaterEqual,
+        "<" => LabelFilterOperation::Less,
+        "<=" => LabelFilterOperation::LessEqual,
+        _ => unreachable!(),
+    };
+    let regex = matches!(
+        operation,
+        LabelFilterOperation::Regex | LabelFilterOperation::NotRegex
+    )
+    .then(|| Regex::new(&format!("^(?:{value})$")))
+    .transpose()
+    .map_err(|error| LokiApiError::bad_request(format!("invalid label filter regex: {error}")))?;
+    Ok(LabelFilter {
+        name: name.to_owned(),
+        operation,
+        value,
+        regex,
+    })
+}
+
+fn split_unquoted(input: &str, separator: char) -> Vec<&str> {
+    let mut output = Vec::new();
+    let mut start = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quoted {
+            escaped = true;
+        } else if character == '"' {
+            quoted = !quoted;
+        } else if character == separator && !quoted {
+            let value = input[start..index].trim();
+            if !value.is_empty() {
+                output.push(value);
+            }
+            start = index + character.len_utf8();
+        }
+    }
+    let value = input[start..].trim();
+    if !value.is_empty() {
+        output.push(value);
+    }
+    output
+}
+
+fn split_keyword_unquoted<'a>(input: &'a str, keyword: &str) -> Vec<&'a str> {
+    let needle = format!(" {keyword} ");
+    let mut output = Vec::new();
+    let mut start = 0usize;
+    while let Some(relative) = find_unquoted(&input[start..], &needle) {
+        let index = start + relative;
+        let value = input[start..index].trim();
+        if !value.is_empty() {
+            output.push(value);
+        }
+        start = index + needle.len();
+    }
+    let value = input[start..].trim();
+    if !value.is_empty() {
+        output.push(value);
+    }
+    output
+}
+
+fn find_unquoted(input: &str, needle: &str) -> Option<usize> {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quoted {
+            escaped = true;
+            continue;
+        }
+        if character == '"' {
+            quoted = !quoted;
+            continue;
+        }
+        if !quoted && input[index..].starts_with(needle) {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn flatten_json_object(
+    prefix: &str,
+    object: &serde_json::Map<String, Value>,
+    labels: &mut BTreeMap<String, String>,
+) {
+    for (name, value) in object {
+        let normalized = normalize_extracted_label_name(name);
+        let path = if prefix.is_empty() {
+            normalized
+        } else {
+            format!("{prefix}_{normalized}")
+        };
+        match value {
+            Value::Object(nested) => flatten_json_object(&path, nested, labels),
+            value => {
+                if let Some(value) = scalar_label_value(value) {
+                    insert_extracted_label(labels, &path, value);
+                }
+            }
+        }
+    }
+}
+
+fn json_path<'a>(value: &'a Value, path: &[String]) -> Option<&'a Value> {
+    path.iter().try_fold(value, |value, component| match value {
+        Value::Object(object) => object.get(component),
+        Value::Array(values) => component
+            .parse::<usize>()
+            .ok()
+            .and_then(|index| values.get(index)),
+        _ => None,
+    })
+}
+
+fn scalar_label_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Number(value) => Some(value.to_string()),
+        Value::Bool(value) => Some(value.to_string()),
+        Value::Null => Some(String::new()),
+        Value::Array(_) | Value::Object(_) => None,
+    }
+}
+
+fn normalize_extracted_label_name(name: &str) -> String {
+    let mut normalized = name
+        .chars()
+        .enumerate()
+        .map(|(index, character)| {
+            if character == '_'
+                || character.is_ascii_alphabetic()
+                || (index > 0 && character.is_ascii_digit())
+            {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if normalized
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_digit)
+    {
+        normalized.insert(0, '_');
+    }
+    normalized
+}
+
+fn insert_extracted_label(labels: &mut BTreeMap<String, String>, requested: &str, value: String) {
+    let mut name = normalize_extracted_label_name(requested);
+    while labels.contains_key(&name) {
+        name.push_str("_extracted");
+    }
+    labels.insert(name, value);
+}
+
+fn set_parser_error(entry: &mut LokiEntry, error: &str) {
+    entry
+        .labels
+        .entry("__error__".to_owned())
+        .or_insert_with(|| error.to_owned());
+}
+
+fn parse_logfmt_labels(line: &str) -> Vec<(String, String)> {
+    let bytes = line.as_bytes();
+    let mut output = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+        let key_start = cursor;
+        while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() && bytes[cursor] != b'='
+        {
+            cursor += 1;
+        }
+        if cursor == key_start || bytes.get(cursor) != Some(&b'=') {
+            while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            continue;
+        }
+        let key = &line[key_start..cursor];
+        cursor += 1;
+        let value = if bytes.get(cursor) == Some(&b'"') {
+            let value_start = cursor;
+            cursor += 1;
+            let mut escaped = false;
+            while cursor < bytes.len() {
+                if escaped {
+                    escaped = false;
+                } else if bytes[cursor] == b'\\' {
+                    escaped = true;
+                } else if bytes[cursor] == b'"' {
+                    cursor += 1;
+                    break;
+                }
+                cursor += 1;
+            }
+            serde_json::from_str::<String>(&line[value_start..cursor]).unwrap_or_default()
+        } else {
+            let value_start = cursor;
+            while cursor < bytes.len() && !bytes[cursor].is_ascii_whitespace() {
+                cursor += 1;
+            }
+            line[value_start..cursor].to_owned()
+        };
+        if validate_label_name(key).is_ok() {
+            output.push((key.to_owned(), value));
+        }
+    }
+    output
+}
+
+fn compile_pattern_parser(pattern: &str) -> Result<Regex, LokiApiError> {
+    let mut regex = String::from("^");
+    let mut remaining = pattern;
+    let mut capture_count = 0usize;
+    while let Some(start) = remaining.find('<') {
+        regex.push_str(&regex::escape(&remaining[..start]));
+        let after = &remaining[start + 1..];
+        let end = after
+            .find('>')
+            .ok_or_else(|| LokiApiError::bad_request("unterminated pattern capture"))?;
+        let capture = &after[..end];
+        if capture == "_" {
+            regex.push_str("(?s:.*?)");
+        } else {
+            validate_label_name(capture)?;
+            regex.push_str("(?P<");
+            regex.push_str(capture);
+            regex.push_str(">(?s:.*?))");
+            capture_count += 1;
+        }
+        remaining = &after[end + 1..];
+    }
+    regex.push_str(&regex::escape(remaining));
+    regex.push('$');
+    if capture_count == 0 {
+        return Err(LokiApiError::bad_request(
+            "pattern parser requires at least one named capture",
+        ));
+    }
+    Regex::new(&regex)
+        .map_err(|error| LokiApiError::bad_request(format!("invalid pattern parser: {error}")))
+}
+
+fn render_logql_template(template: &str, entry: &LokiEntry) -> String {
+    let mut output = String::new();
+    let mut remaining = template;
+    while let Some(start) = remaining.find("{{") {
+        output.push_str(&remaining[..start]);
+        let after = &remaining[start + 2..];
+        let Some(end) = after.find("}}") else {
+            output.push_str(&remaining[start..]);
+            return output;
+        };
+        let expression = after[..end].trim();
+        let value = if expression == "__line__" {
+            entry.line.as_str()
+        } else if expression == "__timestamp__" {
+            output.push_str(&entry.timestamp_unix_nanos.to_string());
+            ""
+        } else if let Some(name) = expression.strip_prefix('.') {
+            entry
+                .labels
+                .get(name)
+                .or_else(|| entry.structured_metadata.get(name))
+                .map(String::as_str)
+                .unwrap_or("")
+        } else {
+            ""
+        };
+        output.push_str(value);
+        remaining = &after[end + 2..];
+    }
+    output.push_str(remaining);
+    output
+}
+
+fn strip_ansi(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut output = String::with_capacity(input.len());
+    let mut cursor = 0usize;
+    let mut literal_start = 0usize;
+    while cursor + 1 < bytes.len() {
+        if bytes[cursor] == 0x1b && bytes[cursor + 1] == b'[' {
+            output.push_str(&input[literal_start..cursor]);
+            cursor += 2;
+            while cursor < bytes.len() {
+                let byte = bytes[cursor];
+                cursor += 1;
+                if (0x40..=0x7e).contains(&byte) {
+                    break;
+                }
+            }
+            literal_start = cursor;
+        } else {
+            cursor += 1;
+        }
+    }
+    output.push_str(&input[literal_start..]);
+    output
+}
+
+fn compare_typed_label(left: &str, right: &str) -> Option<std::cmp::Ordering> {
+    if let (Some(left), Some(right)) = (parse_duration_nanos(left), parse_duration_nanos(right)) {
+        return Some(left.cmp(&right));
+    }
+    if let (Some(left), Some(right)) = (parse_byte_quantity(left), parse_byte_quantity(right)) {
+        return Some(left.cmp(&right));
+    }
+    let left = left.parse::<f64>().ok()?;
+    let right = right.parse::<f64>().ok()?;
+    left.partial_cmp(&right)
 }
 
 fn parse_label_set(input: &str) -> Result<BTreeMap<String, String>, LokiApiError> {
@@ -1546,7 +3552,9 @@ async fn labels(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(params): Query<QueryParams>,
+    body: Bytes,
 ) -> Result<Json<Value>, LokiApiError> {
+    let params = merge_form_query_params(&headers, params, &body)?;
     let tenant = tenant(&headers, &state.config);
     let (start, end) = query_range_bounds(&params)?;
     let mut names = BTreeSet::new();
@@ -1563,7 +3571,9 @@ async fn label_values(
     headers: HeaderMap,
     Path(name): Path<String>,
     Query(params): Query<QueryParams>,
+    body: Bytes,
 ) -> Result<Json<Value>, LokiApiError> {
+    let params = merge_form_query_params(&headers, params, &body)?;
     validate_label_name(&name)?;
     let tenant = tenant(&headers, &state.config);
     let (start, end) = query_range_bounds(&params)?;
@@ -1580,16 +3590,38 @@ async fn series(
     State(state): State<ApiState>,
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
+    body: Bytes,
 ) -> Result<Json<Value>, LokiApiError> {
-    let pairs = form_urlencoded::parse(raw_query.as_deref().unwrap_or_default().as_bytes())
+    let mut pairs = form_urlencoded::parse(raw_query.as_deref().unwrap_or_default().as_bytes())
         .map(|(key, value)| (key.into_owned(), value.into_owned()))
         .collect::<Vec<_>>();
+    if !body.is_empty() {
+        let content_type = headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        if content_type
+            .split(';')
+            .next()
+            .is_none_or(|value| value.trim() != "application/x-www-form-urlencoded")
+        {
+            return Err(LokiApiError::bad_request(
+                "POST series bodies must use application/x-www-form-urlencoded",
+            ));
+        }
+        pairs.extend(
+            form_urlencoded::parse(&body)
+                .map(|(key, value)| (key.into_owned(), value.into_owned())),
+        );
+    }
     let params = QueryParams {
         start: pairs
             .iter()
+            .rev()
             .find_map(|(key, value)| (key == "start").then(|| value.clone())),
         end: pairs
             .iter()
+            .rev()
             .find_map(|(key, value)| (key == "end").then(|| value.clone())),
         ..QueryParams::default()
     };
@@ -1624,7 +3656,9 @@ async fn index_stats(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(params): Query<QueryParams>,
+    body: Bytes,
 ) -> Result<Json<Value>, LokiApiError> {
+    let params = merge_form_query_params(&headers, params, &body)?;
     let tenant = tenant(&headers, &state.config);
     let selector = parse_log_query(params.query.as_deref().unwrap_or("{}"))?;
     let (start, end) = query_range_bounds(&params)?;
@@ -1655,7 +3689,9 @@ async fn index_volume(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(params): Query<QueryParams>,
+    body: Bytes,
 ) -> Result<Json<Value>, LokiApiError> {
+    let params = merge_form_query_params(&headers, params, &body)?;
     volume_response(state, headers, params).await
 }
 
@@ -1663,7 +3699,9 @@ async fn index_volume_range(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(params): Query<QueryParams>,
+    body: Bytes,
 ) -> Result<Json<Value>, LokiApiError> {
+    let params = merge_form_query_params(&headers, params, &body)?;
     volume_response(state, headers, params).await
 }
 
@@ -1697,7 +3735,9 @@ async fn patterns(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(params): Query<QueryParams>,
+    body: Bytes,
 ) -> Result<Json<Value>, LokiApiError> {
+    let params = merge_form_query_params(&headers, params, &body)?;
     let selector = parse_log_query(
         params
             .query
@@ -1774,7 +3814,9 @@ async fn detected_fields(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(params): Query<QueryParams>,
+    body: Bytes,
 ) -> Result<Json<Value>, LokiApiError> {
+    let params = merge_form_query_params(&headers, params, &body)?;
     let tenant = tenant(&headers, &state.config);
     let selector = parse_log_query(params.query.as_deref().unwrap_or("{}"))?;
     let (start, end) = query_range_bounds(&params)?;
@@ -1833,7 +3875,9 @@ async fn detected_field_values(
     headers: HeaderMap,
     Path(name): Path<String>,
     Query(params): Query<QueryParams>,
+    body: Bytes,
 ) -> Result<Json<Value>, LokiApiError> {
+    let params = merge_form_query_params(&headers, params, &body)?;
     let tenant = tenant(&headers, &state.config);
     let selector = parse_log_query(params.query.as_deref().unwrap_or("{}"))?;
     let (start, end) = query_range_bounds(&params)?;
@@ -2010,8 +4054,12 @@ async fn tail(
                         let entries = push
                             .entries
                             .into_iter()
-                            .filter(|entry| {
-                                selector.matches(entry) && !delete_filter.matches(entry)
+                            .filter_map(|entry| {
+                                if delete_filter.matches(&entry) {
+                                    None
+                                } else {
+                                    selector.process(entry)
+                                }
                             })
                             .collect::<Vec<_>>();
                         if entries.is_empty() {
@@ -2159,7 +4207,12 @@ async fn cancel_delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn format_query(Query(params): Query<QueryParams>) -> Result<Json<Value>, LokiApiError> {
+async fn format_query(
+    headers: HeaderMap,
+    Query(params): Query<QueryParams>,
+    body: Bytes,
+) -> Result<Json<Value>, LokiApiError> {
+    let params = merge_form_query_params(&headers, params, &body)?;
     let query = params
         .query
         .ok_or_else(|| LokiApiError::bad_request("query parameter is required"))?;
@@ -2268,21 +4321,21 @@ async fn metrics(State(state): State<ApiState>) -> Response {
         .health()
         .is_ok_and(|health| health.ready && lifecycle == ServiceState::Ready);
     let mut output = format!(
-        "# HELP shard_log_ready Whether ShardLog is ready.\n\
-         # TYPE shard_log_ready gauge\n\
-         shard_log_ready {}\n\
-         # HELP shard_log_durable_sink_pending_items Durable sink items waiting for indexing.\n\
-         # TYPE shard_log_durable_sink_pending_items gauge\n\
-         shard_log_durable_sink_pending_items {}\n\
-         shard_log_durable_sink_pending_bytes {}\n\
-         shard_log_durable_sink_checkpoint_age_milliseconds {}\n\
-         shard_log_durable_sink_applied_appends_total {}\n\
-         shard_log_durable_sink_retries_total {}\n\
-         shard_log_durable_sink_failures_total {}\n\
-         shard_log_durable_sink_dirty_partitions {}\n\
-         shard_log_retention_runs_total {}\n\
-         shard_log_retention_advanced_offsets_total {}\n\
-         shard_log_retention_failures_total {}\n",
+        "# HELP shard_telemetry_ready Whether ShardTelemetry is ready.\n\
+         # TYPE shard_telemetry_ready gauge\n\
+         shard_telemetry_ready {}\n\
+         # HELP shard_telemetry_durable_sink_pending_items Durable sink items waiting for indexing.\n\
+         # TYPE shard_telemetry_durable_sink_pending_items gauge\n\
+         shard_telemetry_durable_sink_pending_items {}\n\
+         shard_telemetry_durable_sink_pending_bytes {}\n\
+         shard_telemetry_durable_sink_checkpoint_age_milliseconds {}\n\
+         shard_telemetry_durable_sink_applied_appends_total {}\n\
+         shard_telemetry_durable_sink_retries_total {}\n\
+         shard_telemetry_durable_sink_failures_total {}\n\
+         shard_telemetry_durable_sink_dirty_partitions {}\n\
+         shard_telemetry_retention_runs_total {}\n\
+         shard_telemetry_retention_advanced_offsets_total {}\n\
+         shard_telemetry_retention_failures_total {}\n",
         u8::from(ready),
         store.pending_items,
         store.pending_bytes,
@@ -2297,27 +4350,27 @@ async fn metrics(State(state): State<ApiState>) -> Response {
     );
     if let Some(retained_payload_bytes) = store.retained_payload_bytes {
         output.push_str(&format!(
-            "shard_log_retained_payload_bytes {retained_payload_bytes}\n"
+            "shard_telemetry_retained_payload_bytes {retained_payload_bytes}\n"
         ));
     }
     if let Some(runtime) = &state.production {
         let protocol = runtime.metrics();
         let (http, ingest, query, tail, native) = runtime.admission_in_flight();
         output.push_str(&format!(
-            "shard_log_http_requests_total {}\n\
-             shard_log_authentication_failures_total {}\n\
-             shard_log_rejected_requests_total {}\n\
-             shard_log_ingest_requests_total {}\n\
-             shard_log_ingest_bytes_total {}\n\
-             shard_log_ingest_records_total {}\n\
-             shard_log_query_requests_total {}\n\
-             shard_log_native_connections_total {}\n\
-             shard_log_tail_subscriptions_total {}\n\
-             shard_log_http_in_flight {}\n\
-             shard_log_ingest_in_flight {}\n\
-             shard_log_query_in_flight {}\n\
-             shard_log_tail_in_flight {}\n\
-             shard_log_native_connections_in_flight {}\n",
+            "shard_telemetry_http_requests_total {}\n\
+             shard_telemetry_authentication_failures_total {}\n\
+             shard_telemetry_rejected_requests_total {}\n\
+             shard_telemetry_ingest_requests_total {}\n\
+             shard_telemetry_ingest_bytes_total {}\n\
+             shard_telemetry_ingest_records_total {}\n\
+             shard_telemetry_query_requests_total {}\n\
+             shard_telemetry_native_connections_total {}\n\
+             shard_telemetry_tail_subscriptions_total {}\n\
+             shard_telemetry_http_in_flight {}\n\
+             shard_telemetry_ingest_in_flight {}\n\
+             shard_telemetry_query_in_flight {}\n\
+             shard_telemetry_tail_in_flight {}\n\
+             shard_telemetry_native_connections_in_flight {}\n",
             protocol.http_requests,
             protocol.authentication_failures,
             protocol.rejected_requests,
@@ -2351,7 +4404,7 @@ async fn services(State(state): State<ApiState>) -> Json<Value> {
         .as_ref()
         .map(|runtime| runtime.lifecycle().state().as_str())
         .unwrap_or("ready");
-    Json(json!({"services": [{"service": "shard-log", "status": status}]}))
+    Json(json!({"services": [{"service": "shard-telemetry", "status": status}]}))
 }
 
 async fn log_level() -> Json<Value> {
@@ -2395,10 +4448,10 @@ async fn flush_store(state: &ApiState) -> Result<(), LokiApiError> {
 async fn build_info() -> Json<Value> {
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
-        "revision": option_env!("SHARD_LOG_GIT_REVISION").unwrap_or("unknown"),
+        "revision": option_env!("SHARD_TELEMETRY_GIT_REVISION").unwrap_or("unknown"),
         "branch": "unknown",
         "buildUser": "cargo",
-        "buildDate": option_env!("SHARD_LOG_BUILD_DATE").unwrap_or("unknown"),
+        "buildDate": option_env!("SHARD_TELEMETRY_BUILD_DATE").unwrap_or("unknown"),
         "goVersion": "",
     }))
 }
@@ -2466,6 +4519,134 @@ mod tests {
             structured_metadata: BTreeMap::new(),
         };
         assert!(selector.matches(&entry));
+    }
+
+    #[test]
+    fn parser_filter_and_format_pipeline_stages_match_logql_semantics() {
+        let selector = parse_log_query(
+            r#"{app="api"} | json | duration >= 40ms and status =~ "5.." | label_format code=status | drop status | line_format "{{.method}} {{.code}} {{ __line__ }}""#,
+        )
+        .expect("query");
+        let entry = LokiEntry {
+            timestamp_unix_nanos: 1,
+            labels: BTreeMap::from([("app".to_owned(), "api".to_owned())]),
+            line: r#"{"method":"GET","status":"500","duration":"42ms"}"#.to_owned(),
+            structured_metadata: BTreeMap::new(),
+        };
+        let processed = selector.process(entry).expect("matching entry");
+        assert_eq!(processed.labels["method"], "GET");
+        assert_eq!(processed.labels["code"], "500");
+        assert!(!processed.labels.contains_key("status"));
+        assert_eq!(
+            processed.line,
+            r#"GET 500 {"method":"GET","status":"500","duration":"42ms"}"#
+        );
+
+        let rejected = LokiEntry {
+            timestamp_unix_nanos: 2,
+            labels: BTreeMap::from([("app".to_owned(), "api".to_owned())]),
+            line: r#"{"method":"GET","status":"200","duration":"2ms"}"#.to_owned(),
+            structured_metadata: BTreeMap::new(),
+        };
+        assert!(selector.process(rejected).is_none());
+    }
+
+    #[test]
+    fn regexp_pattern_logfmt_unpack_and_decolorize_are_lossless() {
+        let regexp = parse_log_query(r#"{} | regexp "user=(?P<user>[^ ]+)""#).expect("regexp");
+        let logfmt = parse_log_query(r#"{} | logfmt | status = 500"#).expect("logfmt");
+        let pattern =
+            parse_log_query(r#"{} | pattern "request <method> <path>""#).expect("pattern");
+        let unpack = parse_log_query(r#"{} | unpack | decolorize"#).expect("unpack");
+        let base = |line: &str| LokiEntry {
+            timestamp_unix_nanos: 1,
+            labels: BTreeMap::new(),
+            line: line.to_owned(),
+            structured_metadata: BTreeMap::new(),
+        };
+        assert_eq!(
+            regexp.process(base("user=alice ok")).unwrap().labels["user"],
+            "alice"
+        );
+        assert!(logfmt.process(base("status=500 duration=42ms")).is_some());
+        let patterned = pattern.process(base("request GET /health")).unwrap();
+        assert_eq!(patterned.labels["method"], "GET");
+        assert_eq!(patterned.labels["path"], "/health");
+        let unpacked = unpack
+            .process(base(r#"{"_entry":"\u001b[31mfailed\u001b[0m","pod":"a"}"#))
+            .unwrap();
+        assert_eq!(unpacked.line, "failed");
+        assert_eq!(unpacked.labels["pod"], "a");
+    }
+
+    #[test]
+    fn parser_errors_are_labels_and_can_be_filtered_explicitly() {
+        let selector = parse_log_query(r#"{} | json | __error__ != """#).expect("query");
+        let entry = LokiEntry {
+            timestamp_unix_nanos: 1,
+            labels: BTreeMap::new(),
+            line: "not json".to_owned(),
+            structured_metadata: BTreeMap::new(),
+        };
+        let processed = selector.process(entry).expect("parser error is selected");
+        assert_eq!(processed.labels["__error__"], "JSONParserErr");
+    }
+
+    #[test]
+    fn metric_logql_range_aggregation_unwrap_and_binary_matching_are_exact() {
+        let entries = vec![
+            LokiEntry {
+                timestamp_unix_nanos: 1_000_000_000,
+                labels: BTreeMap::from([
+                    ("app".to_owned(), "api".to_owned()),
+                    ("pod".to_owned(), "a".to_owned()),
+                ]),
+                line: "duration=100ms".to_owned(),
+                structured_metadata: BTreeMap::new(),
+            },
+            LokiEntry {
+                timestamp_unix_nanos: 2_000_000_000,
+                labels: BTreeMap::from([
+                    ("app".to_owned(), "api".to_owned()),
+                    ("pod".to_owned(), "b".to_owned()),
+                ]),
+                line: "duration=300ms".to_owned(),
+                structured_metadata: BTreeMap::new(),
+            },
+        ];
+        let count = parse_metric_expression(r#"sum by (app) (count_over_time({app="api"}[2s]))"#)
+            .expect("count query");
+        let MetricValue::Vector(count) =
+            evaluate_metric_expression(&count, &entries, 2_000_000_000).expect("evaluation")
+        else {
+            panic!("expected vector");
+        };
+        assert_eq!(count.len(), 1);
+        assert_eq!(count[0].labels["app"], "api");
+        assert_eq!(count[0].value, 2.0);
+
+        let average = parse_metric_expression(
+            r#"avg_over_time({app="api"} | logfmt | unwrap duration [2s])"#,
+        )
+        .expect("unwrap query");
+        let MetricValue::Vector(average) =
+            evaluate_metric_expression(&average, &entries, 2_000_000_000).expect("evaluation")
+        else {
+            panic!("expected vector");
+        };
+        assert_eq!(average.len(), 2);
+        assert!(average.iter().any(|sample| sample.value == 0.1));
+        assert!(average.iter().any(|sample| sample.value == 0.3));
+
+        let comparison =
+            parse_metric_expression(r#"sum(count_over_time({app="api"}[2s])) > bool 1"#)
+                .expect("comparison");
+        let MetricValue::Vector(comparison) =
+            evaluate_metric_expression(&comparison, &entries, 2_000_000_000).expect("evaluation")
+        else {
+            panic!("expected vector");
+        };
+        assert_eq!(comparison[0].value, 1.0);
     }
 
     #[test]
@@ -2721,6 +4902,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_form_parameters_match_url_query_parameters() {
+        let app = loki_router(Arc::new(LokiApiStore::default()), LokiApiConfig::default());
+        let push = Request::builder()
+            .method(Method::POST)
+            .uri("/loki/api/v1/push")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-scope-orgid", "tenant-a")
+            .body(Body::from(
+                r#"{"streams":[{"stream":{"app":"api"},"values":[["100","request complete"]]}]}"#,
+            ))
+            .expect("push request");
+        assert_eq!(
+            app.clone().oneshot(push).await.expect("push").status(),
+            StatusCode::NO_CONTENT
+        );
+
+        let query = Request::builder()
+            .method(Method::POST)
+            .uri("/loki/api/v1/query_range?limit=5")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header("x-scope-orgid", "tenant-a")
+            .body(Body::from(
+                "query=%7Bapp%3D%22api%22%7D&start=1&end=200&direction=forward",
+            ))
+            .expect("form query");
+        let response = app.clone().oneshot(query).await.expect("query response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("JSON");
+        assert_eq!(
+            body["data"]["result"][0]["values"][0][1],
+            "request complete"
+        );
+
+        let series = Request::builder()
+            .method(Method::POST)
+            .uri("/loki/api/v1/series")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header("x-scope-orgid", "tenant-a")
+            .body(Body::from(
+                "match%5B%5D=%7Bapp%3D%22api%22%7D&start=1&end=200",
+            ))
+            .expect("form series");
+        let response = app.oneshot(series).await.expect("series response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("JSON");
+        assert_eq!(body["data"][0]["app"], "api");
+    }
+
+    #[tokio::test]
+    async fn metric_query_range_returns_loki_matrix_samples() {
+        let app = loki_router(Arc::new(LokiApiStore::default()), LokiApiConfig::default());
+        let push = Request::builder()
+            .method(Method::POST)
+            .uri("/loki/api/v1/push")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-scope-orgid", "tenant-a")
+            .body(Body::from(
+                r#"{"streams":[{"stream":{"app":"api"},"values":[["1000000000","one"],["2000000000","two"]]}]}"#,
+            ))
+            .expect("push request");
+        assert_eq!(
+            app.clone().oneshot(push).await.expect("push").status(),
+            StatusCode::NO_CONTENT
+        );
+        let expression = form_urlencoded::byte_serialize(
+            r#"sum by (app) (count_over_time({app="api"}[2s]))"#.as_bytes(),
+        )
+        .collect::<String>();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/loki/api/v1/query_range?query={expression}&start=2000000000&end=3000000000&step=1s"
+                    ))
+                    .header("x-scope-orgid", "tenant-a")
+                    .body(Body::empty())
+                    .expect("query request"),
+            )
+            .await
+            .expect("query response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = serde_json::from_slice(
+            &to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("body"),
+        )
+        .expect("JSON");
+        assert_eq!(body["data"]["resultType"], "matrix");
+        assert_eq!(body["data"]["result"][0]["metric"]["app"], "api");
+        assert_eq!(body["data"]["result"][0]["values"][0][1], "2");
+        assert_eq!(body["data"]["result"][0]["values"][1][1], "1");
+    }
+
+    #[tokio::test]
     async fn delete_requests_hide_matching_logs_and_cancel_restores_visibility() {
         let app = loki_router(Arc::new(LokiApiStore::default()), LokiApiConfig::default());
         let push = Request::builder()
@@ -2871,7 +5156,7 @@ mod tests {
         let response = disabled
             .oneshot(
                 Request::builder()
-                    .uri("/shardlog/api/v1/clickhouse/scan")
+                    .uri("/shardtelemetry/api/v1/clickhouse/scan")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -2901,7 +5186,7 @@ mod tests {
             .clone()
             .oneshot(
                 Request::builder()
-                    .uri("/shardlog/api/v1/clickhouse/scan")
+                    .uri("/shardtelemetry/api/v1/clickhouse/scan")
                     .header("x-scope-orgid", "tenant-a")
                     .body(Body::empty())
                     .expect("request"),
@@ -2913,7 +5198,7 @@ mod tests {
         let authorized = app
             .oneshot(
                 Request::builder()
-                    .uri("/shardlog/api/v1/clickhouse/scan?term=failed&label.app=api&metadata.code=500")
+                    .uri("/shardtelemetry/api/v1/clickhouse/scan?term=failed&label.app=api&metadata.code=500")
                     .header("authorization", "Bearer analytics-secret")
                     .header("x-scope-orgid", "tenant-a")
                     .body(Body::empty())
@@ -3096,8 +5381,8 @@ mod tests {
             .await
             .expect("metrics body");
         let body = std::str::from_utf8(&body).expect("UTF-8 metrics");
-        assert!(body.contains("shard_log_authentication_failures_total"));
-        assert!(body.contains("shard_log_ingest_records_total"));
+        assert!(body.contains("shard_telemetry_authentication_failures_total"));
+        assert!(body.contains("shard_telemetry_ingest_records_total"));
         let counters = runtime.metrics();
         assert_eq!(counters.authentication_failures, 1);
         assert_eq!(counters.ingest_records, 1);

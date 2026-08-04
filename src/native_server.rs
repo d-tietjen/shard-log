@@ -8,9 +8,9 @@ use tokio::sync::{Semaphore, mpsc};
 
 use crate::loki_api::LokiApiError;
 use crate::{
-    DurableLokiStore, MAX_NATIVE_FRAME_BYTES, NATIVE_FRAME_HEADER_BYTES, NativeFrame,
-    NativeFrameHeader, NativeOpcode, NativeStatus, ProductionRuntime, ServiceState,
-    decode_native_query, encode_native_log_batch,
+    DurableTelemetryStore, MAX_NATIVE_FRAME_BYTES, NATIVE_FRAME_HEADER_BYTES, NativeFrame,
+    NativeFrameHeader, NativeOpcode, NativeStatus, NativeTelemetryBatch, ProductionRuntime,
+    ServiceState, decode_native_query, encode_native_log_query_result, is_native_telemetry_batch,
 };
 
 /// Product-owned admission check evaluated for every native append and query.
@@ -20,6 +20,15 @@ use crate::{
 pub trait NativeRequestGate: Send + Sync + std::fmt::Debug + 'static {
     /// Returns `Ok` only when this process may execute the request.
     fn check(&self) -> Result<(), String>;
+
+    /// Returns `Ok` only when this process may append every routed partition.
+    ///
+    /// The default preserves coordinator-only gates. HA products override this
+    /// method to fence each signal partition after the complete STB1 request is
+    /// decoded and before any partition append starts.
+    fn check_partitions(&self, _partitions: &[crate::NativePartitionAppend]) -> Result<(), String> {
+        self.check()
+    }
 }
 
 /// Runtime limits for the native TCP listener.
@@ -32,7 +41,7 @@ pub struct NativeServerConfig {
     /// Wait for exact-query visibility before acknowledging native appends.
     ///
     /// When false, acknowledgement means the authoritative checksummed
-    /// compressed ingest pack is durable and indexing continues under bounded
+    /// STEL envelope is durable and indexing continues under bounded
     /// shard-stream backpressure.
     pub wait_for_index: bool,
     /// Shared authentication, tenant, lifecycle, and admission controls.
@@ -79,7 +88,7 @@ impl NativeServerConfig {
 /// copied from each request frame.
 pub async fn serve_native<F>(
     listener: TcpListener,
-    store: Arc<DurableLokiStore>,
+    store: Arc<DurableTelemetryStore>,
     config: NativeServerConfig,
     shutdown: F,
 ) -> io::Result<()>
@@ -110,7 +119,7 @@ where
                         && error.kind() != io::ErrorKind::UnexpectedEof
                         && error.kind() != io::ErrorKind::ConnectionReset
                     {
-                        eprintln!("native ShardLog connection failed: {error}");
+                        eprintln!("native ShardTelemetry connection failed: {error}");
                     }
                 });
             }
@@ -120,7 +129,7 @@ where
 
 async fn serve_connection(
     socket: TcpStream,
-    store: Arc<DurableLokiStore>,
+    store: Arc<DurableTelemetryStore>,
     config: NativeServerConfig,
 ) -> io::Result<()> {
     let (mut reader, mut writer) = socket.into_split();
@@ -278,10 +287,10 @@ fn authenticate_frame(
 async fn dispatch(
     header: NativeFrameHeader,
     payload: Vec<u8>,
-    store: Arc<DurableLokiStore>,
+    store: Arc<DurableTelemetryStore>,
     config: &NativeServerConfig,
 ) -> NativeFrame {
-    if matches!(header.opcode, NativeOpcode::Append | NativeOpcode::Query)
+    if matches!(header.opcode, NativeOpcode::Query)
         && let Some(gate) = &config.request_gate
         && let Err(error) = gate.check()
     {
@@ -317,17 +326,51 @@ async fn dispatch(
                 None => None,
             };
             let source_bytes = payload.len();
+            if !is_native_telemetry_batch(&payload) {
+                return error_frame(
+                    header,
+                    NativeStatus::BadRequest,
+                    "native append requires the signal-aware STB1 payload",
+                );
+            }
+            let telemetry_batch = match NativeTelemetryBatch::decode(&payload) {
+                Ok(batch) => batch,
+                Err(error) => {
+                    return error_frame(header, NativeStatus::BadRequest, &error.to_string());
+                }
+            };
+            if let Some(gate) = &config.request_gate
+                && let Err(error) = gate.check_partitions(&telemetry_batch.partitions)
+            {
+                return error_frame(header, NativeStatus::Unavailable, &error);
+            }
+            if let Some(runtime) = &runtime
+                && telemetry_batch
+                    .partitions
+                    .iter()
+                    .any(|partition| partition.envelope.tenant.as_ref() != runtime.tenant())
+            {
+                return error_frame(
+                    header,
+                    NativeStatus::Unauthorized,
+                    "native telemetry tenant does not match the authenticated tenant",
+                );
+            }
             let wait_for_index = config.wait_for_index;
             let append = move || {
-                let result = if let Some(runtime) = &runtime {
-                    store.append_native_batch_for_tenant(payload, runtime.tenant(), wait_for_index)
-                } else if wait_for_index {
-                    store.append_native_batch(payload).map(|ack| (ack, 0))
-                } else {
-                    store
-                        .append_native_batch_durable(payload)
-                        .map(|ack| (ack, 0))
-                };
+                let records = telemetry_batch
+                    .partitions
+                    .iter()
+                    .fold(0_u32, |total, partition| {
+                        total.saturating_add(partition.envelope.item_count)
+                    });
+                let result = store
+                    .append_telemetry_batch(&telemetry_batch, wait_for_index)
+                    .and_then(|ack| {
+                        ack.encode()
+                            .map(|encoded| (encoded, records))
+                            .map_err(|error| LokiApiError::internal(error.to_string()))
+                    });
                 drop(ingest_permit);
                 result
             };
@@ -336,7 +379,7 @@ async fn dispatch(
                     if let Some(runtime) = &config.production {
                         runtime.record_ingest(source_bytes, records as usize);
                     }
-                    ok_frame(header, ack.encode().to_vec())
+                    ok_frame(header, ack)
                 }
                 Ok(Err(error)) => store_error_frame(header, error),
                 Err(error) => error_frame(
@@ -415,7 +458,7 @@ async fn dispatch(
                 None => worker.await,
             };
             match result {
-                Ok(Ok(entries)) => match encode_native_log_batch(&tenant, entries) {
+                Ok(Ok(entries)) => match encode_native_log_query_result(&tenant, entries) {
                     Ok(encoded) => ok_frame(header, encoded),
                     Err(error) => error_frame(header, NativeStatus::Internal, &error.to_string()),
                 },
@@ -467,13 +510,15 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use shard_stream_core::{LogicalPartitionId, TopicPartition};
     use tokio::net::TcpStream;
 
     use super::*;
     use crate::{
-        DurableLokiConfig, LokiEntry, NativeAppendAck, NativeLogBatch, NativeQuery,
-        NativeQueryDirection, ServiceLifecycle, SingleTenantConfig, StripeConfig,
-        decode_native_log_batch, encode_native_log_batch, encode_native_query,
+        DurableTelemetryConfig, LokiEntry, NativeLogQueryResult, NativePartitionAppend,
+        NativeQuery, NativeQueryDirection, NativeTelemetryAppendAck, NativeTelemetryBatch,
+        ServiceLifecycle, SingleTenantConfig, StripeConfig, decode_native_log_query_result,
+        encode_native_query, prepare_loki_log_envelope,
     };
 
     #[derive(Debug)]
@@ -492,11 +537,11 @@ mod tests {
             .expect("clock")
             .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "shard-log-native-server-{}-{nonce}",
+            "shard-telemetry-native-server-{}-{nonce}",
             std::process::id()
         ));
         let store = Arc::new(
-            DurableLokiStore::open(DurableLokiConfig {
+            DurableTelemetryStore::open(DurableTelemetryConfig {
                 data_directory: directory.clone(),
                 object_store_directory: None,
                 recovery_journal: false,
@@ -539,15 +584,25 @@ mod tests {
             line: "native timeout".to_owned(),
             structured_metadata: BTreeMap::from([("trace".to_owned(), "abc".to_owned())]),
         };
-        let batch = encode_native_log_batch("tenant-a", vec![entry.clone()]).expect("batch");
+        let topic_partition = TopicPartition::new(crate::LOGS_TOPIC_ID, LogicalPartitionId::new(0));
+        let batch = NativeTelemetryBatch {
+            partitions: vec![NativePartitionAppend {
+                topic_partition,
+                envelope: prepare_loki_log_envelope("tenant-a", vec![entry.clone()])
+                    .expect("log envelope"),
+            }],
+        }
+        .encode()
+        .expect("batch");
         let append = NativeFrame::request(NativeOpcode::Append, 8, batch).expect("append");
         write_frame(&mut client, &append).await;
         let response = read_frame(&mut client).await;
         assert_eq!(response.header.request_id, 8);
         assert_eq!(response.header.status, NativeStatus::Ok);
         assert_eq!(
-            NativeAppendAck::decode(&response.payload)
+            NativeTelemetryAppendAck::decode(&response.payload)
                 .expect("ack")
+                .partitions[0]
                 .first_offset,
             0
         );
@@ -571,8 +626,8 @@ mod tests {
         let response = read_frame(&mut client).await;
         assert_eq!(response.header.request_id, 9);
         assert_eq!(response.header.status, NativeStatus::Ok);
-        let NativeLogBatch { tenant, entries } =
-            decode_native_log_batch(&response.payload).expect("results");
+        let NativeLogQueryResult { tenant, entries } =
+            decode_native_log_query_result(&response.payload).expect("results");
         assert_eq!(tenant, "tenant-a");
         assert_eq!(entries, vec![entry]);
 
@@ -593,11 +648,11 @@ mod tests {
             .expect("clock")
             .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "shard-log-native-auth-{}-{nonce}",
+            "shard-telemetry-native-auth-{}-{nonce}",
             std::process::id()
         ));
         let store = Arc::new(
-            DurableLokiStore::open(DurableLokiConfig {
+            DurableTelemetryStore::open(DurableTelemetryConfig {
                 data_directory: directory.clone(),
                 object_store_directory: None,
                 recovery_journal: false,

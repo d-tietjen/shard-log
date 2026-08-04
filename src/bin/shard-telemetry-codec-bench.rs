@@ -23,7 +23,6 @@ enum Codec {
     Lz4Flex,
     Lz4Native,
     Lz4NativeHighCompression,
-    Lz4Rust,
     Snappy,
     S2,
     S2Better,
@@ -32,8 +31,6 @@ enum Codec {
     Flate2,
     Libdeflate,
     ZlibRs,
-    Flate3,
-    Zenflate,
     Zopfli,
     Brotli,
     Bzip2,
@@ -51,12 +48,11 @@ enum Codec {
 impl Codec {
     /// The balanced one-gigabyte screen. Slow archival codecs remain available
     /// through `--codecs archive` or `--codecs all`.
-    const SCREEN: [Self; 22] = [
+    const SCREEN: [Self; 19] = [
         Self::Copy,
         Self::Lz4Flex,
         Self::Lz4Native,
         Self::Lz4NativeHighCompression,
-        Self::Lz4Rust,
         Self::Snappy,
         Self::S2,
         Self::S2Better,
@@ -64,8 +60,6 @@ impl Codec {
         Self::Flate2,
         Self::Libdeflate,
         Self::ZlibRs,
-        Self::Flate3,
-        Self::Zenflate,
         Self::Brotli,
         Self::Lzfse,
         Self::LzfseRust,
@@ -87,12 +81,11 @@ impl Codec {
         Self::Zstd9,
     ];
 
-    const ALL: [Self; 27] = [
+    const ALL: [Self; 24] = [
         Self::Copy,
         Self::Lz4Flex,
         Self::Lz4Native,
         Self::Lz4NativeHighCompression,
-        Self::Lz4Rust,
         Self::Snappy,
         Self::S2,
         Self::S2Better,
@@ -101,8 +94,6 @@ impl Codec {
         Self::Flate2,
         Self::Libdeflate,
         Self::ZlibRs,
-        Self::Flate3,
-        Self::Zenflate,
         Self::Zopfli,
         Self::Brotli,
         Self::Bzip2,
@@ -123,7 +114,6 @@ impl Codec {
             Self::Lz4Flex => "lz4_flex",
             Self::Lz4Native => "lz4_native",
             Self::Lz4NativeHighCompression => "lz4_native_hc-9",
-            Self::Lz4Rust => "lz4_rust",
             Self::Snappy => "snap",
             Self::S2 => "s2",
             Self::S2Better => "s2_better",
@@ -132,8 +122,6 @@ impl Codec {
             Self::Flate2 => "deflate-6",
             Self::Libdeflate => "libdeflate-6",
             Self::ZlibRs => "zlib_rs-6",
-            Self::Flate3 => "flate3",
-            Self::Zenflate => "zenflate-7",
             Self::Zopfli => "zopfli-5",
             Self::Brotli => "brotli-5",
             Self::Bzip2 => "bzip2-9",
@@ -202,7 +190,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn parse_settings() -> Result<Settings, Box<dyn Error>> {
     let mut arguments = env::args_os().skip(1);
     let input = arguments.next().map(PathBuf::from).ok_or(
-        "usage: shard-log-codec-bench <raw-log-file> [--codecs NAMES|screen|archive|all] [--limit-bytes N] [--block-bytes N] [--report PATH]",
+        "usage: shard-telemetry-codec-bench <raw-log-file> [--codecs NAMES|screen|archive|all] [--limit-bytes N] [--block-bytes N] [--report PATH]",
     )?;
     let mut limit_bytes = DEFAULT_LIMIT_BYTES;
     let mut block_bytes = DEFAULT_BLOCK_BYTES;
@@ -367,17 +355,6 @@ fn compress(codec: Codec, mut input: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
             Some(lz4::block::CompressionMode::HIGHCOMPRESSION(9)),
             true,
         )?),
-        Codec::Lz4Rust => {
-            let bound =
-                usize::try_from(lz4_rust::block::compress_bound(i32::try_from(input.len())?))?;
-            let mut output = vec![0; bound];
-            let length =
-                lz4_rust::block::compress_default(input, &mut output).map_err(|error| {
-                    std::io::Error::other(format!("lz4-rust compression failed: {error:?}"))
-                })?;
-            output.truncate(length);
-            Ok(output)
-        }
         Codec::Snappy => Ok(snap::raw::Encoder::new().compress_vec(input)?),
         Codec::S2 => Ok(minlz::s2::encode(input)),
         Codec::S2Better => Ok(minlz::s2::encode_better(input)),
@@ -409,14 +386,6 @@ fn compress(codec: Codec, mut input: &[u8]) -> Result<Vec<u8>, Box<dyn Error>> {
                 return Err(format!("zlib-rs compression returned {status:?}").into());
             }
             Ok(encoded.to_vec())
-        }
-        Codec::Flate3 => Ok(flate3::deflate(input)),
-        Codec::Zenflate => {
-            let mut encoder = zenflate::Compressor::new(zenflate::CompressionLevel::balanced());
-            let mut output = vec![0; zenflate::Compressor::zlib_compress_bound(input.len())];
-            let length = encoder.zlib_compress(input, &mut output, zenflate::Unstoppable)?;
-            output.truncate(length);
-            Ok(output)
         }
         Codec::Zopfli => {
             let options = zopfli::Options {
@@ -484,14 +453,6 @@ fn decompress(
         Codec::Lz4Native | Codec::Lz4NativeHighCompression => {
             Ok(lz4::block::decompress(input, None)?)
         }
-        Codec::Lz4Rust => {
-            let mut output = vec![0; source_bytes];
-            let length = lz4_rust::block::decompress_safe(input, &mut output).map_err(|error| {
-                std::io::Error::other(format!("lz4-rust decompression failed: {error:?}"))
-            })?;
-            output.truncate(length);
-            Ok(output)
-        }
         Codec::Snappy => Ok(snap::raw::Decoder::new().decompress_vec(input)?),
         Codec::S2 | Codec::S2Better | Codec::S2Best => Ok(minlz::s2::decode(input)?),
         Codec::MinLzBalanced => Ok(minlz::minlz::decompress(input)?),
@@ -516,14 +477,6 @@ fn decompress(
                 return Err(format!("zlib-rs decompression returned {status:?}").into());
             }
             Ok(decoded.to_vec())
-        }
-        Codec::Flate3 => Ok(flate3::inflate(input)),
-        Codec::Zenflate => {
-            let mut decoder = zenflate::Decompressor::new();
-            let mut output = vec![0; source_bytes];
-            let outcome = decoder.zlib_decompress(input, &mut output, zenflate::Unstoppable)?;
-            output.truncate(outcome.output_written);
-            Ok(output)
         }
         Codec::Zopfli => {
             let mut decoder = flate2::read::ZlibDecoder::new(input);
@@ -575,7 +528,7 @@ fn decompress(
 }
 
 fn format_report(settings: &Settings, results: &[CodecResult]) -> String {
-    let mut report = String::from("shard-log codec compression benchmark\n");
+    let mut report = String::from("shard-telemetry codec compression benchmark\n");
     report.push_str(&format!("input: {}\n", settings.input.display()));
     report.push_str(&format!("block target: {}\n", settings.block_bytes));
     report.push_str(&format!(

@@ -1,12 +1,350 @@
 # Compression benchmark results
 
+## Logs, traces, metrics, and correlation — local v1 storage run (2026-08-03)
+
+`shard-telemetry-signal-bench` generates one deterministic, correlated
+production-like corpus for all three signals. Every signal shares exact typed
+resource and scope metadata; logs and spans share trace/span IDs; metric
+exemplars use the same link model. It measures the sole pre-release v1 format:
+
+- logs use the structural storage codec and its embedded lookup index;
+- traces use bounded 8 MiB multi-trace columnar blocks;
+- metrics use per-series chunks;
+- trace and metric stored bytes include their serialized cold-correlation
+  filters.
+
+The current storage-inclusive run used an Apple M5 Max, 32,768 records per
+signal, and 2,000 warm lookup iterations. Encode throughput includes codec and
+cold-filter construction; log encode also includes structural indexing.
+
+| Signal | Canonical bytes | Payload bytes | Auxiliary bytes | Stored bytes | Ratio | Encode | Decode |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Logs | 29,773,336 | 1,188,990 | 0 | 1,188,990 | **25.04x** | 290.97 MiB/s | 529.80 MiB/s |
+| Traces | 13,371,009 | 194,521 | 604 | 195,125 | **68.53x** | 707.91 MiB/s | 3,846.34 MiB/s |
+| Metrics | 14,806,656 | 313,678 | 3,814 | 317,492 | **46.64x** | 1,432.72 MiB/s | 4,274.31 MiB/s |
+
+| Lookup path | Results/page | Lookups/s | p50 | p99 |
+| --- | ---: | ---: | ---: | ---: |
+| Log term + exact metadata | 100 | 52,639 | 18.75 us | 21.83 us |
+| Trace ID | 8 | 97,541 | 10.29 us | 11.17 us |
+| Exact metric series | 100 | 2,723 | 364.92 us | 400.96 us |
+| Resource + typed-label correlation | 1,000 | 4,653 | 214.83 us | 242.21 us |
+
+An earlier codec-only ablation omitted block grouping, structural log storage,
+and cold-correlation bytes. It reported 25.41x logs, 68.98x traces, and 47.20x
+metrics on the same 32,768-record corpus. Those figures remain useful for
+isolating codec changes but are superseded by the storage-inclusive table for
+capacity planning.
+
+These are deterministic synthetic storage/index results, not Adam production
+capture or competitor claims. The existing 80 GiB Adam log result below remains
+the authoritative real-log gate. Retained 16 GiB trace and metric captures are
+still required before publishing Tempo and Prometheus head-to-head claims.
+
+### Adam single-core synthetic lookup and storage codec
+
+The exact public commit `bdcb1c84e37fa3d9d24f097106bbb002a850c0c2`
+was prewarmed once and measured three times on physical CPU 0 of Adam's AMD
+Ryzen 9 3950X. The table reports the median of the three runs; every run used
+32,768 records per signal and 2,000 lookup iterations.
+
+| Signal | Stored bytes | Ratio | Encode | Decode | Lookups/s | p50 / p99 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Logs | 1,188,990 | 25.04x | 88.37 MiB/s | 173.39 MiB/s | 23,757 | 41.74 / 48.11 us |
+| Traces | 195,125 | 68.53x | 286.48 MiB/s | 1,091.95 MiB/s | 17,608 | 57.06 / 66.06 us |
+| Metrics | 317,492 | 46.64x | 707.65 MiB/s | 1,632.68 MiB/s | 1,683 | 591.87 / 627.48 us |
+| Resource + typed-label correlation | — | — | — | — | 1,765 | 558.85 / 699.02 us |
+
+The process consumed one CPU and had a median peak RSS of 191,992 KiB. This
+path intentionally includes rich typed metadata, index construction, and cold
+filters; it does not meet the separate 1 GiB/s-per-core target for logs or
+traces. Metrics exceed 1 GiB/s on the Apple development host but reach 707.65
+MiB/s on Adam. These measurements identify CPU work rather than hiding it
+behind aggregate multi-core throughput.
+
+Retained evidence:
+
+```text
+/home/dtietjen/shard-telemetry-evidence-bdcb1c8/signal-run-{1,2,3}.txt
+```
+
+### Adam traces and metrics versus ClickHouse — 2026-08-04
+
+The exact public revision
+`b05123a60104eb54c463f9f63d52a76f8e0109e0` was compared with ClickHouse
+26.5.1.882 three times sequentially on physical CPU 0. Each run used the same
+deterministic 262,144-record corpus per signal and 2,000 warm lookup
+iterations. The tables report medians.
+
+ClickHouse stored typed query columns plus the complete lossless MessagePack
+record in Zstandard-1 columns. ShardTelemetry stored its signal-native payload,
+cold-correlation filters, and durable frame lengths. Both timed storage paths
+wrote their output and synchronized it before stopping the timer. ClickHouse
+used an isolated one-core MergeTree container with
+`fsync_after_insert = 1`; ShardTelemetry wrote one framed pack per signal and
+called `sync_all`.
+
+| Signal | Engine | Canonical bytes | Durable bytes | Ratio | Durable encode |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Traces | **ShardTelemetry** | 107,609,736 | **1,558,432** | **69.05x** | **268.55 MiB/s** |
+| Traces | ClickHouse | 107,609,736 | 5,753,460 | 18.70x | 103.66 MiB/s |
+| Metrics | **ShardTelemetry** | 126,451,328 | **2,244,829** | **56.33x** | **596.09 MiB/s** |
+| Metrics | ClickHouse | 126,451,328 | 3,882,804 | 32.57x | 110.64 MiB/s |
+
+ShardTelemetry used 72.91% fewer bytes and encoded 2.59x faster for traces. It
+used 42.19% fewer bytes and encoded 5.39x faster for metrics. The metric corpus
+contains exactly 128 series with 2,048 points each, so every series stays below
+the production 4,096-point chunk bound.
+
+| Warm lookup | Results | ShardTelemetry ops/s | ShardTelemetry p50 / p99 | ClickHouse ops/s | ClickHouse p50 / p99 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Trace ID | 8 | **700,272.02** | **0.00138 / 0.00140 ms** | 338.36 | 2 / 6 ms |
+| Exact metric series | 100 | **12,297.18** | **0.080 / 0.124 ms** | 267.40 | 3 / 9 ms |
+
+ShardTelemetry completed 2,069.59x more trace-ID lookups and 45.99x more exact
+metric-series lookups per second. Its trace p50 was 1,449x lower and its metric
+p50 was 37.44x lower. The ShardTelemetry measurements use the native Rust query
+API; ClickHouse uses one persistent `clickhouse-benchmark` client/server
+connection, whose percentile output is quantized to milliseconds. This is an
+engine-boundary comparison, not a same-wire-protocol claim.
+
+The improvement was profile-guided. The baseline revision recomputed a full
+series fingerprint for every decoded metric point, materialized every metric
+chunk before applying the result limit, scanned every trace head and resident
+trace block for an exact ID, and cloned the smallest complete correlation
+posting before intersecting and truncating it. The current paths instead use:
+
+- direct exact-series and exact-trace ownership lookups;
+- timestamp-ordered metric chunk pruning with conflict-safe cutoff;
+- trace-directory fragment pushdown into block-ID-keyed resident storage;
+- one identity check per exact metric series rather than one per point; and
+- bounded streaming correlation intersection with monotonic posting cursors.
+
+On the same 262,144-record corpus and 10,000 iterations, the profile workload
+fell from approximately 1.361 trillion to 72.36 billion sampled CPU cycles, a
+94.68% reduction, with zero lost samples. Metric lookup improved from a
+three-run median of 178.88 to 12,297.18 operations per second. Cross-signal
+correlation improved from 35.46 to 98,596.33 operations per second while
+retaining its 1,000-reference page and exact ordering.
+
+The final profile's largest self-costs are now the log hot-posting collector
+(9.25%), BLAKE3 canonical hashing (6.58%), correlation ingestion (5.81%), and
+hot log matching (3.78%). Metric decoding is 0.57% self time, and neither
+exact trace lookup nor metric lookup remains a leading flat hotspot. The next
+optimization work should therefore target limit-aware log-posting iteration
+and cached immutable resource, scope, attribute, and series identities rather
+than changing the trace or metric compression codecs.
+
+Before timing, ClickHouse returned the selected trace and the complete
+2,048-point metric series as byte-identical MessagePack. All three runs produced
+the same corpus hashes and query-result hashes. Cross-signal correlation is not
+claimed as a ClickHouse comparison because the current ClickHouse query covers
+only one table, while the ShardTelemetry operation follows resource, typed
+attribute, trace, span-link, and exemplar postings across all three signals.
+
+Retained evidence:
+
+```text
+/home/dtietjen/shard-telemetry-signal-clickhouse-head-to-head/optimized-b05123a-r{1,2,3}
+/home/dtietjen/shard-telemetry-profiles/b1b2711-baseline
+/home/dtietjen/shard-telemetry-profiles/b05123a-final
+```
+
+The three `summary.tsv` SHA-256 values are, in run order:
+
+```text
+ca64e0c303a1f1addb76b8bdc03e39431467b664fe0a4d96c4cfeaa075dd4ded
+f4fc215d8ea58c7fabfaa3e1219f4385428a9035afa425e83a95b56a165a2b82
+2df2e3af2c2ce0fbf6dcb08be5136e464517314854c75ce1bda2223e395131f5
+```
+
+The final `perf.data` SHA-256 is
+`72bbf5ef59b6fab5aae8b7676a9d68fb8b9d4b66d5e49ac498ee73e791831712`.
+
+These are deterministic production-like records, not retained production
+captures. A publishable production-corpus claim still requires the planned
+16 GiB trace and metric captures with the same lossless schema and validation
+gates.
+
+Reproduce the head-to-head on Adam from a release build with:
+
+```bash
+RUN_ID=signal-h2h-reproduction \
+RECORDS=262144 \
+LOOKUP_ITERATIONS=2000 \
+scripts/run-signal-clickhouse-head-to-head.sh
+```
+
+Run the standalone signal benchmark locally with:
+
+```bash
+cargo run --release --bin shard-telemetry-signal-bench -- \
+  --records 32768 --iterations 2000
+```
+
+### Profile-guided hot lookup and cold-tier reads — 2026-08-04
+
+Revision `ed9f0971dc19f3e719641f723d1294b603b08088` was prewarmed once and
+measured three times sequentially on Adam physical CPU 0. The hot comparison
+uses the retained `b05123a60104eb54c463f9f63d52a76f8e0109e0` runs above with
+the same 262,144 records per signal and 2,000 lookup iterations.
+
+| Lookup | `b05123a` median | `ed9f097` median | Change | Current p50 / p99 |
+| --- | ---: | ---: | ---: | ---: |
+| Log term + exact metadata, limit 100 | 3,702.64/s | **81,787.94/s** | **22.09x** | **12.12 / 16.05 us** |
+| Trace ID | 700,272.02/s | 699,046.74/s | -0.18% | 1.38 / 1.40 us |
+| Exact metric series | 12,297.18/s | 12,227.66/s | -0.57% | 79.01 / 133.04 us |
+| Cross-signal correlation | 98,596.33/s | 98,533.71/s | -0.06% | 10.06 / 13.47 us |
+
+The log query now streams the shortest resident posting, checks the remaining
+postings by run membership, and stops after the requested offset-ordered page.
+It no longer materializes every match before truncating. Stored bytes and the
+25.02x log ratio are byte-identical to the baseline. The other lookup paths
+remain within normal run-to-run variance.
+
+The comparable 10,000-iteration `perf` workload fell from approximately
+72.36 billion to 49.84 billion sampled cycles, a **31.13% reduction**, with
+zero lost samples. `HotPostingList::collect_in` (formerly 9.25% self cost) and
+hot log matching (formerly 3.78%) no longer appear above the 0.5% reporting
+threshold. BLAKE3 fell from 6.58% to 2.56% after bounded exact-identity caches;
+correlation posting insertion is now the largest flat target at 9.56%.
+
+Cold object-tier reads were measured separately with 64 adjacent 64 KiB block
+ranges inside one 4 MiB immutable payload chunk. Each run used a new object and
+new caches; one cold query was followed by ten warm queries.
+
+| Path | Independent range reads | Batched range read | Ratio of medians |
+| --- | ---: | ---: | ---: |
+| Cold latency | 416,955.97 us | **25,756.76 us** | **16.19x** |
+| Warm latency/query | 374,601.71 us | **5,813.08 us** | **64.44x** |
+
+Both implementations fetched exactly one 4 MiB chunk from object storage. The
+independent path loaded that chunk 704 times across the cold and warm phases;
+the batched path loaded it 11 times. Production queries now use the batched
+path for selected log frames, trace blocks, and metric chunks. Catalog pages,
+group manifests, query/recovery indexes, and payload ranges are all cached and
+checksum-verified. Control/index data has a separate 8 GiB default cache, so a
+payload scan cannot evict it from the 512 GiB payload cache.
+
+The standalone cold benchmark is reproducible with:
+
+```bash
+taskset -c 0 target/release/shard-telemetry-tier-cache-bench --iterations 10
+```
+
+Retained native pinned evidence:
+
+```text
+/home/dtietjen/shard-telemetry-evidence-ed9f097
+```
+
+The three signal output hashes are:
+
+```text
+3ee42d41314136c298d0f801ae5514b62da51167fd71a1906bc7ba7b68288cd9
+dff1486e13d976f4ed40f27afd2ecb1e7da9c8da526afd65e50b7ba8f0ef82e3
+1dd041bc7f0cad62de6cf01333176f430c353e698ab092805ee0430a66ef48de
+```
+
+The three cold-tier output hashes are:
+
+```text
+2dcfabd804c0144016f1ed1b9db0d1b20ee3b3c7365f58cb8858ebe62818f158
+de41d482146f04dece67c495b6ddca5f01901a4f28760f61364f761bcd66415c
+764dda8bd5929536c917e8be313a8ccc5d45e1dacfc3301977754ebff0e0d3f1
+```
+
+The final `perf.data` SHA-256 is
+`033d73c8a439ab89cc5abf2c2266236ef1a3cc5c42bbefbe9d065eebae7e2b0d`.
+These are native revision-pinned measurements, not deterministic-simulation
+campaign evidence.
+
+## Current single-format 80 GiB acceptance — 2026-08-04
+
+This is the current pre-release result for commit
+`bdcb1c84e37fa3d9d24f097106bbb002a850c0c2`. It measures the only supported
+`STEL` structural format; there are no legacy readers, compatibility formats,
+or alternate ShardTelemetry implementations in this comparison.
+
+Host: Adam, AMD Ryzen 9 3950X, Linux 6.8
+
+CPUs: physical cores `0-15`; SMT siblings `16-31` were excluded
+
+Corpus: 85,899,345,920-byte immutable ClickHouse Docker JSON log
+
+SHA-256: `4fd6379bd89fcb44688a3ebd611729416c82f110fbf49ffef905d9df0ebf0508`
+
+The direct durable-storage path normalized and accepted 85,899,343,853 bytes
+across 607,363,459 records. Seven malformed complete records totaling 1,973
+bytes were rejected and reported. The run used 8 MiB blocks, 16 workers,
+Zstandard level 1, the production-default disabled locality router, and no
+second persistent term/field sidecar.
+
+| Metric | Current ShardTelemetry |
+| --- | ---: |
+| Structural bytes before Zstd | 15,026,825,037 |
+| Embedded compression-derived index before Zstd | 384,399,867 |
+| Zstd payload bytes | 620,093,229 |
+| Manifest bytes | 819,217 |
+| Durable total | **620,912,446** |
+| Raw-source compression ratio | **138.34x** |
+| Ingest wall time | **17.883 s** |
+| End-to-end throughput | **4,580.79 MiB/s** |
+
+All 10,240 payload checksums passed. The verifier also reconstructed the first,
+middle, and final blocks exactly. Compared with the accepted historical Pco-8
+result, the current format stores 7,561,221 fewer bytes and is 1.20% smaller.
+Compared with the first telemetry expansion run, it stores 40,419,454 fewer
+bytes and is 6.11% smaller. This closes the homogeneous-corpus no-regression
+gate while retaining the embedded lookup index.
+
+The storage improvement comes from making the frame index complementary to the
+codec: adaptive run-length/bit-packed ordinal columns, authoritative template
+IDs reused by body decoding, collision-safe 24-bit term/field fingerprints,
+and one shared fail-open membership hint. Fingerprint and filter collisions can
+only add candidates; exact selective decode remains the result authority.
+
+### Same-host retained engine comparison
+
+The rows below use the same Adam host, physical CPU set, and immutable corpus.
+They were run sequentially and retained independently. ShardTelemetry and
+ClickHouse use their native storage harnesses; Loki includes its HTTP JSON
+compatibility boundary, so the table is an engine-level result rather than a
+same-protocol claim.
+
+| Engine | Settled durable bytes | Ratio | Wall time | Throughput |
+| --- | ---: | ---: | ---: | ---: |
+| ShardTelemetry `bdcb1c8` | **620,912,446** | **138.34x** | **17.883 s** | **4,580.79 MiB/s** |
+| ClickHouse 26.5.1.882 | 1,175,650,470 | 73.07x | 89.46 s | 915.72 MiB/s |
+| Loki 3.7.2 | 4,905,868,184 | 17.51x | 1,010.043 s | 81.11 MiB/s |
+
+On this corpus ShardTelemetry is 5.00x faster than ClickHouse and uses 47.2%
+fewer durable bytes. It is 56.5x faster than the Loki compatibility run and
+uses 7.90x less settled storage. These results do not establish the separate
+1 GiB/s-per-core or 80%-scaling-through-16-cores gates: the measured aggregate
+rate is 4.47 GiB/s, or about 286 MiB/s per assigned core if divided naively.
+
+Retained Adam evidence:
+
+```text
+/home/dtietjen/shard-telemetry-evidence-bdcb1c8/full80-{report,stdout,time}.txt
+/home/dtietjen/shard-telemetry-evidence-bdcb1c8/full80-output
+/home/dtietjen/shard-telemetry-validation-suite-20260803/head-to-head/stel-current-ca5-20260803
+/home/dtietjen/shard-telemetry-validation-suite-20260803/loki/loki-3.7.2-e004916-20260803
+```
+
+The current ShardTelemetry report and stdout both have SHA-256
+`ee6909d1a2ed54b423e7d454e36162782708c1ba3a90961d6df0102b930b7bc8`.
+The settled Loki correction summary has SHA-256
+`c6a8f6918dc792fa7003a771c0f26268630430f5f012b14af43d5e411e7949c1`.
+
 ## Native fully indexed ingest optimization series — 1 GiB
 
 Date: 2026-07-30  
 Host: Adam, AMD Ryzen 9 3950X, Linux 6.8  
 Corpus: first complete-record span covering 1,073,741,933 source bytes and
 7,592,023 records from the immutable 80 GiB ClickHouse Docker JSON corpus  
-Protocol: native grouped batches, 1 MiB target, 16 ShardLog owner stripes,
+Protocol: native grouped batches, 1 MiB target, 16 ShardTelemetry owner stripes,
 leader-durable shard-stream append, and indexed acknowledgement  
 Storage: one authoritative shard-stream copy; the optional recovery journal
 was disabled
@@ -46,7 +384,7 @@ cause but means none of these rows is a server-only 16-core measurement.
 
 Every 1 GiB run wrote 832,404,552 native payload bytes and occupied about
 795 MiB on disk. That raw authoritative WAL write is now the throughput
-ceiling: ShardLog's structural block compressor runs above 2 GiB/s on this
+ceiling: ShardTelemetry's structural block compressor runs above 2 GiB/s on this
 corpus, but compression currently occurs after the raw shard-stream append.
 Reaching sustainable multi-GiB/s durable ingestion requires an explicitly
 approved recovery-format change that makes a checksummed structural-compressed
@@ -56,20 +394,20 @@ would only hide index/WAL lag and is not counted as a throughput result.
 Retained Adam evidence:
 
 ```text
-/home/dtietjen/shard-log-native-profile-v2
-/home/dtietjen/shard-log-native-profile-v3
-/home/dtietjen/shard-log-native-profile-v4-single-copy
-/home/dtietjen/shard-log-native-profile-v5-term-cache
-/home/dtietjen/shard-log-native-profile-v7-ordinals
-/home/dtietjen/shard-log-native-profile-v9-shared-metadata
-/home/dtietjen/shard-log-native-profile-v10-shared-metadata-perf
-/home/dtietjen/shard-log-native-profile-v11-workers32
-/home/dtietjen/shard-log-native-profile-v14-dense-postings-w32
-/home/dtietjen/shard-log-native-profile-v15-dense-postings-perf-w32
-/home/dtietjen/shard-log-native-profile-v19-notify-repeat-{a,b,c}
-/home/dtietjen/shard-log-native-profile-v20-linger1000-{a,b,c}
-/home/dtietjen/shard-log-native-profile-v21-batch2m-{a,b,c}
-/home/dtietjen/shard-log-native-profile-v22-shared-cpuset-{a,b,c}
+/home/dtietjen/shard-telemetry-native-profile-v2
+/home/dtietjen/shard-telemetry-native-profile-v3
+/home/dtietjen/shard-telemetry-native-profile-v4-single-copy
+/home/dtietjen/shard-telemetry-native-profile-v5-term-cache
+/home/dtietjen/shard-telemetry-native-profile-v7-ordinals
+/home/dtietjen/shard-telemetry-native-profile-v9-shared-metadata
+/home/dtietjen/shard-telemetry-native-profile-v10-shared-metadata-perf
+/home/dtietjen/shard-telemetry-native-profile-v11-workers32
+/home/dtietjen/shard-telemetry-native-profile-v14-dense-postings-w32
+/home/dtietjen/shard-telemetry-native-profile-v15-dense-postings-perf-w32
+/home/dtietjen/shard-telemetry-native-profile-v19-notify-repeat-{a,b,c}
+/home/dtietjen/shard-telemetry-native-profile-v20-linger1000-{a,b,c}
+/home/dtietjen/shard-telemetry-native-profile-v21-batch2m-{a,b,c}
+/home/dtietjen/shard-telemetry-native-profile-v22-shared-cpuset-{a,b,c}
 ```
 
 ## Loki-wire durability ablation — 128 MiB
@@ -78,13 +416,13 @@ Date: 2026-07-30
 Host: Adam, AMD Ryzen 9 3950X, Linux 6.8  
 CPUs: physical cores `0-15` for each sequential engine run  
 Source: first 128 MiB of the immutable 80 GiB ClickHouse Docker JSON corpus  
-Client: `shard-log-loki-load`, 16 deterministic file spans, 16 persistent HTTP
+Client: `shard-telemetry-loki-load`, 16 deterministic file spans, 16 persistent HTTP
 connections, and 1 MiB Loki JSON push batches  
 Records accepted by both engines: 949,018
 
 | Engine | Source throughput | Total disk bytes after run |
 | --- | ---: | ---: |
-| ShardLog durable API | 43.16 MiB/s | 241,490,286 |
+| ShardTelemetry durable API | 43.16 MiB/s | 241,490,286 |
 | Grafana Loki 3.7.2 | 57.63 MiB/s | 120,076,424 |
 
 Loki used image
@@ -92,11 +430,11 @@ Loki used image
 with its ingestion rate and burst limits raised so the database, rather than a
 4 MiB/s tenant throttle, determined throughput.
 
-This is a failed ShardLog ablation, not an accepted full result. The direct
+This is a failed ShardTelemetry ablation, not an accepted full result. The direct
 structural benchmark did not include the production durability path. Here
-ShardLog retained the authoritative shard-stream source packs and a second raw
+ShardTelemetry retained the authoritative shard-stream source packs and a second raw
 sink recovery journal, while sealed compressed block payloads remained
-memory-owned. The full 80 GiB ShardLog result is therefore gated on durable
+memory-owned. The full 80 GiB ShardTelemetry result is therefore gated on durable
 compressed-block publication, cold reads, and reclaiming raw source ranges
 covered by published blocks. See `LOKI_COMPATIBILITY.md`.
 
@@ -104,17 +442,17 @@ covered by published blocks. See `LOKI_COMPATIBILITY.md`.
 
 Date: 2026-07-30  
 Host and CPUs: Adam, physical cores `0-15`  
-Corpus: the same immutable 80 GiB file and SHA-256 used by the ShardLog and
+Corpus: the same immutable 80 GiB file and SHA-256 used by the ShardTelemetry and
 ClickHouse runs below  
 Image:
 `sha256:191d4fdfb7264f16989f0a57f320872620a5a7c2ceeec6229212c4190ec49b86`
 
-The same `shard-log-loki-load` client used for the bounded ablation sent 1 MiB
+The same `shard-telemetry-loki-load` client used for the bounded ablation sent 1 MiB
 Loki JSON pushes over 16 persistent connections. Every submitted batch
 received HTTP 200/204. The client reached the known truncated final physical
 line after sending all complete records and exited nonzero while parsing that
 tail; the fixed client now skips a non-newline-terminated final fragment just
-as the established ShardLog/ClickHouse harness skips the leading fragment.
+as the established ShardTelemetry/ClickHouse harness skips the leading fragment.
 
 | Source bytes represented | Settled disk bytes | Ratio | Wall time | Throughput |
 | ---: | ---: | ---: | ---: | ---: |
@@ -137,24 +475,24 @@ capacity planning; the compression ratio uses settled durable storage.
 Evidence is retained on Adam at:
 
 ```text
-/home/dtietjen/shard-log-loki-full-80g-20260730-v1
+/home/dtietjen/shard-telemetry-loki-full-80g-20260730-v1
 ```
 
 ### Provisional same-corpus comparison
 
 The rows below use the same immutable source and the same Adam physical CPU set,
-but are not yet a single-interface campaign: ShardLog and ClickHouse are the
+but are not yet a single-interface campaign: ShardTelemetry and ClickHouse are the
 previous sequential indexed native-engine run, while Loki includes Loki HTTP
 JSON framing and the shared wire client.
 
 | Engine | Settled stored bytes | Raw-source ratio | Throughput |
 | --- | ---: | ---: | ---: |
-| ShardLog + exact index | **743,581,572** | **115.52x** | **1,214.17 MiB/s** |
+| ShardTelemetry + exact index | **743,581,572** | **115.52x** | **1,214.17 MiB/s** |
 | Loki 3.7.2 | 3,782,890,631 | 22.71x | 83.87 MiB/s |
 | ClickHouse + text index | 6,093,155,990 | 14.10x | 353.33 MiB/s |
 
 This table does not satisfy the final drop-in service acceptance gate.
-ShardLog's Loki-wire durable path currently fails the bounded comparison and
+ShardTelemetry's Loki-wire durable path currently fails the bounded comparison and
 must publish cold blocks and reclaim source data before a three-service
 sequential rerun is meaningful.
 
@@ -167,7 +505,7 @@ machine-log dataset. Archive checksum: `b0d0a8bed97530bccf0babdf3a905572`.
 Command:
 
 ```text
-cargo run --release --bin shard-log-compress-bench -- /path/to/HDFS.log --limit-bytes 1GiB
+cargo run --release --bin shard-telemetry-compress-bench -- /path/to/HDFS.log --limit-bytes 1GiB
 ```
 
 The line-oriented input boundary made the measured source `1,073,741,791`
@@ -234,7 +572,7 @@ compared field-for-field before measurement continues.
 Command:
 
 ```text
-shard-log-structural-bench /path/to/docker-json.log --limit-bytes 1GiB
+shard-telemetry-structural-bench /path/to/docker-json.log --limit-bytes 1GiB
 ```
 
 | Layout | Stored bytes | Ratio against raw Docker source | Source retained |
@@ -269,14 +607,14 @@ all production logs.
 Command:
 
 ```text
-cargo run --release --bin shard-log-codec-bench -- /path/to/raw.log --codecs all
+cargo run --release --bin shard-telemetry-codec-bench -- /path/to/raw.log --codecs all
 ```
 
 The complete matrix uses a fresh reader and independent 8 MiB blocks for every
 codec. The benchmark verifies a first-block round trip for every row and times
 compression after the input block has been read. It does not use a trained
 dictionary, so it is a baseline for choosing a byte codec rather than a claim
-about the final normalized shard-log layout.
+about the final normalized shard-telemetry layout.
 
 | Codec | Stored bytes | Ratio | Retained | Compression throughput |
 | --- | ---: | ---: | ---: | ---: |
@@ -284,7 +622,6 @@ about the final normalized shard-log layout.
 | `lz4_flex` | 81,142,348 | 13.23x | 7.56% | 1,897 MiB/s |
 | `lz4_native` | 81,110,632 | 13.24x | 7.55% | 2,261 MiB/s |
 | `lz4_native_hc-9` | 62,630,026 | 17.14x | 5.83% | 133 MiB/s |
-| `lz4_rust` | 81,110,120 | 13.24x | 7.55% | 2,263 MiB/s |
 | `snap` | 119,801,022 | 8.96x | 11.16% | **2,410 MiB/s** |
 | `s2` | 93,329,078 | 11.50x | 8.69% | 2,118 MiB/s |
 | `s2_better` | 91,011,664 | 11.80x | 8.48% | 551 MiB/s |
@@ -293,8 +630,6 @@ about the final normalized shard-log layout.
 | DEFLATE level 6 | 42,822,645 | 25.07x | 3.99% | 128 MiB/s |
 | `libdeflate-6` | 40,665,196 | 26.40x | 3.79% | 333 MiB/s |
 | `zlib_rs-6` | 42,149,520 | 25.47x | 3.93% | 270 MiB/s |
-| `flate3` | 52,393,082 | 20.49x | 4.88% | 76 MiB/s |
-| `zenflate-7` | 40,469,558 | 26.53x | 3.77% | 235 MiB/s |
 | `zopfli-5` | 36,168,767 | 29.69x | 3.37% | 0.50 MiB/s |
 | `brotli-5` | 42,479,572 | 25.28x | 3.96% | 62 MiB/s |
 | `bzip2-9` | **32,413,164** | **33.13x** | **3.02%** | 11.7 MiB/s |
@@ -308,17 +643,18 @@ about the final normalized shard-log layout.
 | `zstd-3` | 46,959,090 | 22.87x | 4.37% | 1,146 MiB/s |
 | `zstd-9` | 38,958,957 | 27.56x | 3.63% | 151 MiB/s |
 
-The practical Pareto choices are Snappy, LZ4, zstd-1, libdeflate-6,
-zenflate-7, zstd-9, and bzip2-9. The small 0.13x ratio difference between
-libdeflate-6 and zenflate-7 is not enough to treat the latter as a default: it
-is 29% slower. Zopfli is dominated by bzip2-9 on this corpus: bzip2 is both
-smaller and more than twenty times faster.
+The practical Pareto choices in the Apache-2.0 distribution are Snappy, native
+LZ4, zstd-1, libdeflate-6, zstd-9, and bzip2-9. GPL- and AGPL-licensed codecs
+used in an early research sweep, along with codecs lacking declared license
+metadata, are not linked into or selectable from the released benchmark
+binary. Zopfli is dominated by bzip2-9 on this corpus:
+bzip2 is both smaller and more than twenty times faster.
 
 ### Selection guide
 
 | Priority | Recommended policy | Why | Cost |
 | --- | --- | --- | --- |
-| Lowest encode latency | LZ4 (`lz4_rust` or native LZ4) | 13.24x at about 2.26 GiB/s; substantially smaller than Snappy for only a small throughput cost. | Stores about twice as many bytes as zstd-1. |
+| Lowest encode latency | Native LZ4 | 13.24x at about 2.26 GiB/s; substantially smaller than Snappy for only a small throughput cost. | Stores about twice as many bytes as zstd-1. |
 | Default hot storage | zstd level 1 | 25.54x at 1.37 GiB/s; it dominates most middle-ground codecs. | Less peak throughput than LZ4. |
 | Background compact storage | libdeflate-6 | 26.40x at 333 MiB/s; modestly smaller than zstd-1. | Requires a separate codec path and is about four times slower than zstd-1. |
 | Cold searchable storage | zstd level 9 | 27.56x at 151 MiB/s; a good compact, queryable block format. | About nine times slower than zstd-1. |
@@ -344,7 +680,7 @@ compressing at 1.52 GiB/s. zstd-9 saves a further 256,205,400 bytes (7.66%)
 over zstd-1 but takes 10.35x as long, making it a cold-tier option. Snappy is
 the pure speed winner; LZ4 is 32.3% smaller at 76.7% of Snappy's throughput.
 
-## ShardLog versus ClickHouse — sequential 80 GiB ingest
+## ShardTelemetry versus ClickHouse — sequential 80 GiB ingest
 
 Run date: 2026-07-29  
 Host: Adam, AMD Ryzen 9 3950X, Linux 6.8  
@@ -363,7 +699,7 @@ thread of Adam's 16 physical cores; SMT siblings `16-31` were not used. The
 entire source was read immediately before each timed leg to give both the same
 hot-cache treatment.
 
-ShardLog used deterministic 8 MiB complete-line ranges, 16 owner-local parser,
+ShardTelemetry used deterministic 8 MiB complete-line ranges, 16 owner-local parser,
 structural-encoder, and zstd-1 contexts, 16 durable pack files, and one ordered
 manifest. Pack files and the manifest were synchronized before the ingest
 timer stopped. Every payload checksum was then verified and the first, middle,
@@ -375,17 +711,17 @@ Its typed `MergeTree` stored `time DateTime64(9)` with
 `log String` with `ZSTD(1)`, ordered by `(stream, time)`. The table enabled
 `fsync_after_insert`. A pinned in-container adapter skipped only the leading
 partial line and streamed the remaining immutable file into `JSONEachRow`;
-the server's error allowance was set to ShardLog's measured count of seven.
+the server's error allowance was set to ShardTelemetry's measured count of seven.
 The final row-count equality was a mandatory harness gate.
 
 | Engine | Accepted records | Durable stored bytes | Compression ratio | Ingest time | Throughput |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| ShardLog | 607,363,459 | **826,364,011** | **103.95x** | **64.890 s** | **1,262.44 MiB/s** |
+| ShardTelemetry | 607,363,459 | **826,364,011** | **103.95x** | **64.890 s** | **1,262.44 MiB/s** |
 | ClickHouse | 607,363,459 | 1,175,227,112 | 73.09x | 86.850 s | 943.24 MiB/s |
 
-ShardLog was 1.338x as fast and used 348,863,101 fewer durable bytes, a 29.68%
+ShardTelemetry was 1.338x as fast and used 348,863,101 fewer durable bytes, a 29.68%
 reduction from ClickHouse's active-part size. Its ratio was 1.422x higher.
-The ShardLog total includes 825,544,794 bytes of pack payload and an 819,217
+The ShardTelemetry total includes 825,544,794 bytes of pack payload and an 819,217
 byte manifest. The ClickHouse total is `sum(bytes_on_disk)` for the 20 active
 table parts, including their active data, marks, and part metadata. It does not
 use the whole container data-directory size, which also contained system data
@@ -399,26 +735,26 @@ and is not a general prediction for heterogeneous OTLP logs.
 The authoritative evidence is retained on Adam at:
 
 ```text
-/home/dtietjen/shard-log-head-to-head/full-80g-20260729-v4
+/home/dtietjen/shard-telemetry-head-to-head/full-80g-20260729-v4
 ```
 
 Key evidence checksums:
 
 ```text
 summary.tsv          d07a33a31dccdea7e2f747ebf00a9da08242f5f78763b5025520b97292447ebf
-shard-log-report.txt b27c688bae0ad01feaabc0c25f2eb0511253d985f4da0f588ec1083063e1b78d
+shard-telemetry-report.txt b27c688bae0ad01feaabc0c25f2eb0511253d985f4da0f588ec1083063e1b78d
 clickhouse-parts.tsv 3fcfa78913d65e761194c2e93a6c18439ba7b98066bf80741e3a3c5c050c7b13
 provenance.txt       95883ba16989d22d7b20437f6070448d6c27851941fd089351278a40a0f348ef
 ```
 
-## ShardLog versus indexed ClickHouse — 80 GiB ingest and query
+## ShardTelemetry versus indexed ClickHouse — 80 GiB ingest and query
 
 Run date: 2026-07-30  
 Host: Adam, AMD Ryzen 9 3950X, Linux 6.8  
 Execution tier: native Linux host-performance evidence; this is not a
 logical-time or exact-replay simulation.
 
-This comparison adds serving indexes to both engines. ShardLog used its
+This comparison adds serving indexes to both engines. ShardTelemetry used its
 persistent exact term/field index and selective structural decoder. ClickHouse
 26.5.1 used its generally available `text` index with
 `splitByNonAlpha` tokenization and a lowercase preprocessor.
@@ -432,7 +768,7 @@ compared canonical timestamp, stream, and body output byte-for-byte before
 timing every query class.
 
 Both legs ran sequentially on physical CPUs `0-15`, with the exact source
-range prewarmed immediately before each ingest. ShardLog used 16 owner-local
+range prewarmed immediately before each ingest. ShardTelemetry used 16 owner-local
 workers, 8 MiB blocks, Pco timestamps, zstd level 1, disabled locality and
 real-time dictionary experiments, synchronized packs and manifest, and its
 persistent query index. ClickHouse used a `MergeTree` ordered by
@@ -444,24 +780,24 @@ persistent query index. ClickHouse used a `MergeTree` ordered by
 
 | Engine | Stored bytes | Raw-source ratio | External wall time | External throughput |
 | --- | ---: | ---: | ---: | ---: |
-| ShardLog + exact index | **743,581,572** | **115.52x** | **67.47 s** | **1,214.17 MiB/s** |
+| ShardTelemetry + exact index | **743,581,572** | **115.52x** | **67.47 s** | **1,214.17 MiB/s** |
 | ClickHouse + text index | 6,093,155,990 | 14.10x | 231.85 s | 353.33 MiB/s |
 
-The conservative process-level result makes ShardLog 3.44x faster and 8.19x
-smaller, an 87.80% stored-byte reduction. ShardLog's external time includes
+The conservative process-level result makes ShardTelemetry 3.44x faster and 8.19x
+smaller, an 87.80% stored-byte reduction. ShardTelemetry's external time includes
 25.19 seconds of post-ingest checksum and sampled reconstruction verification.
 Its durable stage alone took 35.43 seconds at 2,311.95 MiB/s, but that number
 is not used in the headline because the comparison records the stricter
 whole-process wall time.
 
-| Component | ShardLog | ClickHouse |
+| Component | ShardTelemetry | ClickHouse |
 | --- | ---: | ---: |
 | Compressed structural/data bytes | 628,909,207 | 1,172,219,181 |
 | Search index bytes | 113,853,148 | 4,918,354,227 |
 | Manifest/marks/remaining active-part bytes | 819,217 | 2,582,582 |
 | Total | **743,581,572** | 6,093,155,990 |
 
-The compressed ShardLog index is 43.2x smaller than ClickHouse's text index.
+The compressed ShardTelemetry index is 43.2x smaller than ClickHouse's text index.
 The normalized data lane itself is 1.86x smaller than ClickHouse's compressed
 typed columns. These ratios are against the raw Docker source and therefore
 include replacing the JSON wrapper with typed fields; they are not
@@ -470,12 +806,12 @@ byte-identical JSON archival ratios.
 ### Warm query latency
 
 Every row reports 200 sequential warm queries returning at most 100 records.
-ShardLog latency includes planning, pack read, payload checksum, zstd
+ShardTelemetry latency includes planning, pack read, payload checksum, zstd
 decompression, and selective record decode. ClickHouse latency is measured by
 `clickhouse-benchmark` over its local native client/server path. The forced
 scan disables skip indexes and is a reference, not the indexed head-to-head.
 
-| Query | ShardLog p50 / p99 | ClickHouse indexed p50 / p99 | ClickHouse scan p50 | ShardLog p50 advantage |
+| Query | ShardTelemetry p50 / p99 | ClickHouse indexed p50 / p99 | ClickHouse scan p50 | ShardTelemetry p50 advantage |
 | --- | ---: | ---: | ---: | ---: |
 | Latest 100 | 1.055 / 1.076 ms | 497 / 521 ms | 497 ms | 471x |
 | `docker.stream=stderr` | 1.073 / 1.110 ms | 4 / 5 ms | 4 ms | 3.7x |
@@ -490,7 +826,7 @@ makes the stream-filtered ClickHouse query efficient, and its indexed missing
 term avoids the 1.57-second full scan. This matrix intentionally includes both
 favorable and unfavorable selectivity cases.
 
-### Current ShardLog cost
+### Current ShardTelemetry cost
 
 Query execution is fast, but the benchmark's monolithic index representation
 is not production-ready at this scale:
@@ -503,12 +839,12 @@ is not production-ready at this scale:
 The next optimization is therefore segmented, mmap-friendly postings that
 retain run/delta encoding and load only selected block directories. These
 figures also explain why the result is an engine-level comparison, not yet a
-production service claim. ShardLog ran in-process without an RPC layer;
+production service claim. ShardTelemetry ran in-process without an RPC layer;
 ClickHouse ran as a warm server over its local native protocol.
 
 ### Provenance and evidence
 
-ShardLog source archive:
+ShardTelemetry source archive:
 `af8bfe78a8788bd5c7fb837d4bf06477ed359e892f99a346517810df7613948a`.
 The bundled `shard-stream` revision is
 `13ee7903d42cabe9bd5c0df0fa8e4a4fdc660ea7`, with relevant source-tree hash
@@ -523,14 +859,14 @@ dirty and neither framework binary was in the timed native-host path.
 Authoritative evidence is retained on Adam at:
 
 ```text
-/home/dtietjen/shard-log-query-head-to-head/80gib-v7-20260730T205000Z
+/home/dtietjen/shard-telemetry-query-head-to-head/80gib-v7-20260730T205000Z
 ```
 
 Key evidence checksums:
 
 ```text
 ingest-summary.tsv          a71d829413d3cf4a177a26bb6a34dfd32d488a4dc100841e44c2fa2a1399d27a
-shard-log-report.txt        87481295ff6a1db549c2cfc2a32ea91bc6d740cb5c878afd0963e2e0b992b541
+shard-telemetry-report.txt        87481295ff6a1db549c2cfc2a32ea91bc6d740cb5c878afd0963e2e0b992b541
 clickhouse-parts.tsv        1d3e1234175d1b14153d242f4f3d68d1b86decc22d979c6910d961fd025cebdb
 clickhouse-index.tsv        90d39c7c2da5b8b540518f18bd02521041fb7ecc919049c6d0db555e26b88de5
 clickhouse-parse-errors.csv f1395ea74680adf42e4d04d371a8aaff194fe2cd410ee68cb2912d8928353048
@@ -554,7 +890,7 @@ Host: Adam, one Ryzen 9 3950X physical core pinned with `taskset -c 0`
 Command:
 
 ```text
-target/release/shard-log-locality-bench \
+target/release/shard-telemetry-locality-bench \
   --iterations 1000000 \
   --seal-records 50000
 ```
@@ -586,12 +922,12 @@ compression, and pack synchronization determine end-to-end throughput.
 Run date: 2026-07-29  
 Host: Adam, one Ryzen 9 3950X physical core  
 Evidence:
-`/home/dtietjen/shard-log-locality-interleaving-20260729-v1`
+`/home/dtietjen/shard-telemetry-locality-interleaving-20260729-v1`
 
 The harness collected bounded tails from three independent live services:
 Pluribus, Eden's telemetry hot path, and the OpenTelemetry Collector. A
 lossless adapter put each original message line into a Docker JSON envelope
-with a fixed valid timestamp, then `shard-log-interleave` emitted one complete
+with a fixed valid timestamp, then `shard-telemetry-interleave` emitted one complete
 line from each source in round-robin order. The resulting 76,851-record corpus
 was 26,408,726 bytes. Both modes used one worker and 1 MiB target blocks.
 
@@ -624,19 +960,19 @@ interleave-report.txt 899c213e4e36f4bf6cdf45e56810c2a3e7896edaf0fa6136895e408e15
 Run date: 2026-07-29  
 Host: Adam, AMD Ryzen 9 3950X, Linux 6.8  
 Evidence:
-`/home/dtietjen/shard-log-head-to-head/full-80g-locality-20260729-v1`
+`/home/dtietjen/shard-telemetry-head-to-head/full-80g-locality-20260729-v1`
 
 The finalized harness ran three sequential legs with identical source
-prewarming and CPUs `0-15`: ShardLog with routing disabled, ShardLog with
+prewarming and CPUs `0-15`: ShardTelemetry with routing disabled, ShardTelemetry with
 routing enabled, and ClickHouse. All accepted exactly 607,363,459 records and
-85,899,343,853 source bytes. Every ShardLog payload checksum passed, and the
+85,899,343,853 source bytes. Every ShardTelemetry payload checksum passed, and the
 first, middle, and last blocks decompressed and decoded successfully after
 ingest.
 
 | Engine | Stored bytes | Ratio | Elapsed | Throughput |
 | --- | ---: | ---: | ---: | ---: |
-| ShardLog, routing disabled | **826,364,011** | **103.95x** | **70.2466 s** | **1,166.18 MiB/s** |
-| ShardLog, routing enabled | **826,364,011** | **103.95x** | 76.5802 s | 1,069.73 MiB/s |
+| ShardTelemetry, routing disabled | **826,364,011** | **103.95x** | **70.2466 s** | **1,166.18 MiB/s** |
+| ShardTelemetry, routing enabled | **826,364,011** | **103.95x** | 76.5802 s | 1,069.73 MiB/s |
 | ClickHouse | 1,176,062,051 | 73.04x | 87.3700 s | 937.62 MiB/s |
 
 The enabled router cleared the required 1 GiB/s floor and did not change
@@ -644,7 +980,7 @@ stored size by one byte. It was 8.27% slower than the disabled ablation, but
 still 14.09% faster than ClickHouse. It stored 349,698,040 fewer bytes than
 ClickHouse, a 29.74% reduction from ClickHouse's active-part size.
 
-Storage accounting for both ShardLog legs:
+Storage accounting for both ShardTelemetry legs:
 
 | Component | Bytes |
 | --- | ---: |
@@ -682,8 +1018,8 @@ Evidence checksums:
 
 ```text
 summary.tsv                    5b67c4772211f1999cd22d898c32dbf71d69e5d6522d5a90096c1de547a19091
-shard-log-disabled-report.txt d088b4d62399890b82f9998f53d82a0110b68dab25580af84039577474454b71
-shard-log-enabled-report.txt  3440256346019492834c239f20aaf0e8068c57ab4be2f53cef796536e390c8be
+shard-telemetry-disabled-report.txt d088b4d62399890b82f9998f53d82a0110b68dab25580af84039577474454b71
+shard-telemetry-enabled-report.txt  3440256346019492834c239f20aaf0e8068c57ab4be2f53cef796536e390c8be
 clickhouse-parts.tsv           bb38748452501ef2211d8e831127f49fad9b66a9891c225ddc8cd16a0536cf5a
 provenance.txt                 57a264c71f361a4c131f76f42a3af8eeefd9c9a4ff2ed7f53a606daf4b4f3234
 ```
@@ -732,7 +1068,7 @@ This is a local implementation smoke test, not an acceptance result. In
 particular, block score throughput operates on already fingerprinted compact
 records and must not be interpreted as end-to-end log ingest throughput.
 
-### Current 80 GiB cross-version matrix
+### Historical 80 GiB implementation ablation
 
 Run date: 2026-07-29 local / 2026-07-30 UTC  
 Host: Adam, Ryzen 9 3950X, Linux 6.8  
@@ -744,7 +1080,7 @@ Source SHA-256:
 The matrix used one immutable source and mandatory equality gates for
 85,899,343,853 accepted source bytes and 607,363,459 records:
 
-| Version and mode | Stored bytes | Ratio | Seconds | MiB/s |
+| Historical implementation and mode | Stored bytes | Ratio | Seconds | MiB/s |
 | --- | ---: | ---: | ---: | ---: |
 | Historical TinyLFU, disabled | 826,364,011 | 103.95x | 70.060 | 1,169.28 |
 | Historical TinyLFU, enabled | 826,364,011 | 103.95x | 76.604 | 1,069.40 |
@@ -754,7 +1090,7 @@ The matrix used one immutable source and mandatory equality gates for
 
 The historical router cost 8.54% against its disabled control. Block
 collation v5 cost 5.07% against its disabled control. This homogeneous corpus
-admitted no specialized placement, so all ShardLog rows are byte-identical.
+admitted no specialized placement, so all ShardTelemetry rows are byte-identical.
 
 The matrix exposed an enabled-only offset-ordering defect during its first
 attempt. The incomplete run is retained separately. The fix merges relocated
@@ -785,7 +1121,7 @@ throughput by 1.09%.
 Authoritative matrix evidence:
 
 ```text
-/home/dtietjen/shard-log-head-to-head/full-80g-version-matrix-20260729-v2
+/home/dtietjen/shard-telemetry-head-to-head/full-80g-version-matrix-20260729-v2
 summary.tsv      c17ae0b547efea213f29b2eb6684d6e884b12948e25433656767eb601686b94c
 provenance.txt   ffe5509194ea75675f26c4569bb692c822c55eea66b332b4a05f3205188bf929
 ```
@@ -793,7 +1129,7 @@ provenance.txt   ffe5509194ea75675f26c4569bb692c822c55eea66b332b4a05f3205188bf92
 Final v6 evidence and source:
 
 ```text
-/home/dtietjen/shard-log-head-to-head/block-collator-enabled-full-80g-v6
+/home/dtietjen/shard-telemetry-head-to-head/block-collator-enabled-full-80g-v6
 report.txt       11006550ea8fdc98f516e7a9565b26f4cf2f1b4f4e9a10884d741dcd43dc85ee
 time.txt         9915ae87c45664aa022c0d7c2f42a536b90905f4e3ceb3b443605c30015458a5
 source archive   c63ee9585327a18daabe348b29c05d84e5c50e83d93b4ecc83ee150829e17140
@@ -867,10 +1203,10 @@ writes, and post-ingest verification.
 
 | Engine / mode | Durable bytes | Ratio | Seconds | MiB/s |
 | --- | ---: | ---: | ---: | ---: |
-| Previous ShardLog v6, locality enabled | 826,364,011 | 103.95x | 79.177 | 1,034.64 |
-| Pco-8 ShardLog, locality enabled | **628,473,667** | **136.68x** | 81.511 | 1,005.02 |
-| Pco-8 ShardLog, locality disabled (initial default) | **628,473,667** | **136.68x** | **74.157** | **1,104.68** |
-| Pco-8 ShardLog, first optimized hot path | **628,473,667** | **136.68x** | **42.344** | **1,934.63** |
+| Previous ShardTelemetry v6, locality enabled | 826,364,011 | 103.95x | 79.177 | 1,034.64 |
+| Pco-8 ShardTelemetry, locality enabled | **628,473,667** | **136.68x** | 81.511 | 1,005.02 |
+| Pco-8 ShardTelemetry, locality disabled (initial default) | **628,473,667** | **136.68x** | **74.157** | **1,104.68** |
+| Pco-8 ShardTelemetry, first optimized hot path | **628,473,667** | **136.68x** | **42.344** | **1,934.63** |
 | ClickHouse 26.5.1.882 | 1,175,260,664 | 73.09x | 87.830 | 932.71 |
 
 Storage accounting for both Pco legs:
@@ -885,7 +1221,7 @@ Storage accounting for both Pco legs:
 | Compression dictionaries | 0 |
 | Durable pack plus manifest | **628,473,667** |
 
-Pco saved 197,890,344 durable bytes, or 23.95%, from the previous ShardLog
+Pco saved 197,890,344 durable bytes, or 23.95%, from the previous ShardTelemetry
 format. It saved 546,786,997 bytes, or 46.53%, from ClickHouse's active-part
 size. That first optimized path was 75.13% faster than the initial
 locality-disabled Pco path and 107.42% faster than ClickHouse while preserving
@@ -902,7 +1238,7 @@ validation.
 Authoritative evidence:
 
 ```text
-/home/dtietjen/shard-log-head-to-head/timestamp-checkpoints-20260729-v1
+/home/dtietjen/shard-telemetry-head-to-head/timestamp-checkpoints-20260729-v1
 pco-v4-full-80g-report.txt          0dccc8eb8c72af4f2063feb64e4c5a8b0917a15f739083089b24c29d41bbfc2c
 pco-v4-disabled-full-80g-report.txt 28edca19c3d9a6cf06dde16c9f67e6260fafd27c1c9e9129c48c39861faa17ca
 pco-v4-full-80g-time.txt            9df4c3a55ca4c739e0a709b966770b101395af90062e84ab70ff65165eeb1e08
@@ -930,7 +1266,7 @@ pco-v5-default-1g-time.txt           edbb5a49d03f313543e930b6f4d95fef4806cb650d8
 
 These are native pinned-core performance runs, not deterministic task-schedule
 replays. Adam passed the deterministic-simulation Linux doctor, but both the
-framework checkout and ShardLog source state were dirty/uncommitted; the
+framework checkout and ShardTelemetry source state were dirty/uncommitted; the
 retained source archive and binary hashes, rather than a Git revision, are the
 reconstruction boundary.
 
@@ -941,7 +1277,7 @@ Host: Adam, Ryzen 9 3950X, Linux 6.8.0-111-generic
 CPUs: `0-15`, 16 workers  
 Block target: 8 MiB  
 Locality and real-time dictionary: disabled  
-Evidence: `/home/dtietjen/shard-log-head-to-head/throughput-optimization-20260729-v1`
+Evidence: `/home/dtietjen/shard-telemetry-head-to-head/throughput-optimization-20260729-v1`
 
 Profiling showed that Pco and Zstd were no longer the throughput limit. The
 initial path spent most of its CPU in repeated message scanning, metadata
@@ -1019,7 +1355,7 @@ performance evidence, not deterministic task-schedule replay. The
 deterministic-simulation framework revisions were
 `62f4e527284add129faf9d9d3bfd1ec99f65f26e` locally and
 `bd1c4ba7eff99a5f324a5434b1a9d23444e32582` on Adam; both checkouts were dirty.
-The ShardLog repository was unborn/uncommitted, so retained archives and
+The ShardTelemetry repository was unborn/uncommitted, so retained archives and
 binary hashes are the replay boundary.
 
 ## Current default — path-by-path single-core optimization
@@ -1031,7 +1367,7 @@ Multicore gate: CPUs `0-15`, one worker per physical core
 Block target: 8 MiB  
 Locality and real-time dictionary: disabled  
 Evidence:
-`/home/dtietjen/shard-log-head-to-head/single-thread-optimization-20260730-v1`
+`/home/dtietjen/shard-telemetry-head-to-head/single-thread-optimization-20260730-v1`
 
 The optimization pass treated ingestion as a sequence of independently
 measurable costs:
@@ -1149,18 +1485,18 @@ visible above one worker.
 ### Authoritative full 80 GiB head-to-head
 
 The final sequential harness prewarmed the immutable source separately before
-each engine. ShardLog and ClickHouse 26.5.1.882 each received CPUs `0-15`.
-ShardLog synchronized 16 pack files and its manifest before stopping the
+each engine. ShardTelemetry and ClickHouse 26.5.1.882 each received CPUs `0-15`.
+ShardTelemetry synchronized 16 pack files and its manifest before stopping the
 timer. ClickHouse enabled `fsync_after_insert`; the harness flushed the table
 and measured active-part bytes. Both accepted 607,363,459 records spanning
 85,899,343,853 source bytes.
 
 | Engine | Durable bytes | Ratio | Seconds | MiB/s |
 | --- | ---: | ---: | ---: | ---: |
-| **ShardLog current default** | **628,417,043** | **136.69x** | **10.8206** | **7,570.75** |
+| **ShardTelemetry current default** | **628,417,043** | **136.69x** | **10.8206** | **7,570.75** |
 | ClickHouse 26.5.1.882 | 1,175,169,126 | 73.10x | 88.3300 | 927.43 |
 
-ShardLog was 8.16x as fast and used 546,752,083 fewer bytes, a 46.52%
+ShardTelemetry was 8.16x as fast and used 546,752,083 fewer bytes, a 46.52%
 reduction from ClickHouse's stored size. Its storage comprised 627,597,826
 compressed payload bytes and an 819,217-byte manifest; structural data before
 zstd was 15,847,462,930 bytes. The result is 56,624 bytes smaller than the
@@ -1179,10 +1515,10 @@ Key evidence checksums:
 
 ```text
 head-to-head summary          07a74e830c19dc2a66af58726ca7617ce53d2900f7375e93a65f3d73acb54e15
-16-core ShardLog report       d8fa443934f7057c084ddc14780a51eb979ec34a6757011ca5fa8c915a590a79
+16-core ShardTelemetry report       d8fa443934f7057c084ddc14780a51eb979ec34a6757011ca5fa8c915a590a79
 ClickHouse active parts       8dc59b4010d60824b7320d53009a570a5f68bb0a3e5e175a0494b728dd684054
 head-to-head provenance       77a96bf9efd940ac3f40ecf01a44225344c57255f7baac4de15053623cf385b2
-one-core ShardLog report      aba3310b3995f9bc0f97b4e7605235a74d168bd633a1c0f45d78158934fafd4f
+one-core ShardTelemetry report      aba3310b3995f9bc0f97b4e7605235a74d168bd633a1c0f45d78158934fafd4f
 one-core external time        10c7bf2b85c9fb9fd64241a993b0784a81883f037a8b8dee91cd5b320d94607c
 one-core provenance           fcc702f1912e9b15716f7e68587cb0307c108655f2c0205c720e7125bd9ff748
 ```
@@ -1191,7 +1527,7 @@ This is native Linux host-performance evidence, not logical or exact
 task-schedule replay. The deterministic-simulation framework revisions were
 `62f4e527284add129faf9d9d3bfd1ec99f65f26e` locally and
 `bd1c4ba7eff99a5f324a5434b1a9d23444e32582` on Adam; both framework
-checkouts were dirty. The ShardLog repository was unborn/uncommitted, so the
+checkouts were dirty. The ShardTelemetry repository was unborn/uncommitted, so the
 retained source archive and binary hashes are the reconstruction boundary.
 
 ## Real-time dictionary learning
@@ -1202,7 +1538,7 @@ Rust: 1.93.0
 Zstd crate: 0.13.3  
 Workers: 8  
 Locality: disabled  
-Evidence: `/private/tmp/shard-log-realtime-dictionary-local-20260729-v1`
+Evidence: `/private/tmp/shard-telemetry-realtime-dictionary-local-20260729-v1`
 
 ### What was tested
 
@@ -1294,9 +1630,9 @@ the non-repeated Pluribus/Eden/OTEL interleaving.
 Run date: 2026-07-30  
 Adam host: `dtietjen@ssh.tryeden.dev`, AMD Ryzen 9 3950X  
 Adam evidence:
-`/home/dtietjen/shard-log-query-optimization-20260730-v1`  
+`/home/dtietjen/shard-telemetry-query-optimization-20260730-v1`
 Local comparison:
-`/private/tmp/shard-log-v3-compare.8FPULe`
+`/private/tmp/shard-telemetry-v3-compare.8FPULe`
 
 ### Hot stripe
 
@@ -1380,14 +1716,14 @@ and the current source:
 | Every 100th record, 100 hits | not measured | about 0.460 ms |
 
 The contiguous selective path improved about 15x while adding only eight
-compressed bytes in this test. The current `shard-log-selective-decode-bench`
+compressed bytes in this test. The current `shard-telemetry-selective-decode-bench`
 also measures query-index construction. Message/term direct maps, recycled
 term-ID vectors, duplicate-safe last-ordinal checks, and removal of a
 per-record metadata set increased that synthetic build rate from 742,463 to
 approximately 1.14 million records/s per core.
 
 Persistent postings now retain dense runs after decode instead of expanding
-them into complete ordinal vectors. `shard-log-pack-query-bench` reports both
+them into complete ordinal vectors. `shard-telemetry-pack-query-bench` reports both
 logical posting cardinality and resident posting-array/run bytes. On this
 synthetic block, 1,736,000 logical ordinals occupied 1,452,352 resident bytes
 instead of 6,944,000 bytes as a flat `u32` representation, a 79.1% reduction
@@ -1404,7 +1740,7 @@ cannot be queried by the new decoder.
 
 Run date: 2026-07-30  
 Command:
-`cargo run --release --bin shard-log-query-bench -- --records 100000 --iterations 100`  
+`cargo run --release --bin shard-telemetry-query-bench -- --records 100000 --iterations 100`
 Environment: local arm64 release build, one `LogStripe`
 
 This run exercises the complete lookup contract added after the original
@@ -1449,23 +1785,23 @@ through the structural encoder and decoder.
 Run date: 2026-07-30  
 Host: Adam, AMD Ryzen 9 3950X, Linux 6.8  
 Evidence:
-`/home/dtietjen/shard-log-query-head-to-head/cold-current-v2-20260730T221500Z`
+`/home/dtietjen/shard-telemetry-query-head-to-head/cold-current-v2-20260730T221500Z`
 
 This run answers the non-hot-record case. It reused the verified
-607,363,459-row ShardLog pack and ClickHouse snapshot from the indexed 80 GiB
+607,363,459-row ShardTelemetry pack and ClickHouse snapshot from the indexed 80 GiB
 campaign. Both engines ran sequentially on physical CPUs `0-15`. Search
 indexes remained resident; immediately before each cold sample the harness
-used `POSIX_FADV_DONTNEED` on ShardLog pack files and ClickHouse's immutable
+used `POSIX_FADV_DONTNEED` on ShardTelemetry pack files and ClickHouse's immutable
 `time`, `stream`, and `log` payload files. ClickHouse's result and query caches
 were disabled. This is a local-SSD payload-cold comparison, not a remote
 object-store latency measurement.
 
 Every query first emitted timestamp, stream, and message results. The harness
-required byte-identical ShardLog and ClickHouse files before timing. Warm rows
+required byte-identical ShardTelemetry and ClickHouse files before timing. Warm rows
 use 20 iterations and cold rows use five, except the deliberately expensive
 substring miss, which uses one.
 
-| Lookup, limit 100 | ShardLog warm p50 | ClickHouse warm p50 | ShardLog cold p50 | ClickHouse cold p50 |
+| Lookup, limit 100 | ShardTelemetry warm p50 | ClickHouse warm p50 | ShardTelemetry cold p50 | ClickHouse cold p50 |
 | --- | ---: | ---: | ---: | ---: |
 | Latest | **1.055 ms** | 508 ms | **1.414 ms** | 666 ms |
 | `docker.stream=stderr` | **1.054 ms** | 5 ms | **1.396 ms** | 21 ms |
@@ -1476,7 +1812,7 @@ substring miss, which uses one.
 | Message regex, positive | **72.193 ms** | 597 ms | **72.892 ms** | 788 ms |
 | Message contains, missing | 35,930 ms | **1,672 ms** | 35,918 ms | **1,885 ms** |
 
-Indexed ShardLog reads one block and remains within about 1.4-2.4 ms at cold
+Indexed ShardTelemetry reads one block and remains within about 1.4-2.4 ms at cold
 p50. Cold latest is 471x faster, the favorable ClickHouse stream lookup is
 15x faster, positive contains is 10.0x faster, and positive regex is 10.8x
 faster. A missing token is rejected by resident postings without a payload
@@ -1484,13 +1820,13 @@ read.
 
 The missing substring reverses the result: ClickHouse is 19.1x faster cold.
 Neither engine can reject it with the configured text index, but ClickHouse
-scans its body column vectorially. ShardLog's 16-worker fallback currently
+scans its body column vectorially. ShardTelemetry's 16-worker fallback currently
 decodes complete structural records across all 10,240 blocks. It processes the
 corpus in 35.92 seconds without constructing a corpus-wide candidate vector,
 but body-only predicate pushdown and block-level n-gram rejection are now the
 highest-value query optimizations.
 
-Payload temperature is not ShardLog's largest indexed-query problem. The
+Payload temperature is not ShardTelemetry's largest indexed-query problem. The
 current global index still takes 23.13-23.23 seconds to load and expands its
 113,853,148-byte file into 17,071,691,984 bytes of resident posting storage.
 The latency table excludes this one-time process startup for both long-lived
@@ -1503,7 +1839,7 @@ the benchmark binary by
 `eca589c1d944c4c2d21ef3d4d731574f85fc8e2071496f1a4cbe785517741328`;
 and the harness by
 `5f77f147bdfa7e259c451c207745964b046002772cf4904fdc113c3e5192c158`.
-The ShardLog repository is still unborn, so those content hashes—not a commit
+The ShardTelemetry repository is still unborn, so those content hashes—not a commit
 ID—identify the tested source. The ClickHouse image remained pinned to
 `sha256:770156c537ca9124046e138a3b5845c64ea58ce8722de7a2e05fd827f4976520`.
 
@@ -1512,9 +1848,9 @@ ID—identify the tested source. The ClickHouse image remained pinned to
 Run date: 2026-07-30  
 Host: Adam, AMD Ryzen 9 3950X, Linux 6.8  
 Final query evidence:
-`/home/dtietjen/shard-log-query-head-to-head/cold-trigram-v5-20260730T185500Z`  
+`/home/dtietjen/shard-telemetry-query-head-to-head/cold-trigram-v5-20260730T185500Z`
 Final ingest evidence:
-`/home/dtietjen/shard-log-query-head-to-head/missing-substring-v5-build-20260730T185600Z`
+`/home/dtietjen/shard-telemetry-query-head-to-head/missing-substring-v5-build-20260730T185600Z`
 
 The `SLOGQIX2` query directory adds one 65,536-bit lowercase message-trigram
 filter per 8 MiB source block. Filters are necessary-condition metadata:
@@ -1556,7 +1892,7 @@ disabled ClickHouse result/query/filesystem caches, and required byte-identical
 timestamp, stream, and message output before timing. Warm rows use 20
 iterations and cold rows use five.
 
-| Lookup, limit 100 | ShardLog warm p50 | ClickHouse warm p50 | ShardLog cold p50 | ClickHouse cold p50 |
+| Lookup, limit 100 | ShardTelemetry warm p50 | ClickHouse warm p50 | ShardTelemetry cold p50 | ClickHouse cold p50 |
 | --- | ---: | ---: | ---: | ---: |
 | Latest | **1.336 ms** | 511 ms | **1.776 ms** | 663 ms |
 | `docker.stream=stderr` | **1.346 ms** | 5 ms | **1.788 ms** | 21 ms |
@@ -1567,12 +1903,12 @@ iterations and cold rows use five.
 | Message regex, positive | **79.259 ms** | 596 ms | **78.998 ms** | 775 ms |
 | Message contains, missing | **0.00091 ms** | 1,624 ms | **0.00091 ms** | 1,794 ms |
 
-Cold ShardLog is 8.7x faster for the positive substring and about 1.97 million
+Cold ShardTelemetry is 8.7x faster for the positive substring and about 1.97 million
 times faster for the missing substring. Regex receives no trigram pruning in
 this version; its 9.8x cold advantage comes from stopping after the first
 matching block.
 
-Every one of the eight ShardLog result files has the same SHA-256 as its
+Every one of the eight ShardTelemetry result files has the same SHA-256 as its
 ClickHouse counterpart. The missing result is the canonical empty-file digest
 `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`;
 the positive substring pair is
@@ -1610,10 +1946,10 @@ and the immutable `query-index.bin` is
 
 Run date: 2026-07-30  
 Host: Adam, AMD Ryzen 9 3950X, Linux 6.8  
-Evidence: `/home/dtietjen/shard-log-native-ab-v7`
+Evidence: `/home/dtietjen/shard-telemetry-native-ab-v7`
 
-This sequential ablation compares ShardLog's native binary protocol with its
-Loki-compatible JSON push boundary. It is not a ShardLog-versus-Loki-engine
+This sequential ablation compares ShardTelemetry's native binary protocol with its
+Loki-compatible JSON push boundary. It is not a ShardTelemetry-versus-Loki-engine
 comparison. Both legs used the same final release server and loader, CPUs
 `0-15`, 16 physical/index stripes, 16 persistent client connections, 1 MiB
 target batches, indexed acknowledgements, fresh directories, and the same
@@ -1662,7 +1998,7 @@ optimization target.
 
 The run also exposed and fixed an offset invariant at the shard-stream
 boundary. Offsets are lane-global and strictly increasing for a logical
-partition, but may contain gaps occupied by sibling partitions. ShardLog now
+partition, but may contain gaps occupied by sibling partitions. ShardTelemetry now
 accepts monotonic gaps while preserving exact IDs and rejecting duplicates or
 regressions. A three-batch durable/restart test covers this behavior.
 
@@ -1804,11 +2140,11 @@ above, the now-production-shaped comparison is:
 
 | Engine | Durable/settled bytes | Ratio | Throughput |
 | --- | ---: | ---: | ---: |
-| **ShardLog compressed-frame index** | **780,387,953** | **110.07x** | **669.45 MiB/s** |
+| **ShardTelemetry compressed-frame index** | **780,387,953** | **110.07x** | **669.45 MiB/s** |
 | Loki 3.7.2 | 3,782,890,631 | 22.71x | 83.87 MiB/s |
 | ClickHouse + text index | 6,093,155,990 | 14.10x | 353.33 MiB/s |
 
-ShardLog stored 4.85x fewer bytes than Loki and 7.81x fewer than ClickHouse.
+ShardTelemetry stored 4.85x fewer bytes than Loki and 7.81x fewer than ClickHouse.
 It ingested 7.98x faster than Loki and 1.89x faster than ClickHouse. These
 comparison rows share corpus, Adam host, and physical CPU set, but were
 executed as retained sequential campaigns rather than one newly rerun
@@ -1817,16 +2153,16 @@ three-engine script.
 Retained Adam evidence:
 
 ```text
-/home/dtietjen/shard-log-embedded-durable-v1-s1
-/home/dtietjen/shard-log-embedded-durable-v2-perf
-/home/dtietjen/shard-log-embedded-durable-v3-pipeline4
-/home/dtietjen/shard-log-embedded-durable-v4-workers32
-/home/dtietjen/shard-log-embedded-durable-v5-pipeline8
-/home/dtietjen/shard-log-embedded-durable-v6-pipeline16
-/home/dtietjen/shard-log-embedded-durable-v7-topk
-/home/dtietjen/shard-log-embedded-durable-v8-full80
-/home/dtietjen/shard-log-embedded-durable-v9-full80-reader-cache
-/home/dtietjen/shard-log-embedded-durable-v10-full80-final
+/home/dtietjen/shard-telemetry-embedded-durable-v1-s1
+/home/dtietjen/shard-telemetry-embedded-durable-v2-perf
+/home/dtietjen/shard-telemetry-embedded-durable-v3-pipeline4
+/home/dtietjen/shard-telemetry-embedded-durable-v4-workers32
+/home/dtietjen/shard-telemetry-embedded-durable-v5-pipeline8
+/home/dtietjen/shard-telemetry-embedded-durable-v6-pipeline16
+/home/dtietjen/shard-telemetry-embedded-durable-v7-topk
+/home/dtietjen/shard-telemetry-embedded-durable-v8-full80
+/home/dtietjen/shard-telemetry-embedded-durable-v9-full80-reader-cache
+/home/dtietjen/shard-telemetry-embedded-durable-v10-full80-final
 ```
 
 ## Borrowed native decode — single-core durable path
@@ -1945,11 +2281,11 @@ The next write-path priorities are therefore:
 Retained Adam evidence:
 
 ```text
-/home/dtietjen/deterministic-sim-runs/shard-log/borrowed-native-single-core-20260730-v1-sanity-1g
-/home/dtietjen/deterministic-sim-runs/shard-log/borrowed-native-single-core-20260730-v2-full80
-/home/dtietjen/deterministic-sim-runs/shard-log/borrowed-native-single-core-profile-20260730-v1-4g
-/home/dtietjen/deterministic-sim-runs/shard-log/borrowed-native-single-core-profile-20260730-v2-8g
-/home/dtietjen/deterministic-sim-runs/shard-log/borrowed-native-single-core-stat-20260730-v2-8g
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/borrowed-native-single-core-20260730-v1-sanity-1g
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/borrowed-native-single-core-20260730-v2-full80
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/borrowed-native-single-core-profile-20260730-v1-4g
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/borrowed-native-single-core-profile-20260730-v2-8g
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/borrowed-native-single-core-stat-20260730-v2-8g
 ```
 
 The synchronized executable-source digest over `Cargo.lock`, `Cargo.toml`,
@@ -2048,13 +2384,13 @@ denied passed on macOS and Linux.
 Retained Adam evidence:
 
 ```text
-/home/dtietjen/deterministic-sim-runs/shard-log/structural-inline-ab-inline-20260731-v1-8g
-/home/dtietjen/deterministic-sim-runs/shard-log/structural-inline-ab-inline-20260731-v2-8g
-/home/dtietjen/deterministic-sim-runs/shard-log/structural-inline-profile-20260731-v1-8g
-/home/dtietjen/deterministic-sim-runs/shard-log/structural-inline-stat-20260731-v1-8g
-/home/dtietjen/deterministic-sim-runs/shard-log/structural-byte-equivalence-baseline-20260731-v3-1g
-/home/dtietjen/deterministic-sim-runs/shard-log/structural-byte-equivalence-optimized-20260731-v3-1g
-/home/dtietjen/deterministic-sim-runs/shard-log/structural-inline-single-core-20260731-v1-full80
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/structural-inline-ab-inline-20260731-v1-8g
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/structural-inline-ab-inline-20260731-v2-8g
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/structural-inline-profile-20260731-v1-8g
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/structural-inline-stat-20260731-v1-8g
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/structural-byte-equivalence-baseline-20260731-v3-1g
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/structural-byte-equivalence-optimized-20260731-v3-1g
+/home/dtietjen/deterministic-sim-runs/shard-telemetry/structural-inline-single-core-20260731-v1-full80
 ```
 
 The final executable-source digest is
@@ -2063,7 +2399,7 @@ The retained deterministic source archive has SHA-256
 `29fb85e8d72ea8274d0c602120bd0efab45d526b96df6be2948a3107707e07e3`.
 Adam used framework revision
 `bd1c4ba7eff99a5f324a5434b1a9d23444e32582`; its framework checkout was
-dirty, and ShardLog still has an unborn revision. This is native
+dirty, and ShardTelemetry still has an unborn revision. This is native
 host-scheduled benchmark evidence, not exact task-schedule replay.
 
 ## ClickHouse analytical compatibility gate
@@ -2076,7 +2412,7 @@ missing-map empty-default equality, alias/subquery evaluation, and aggregate
 combinators. The expanded matrix passed locally on ClickHouse 26.6.1.1193 and
 on Adam with the pinned `26.3.17.56` image.
 
-`clickhouse/adapter` now contains the pinned `StorageShardLog` implementation.
+`clickhouse/adapter` now contains the pinned `StorageShardTelemetry` implementation.
 It reuses `StorageURL` and adds automatic projection, timestamp, exact nonempty
 label/metadata equality, and safe filtered trivial-limit pushdown. The exact
 26.3 analyzer emits the map subcolumn forms handled by the adapter. Unsupported
@@ -2086,16 +2422,16 @@ The next command after producing a custom image from exact tag
 `v26.3.17.56-lts` is:
 
 ```bash
-SHARDLOG_CLICKHOUSE_TOKEN_FILE=/run/secrets/shardlog-clickhouse-token \
-CLICKHOUSE_IMAGE=shardlog-clickhouse@sha256:REPLACE_WITH_BUILT_DIGEST \
-SHARDLOG_URL=http://127.0.0.1:3100/shardlog/api/v1/clickhouse/scan \
-SHARDLOG_TENANT=fake \
+SHARD_TELEMETRY_CLICKHOUSE_TOKEN_FILE=/run/secrets/shardtelemetry-clickhouse-token \
+CLICKHOUSE_IMAGE=shardtelemetry-clickhouse@sha256:REPLACE_WITH_BUILT_DIGEST \
+SHARD_TELEMETRY_URL=http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan \
+SHARD_TELEMETRY_TENANT=fake \
 scripts/run-clickhouse-adapter-compatibility.sh
 ```
 
 The 80 GiB cold/warm head-to-head follows only after that functional gate
 passes. It must sequentially query the same loaded
-ShardLog corpus through `StorageShardLog` and the retained
+ShardTelemetry corpus through `StorageShardTelemetry` and the retained
 `benchmark.logs` MergeTree snapshot on CPUs 0-15, with equal `max_threads`,
 cache state, result checksums, and query ordering. Adam had only 56 GiB free at
 94% utilization when this adapter was added, so a full ClickHouse source build

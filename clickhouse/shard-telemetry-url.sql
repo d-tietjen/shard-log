@@ -1,7 +1,7 @@
 -- Replace both placeholders from a secret-aware deployment template.
-CREATE DATABASE IF NOT EXISTS shardlog;
+CREATE DATABASE IF NOT EXISTS shardtelemetry;
 
-CREATE TABLE IF NOT EXISTS shardlog.logs
+CREATE TABLE IF NOT EXISTS shardtelemetry.logs
 (
     tenant String,
     timestamp DateTime64(9, 'UTC'),
@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS shardlog.logs
     metadata Map(String, String)
 )
 ENGINE = URL(
-    'http://127.0.0.1:3100/shardlog/api/v1/clickhouse/scan',
+    'http://127.0.0.1:3100/shardtelemetry/api/v1/clickhouse/scan',
     ArrowStream,
     headers(
         'Authorization' = 'Bearer REPLACE_FROM_SECRET_STORE',

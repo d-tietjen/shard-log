@@ -3,16 +3,19 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use shard_log::{
-    DurableLokiConfig, DurableLokiStore, LokiApiConfig, NativeServerConfig, ProductionRuntime,
-    ServiceLifecycle, SingleTenantConfig, StripeConfig, loki_router, loki_router_with_clickhouse,
-    serve_native, single_tenant_loki_router,
+use shard_telemetry::{
+    DurableTelemetryConfig, DurableTelemetryStore, LokiApiConfig, NativeServerConfig,
+    OtlpIngestService, OtlpReceiverConfig, ProductionRuntime, PrometheusApiConfig,
+    PrometheusService, ServiceLifecycle, ShardTelemetryConfig, SignalConfig, SingleTenantConfig,
+    StripeConfig, TempoApiConfig, TempoService, loki_router, loki_router_with_clickhouse,
+    otlp_http_router, prometheus_router, serve_native, serve_otlp_grpc, single_tenant_loki_router,
+    tempo_router,
 };
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "shard-log-server",
-    about = "Standalone Loki-compatible ShardLog server"
+    name = "shard-telemetry-server",
+    about = "Standalone Loki-compatible ShardTelemetry server"
 )]
 struct Arguments {
     /// HTTP listen address.
@@ -21,6 +24,12 @@ struct Arguments {
     /// High-throughput native binary protocol listen address.
     #[arg(long, default_value = "127.0.0.1:3101")]
     native_listen: SocketAddr,
+    /// OTLP/gRPC listen address.
+    #[arg(long, default_value = "127.0.0.1:4317")]
+    otlp_grpc_listen: SocketAddr,
+    /// OTLP/HTTP listen address.
+    #[arg(long, default_value = "127.0.0.1:4318")]
+    otlp_http_listen: SocketAddr,
     /// Tenant used when X-Scope-OrgID is absent.
     #[arg(long, default_value = "fake")]
     default_tenant: String,
@@ -34,9 +43,9 @@ struct Arguments {
     #[arg(long, default_value_t = 5_000)]
     max_query_limit: usize,
     /// Durable local data directory.
-    #[arg(long, default_value = "./shard-log-data")]
+    #[arg(long, default_value = "./shard-telemetry-data")]
     data_directory: PathBuf,
-    /// Optional local directory used as the object-store backend.
+    /// Local object-store backend; required with --auth-token-file.
     #[arg(long)]
     object_store_directory: Option<PathBuf>,
     /// Retain a duplicate raw-payload journal to accelerate hot-index recovery.
@@ -155,12 +164,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     };
+    if production.is_some() && arguments.object_store_directory.is_none() {
+        return Err(
+            "--object-store-directory is required in production mode for durable compressed checkpoints"
+                .into(),
+        );
+    }
     let listener = tokio::net::TcpListener::bind(arguments.listen).await?;
     let native_listener = tokio::net::TcpListener::bind(arguments.native_listen).await?;
-    let store = Arc::new(DurableLokiStore::open(DurableLokiConfig {
+    let otlp_http_listener = tokio::net::TcpListener::bind(arguments.otlp_http_listen).await?;
+    let store = Arc::new(DurableTelemetryStore::open(DurableTelemetryConfig {
         data_directory: arguments.data_directory,
         object_store_directory: arguments.object_store_directory,
-        recovery_journal: production.is_some() || arguments.recovery_journal,
+        recovery_journal: arguments.recovery_journal,
         retention: (arguments.retention_seconds > 0)
             .then(|| std::time::Duration::from_secs(arguments.retention_seconds)),
         shard_count: arguments.shards,
@@ -170,9 +186,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         indexed_ack_timeout: std::time::Duration::from_secs(arguments.indexed_ack_timeout_seconds),
     })?);
     let api_config = LokiApiConfig {
-        default_tenant: Arc::from(arguments.default_tenant),
+        default_tenant: Arc::from(arguments.default_tenant.as_str()),
         max_query_limit: arguments.max_query_limit,
     };
+    let logical_partitions = u16::try_from(arguments.tenant_partitions)
+        .ok()
+        .and_then(std::num::NonZeroU16::new)
+        .ok_or("--tenant-partitions must be in 1..=65535")?;
+    let otlp_service = OtlpIngestService::new(
+        Arc::clone(&store),
+        OtlpReceiverConfig {
+            tenant: Arc::from(arguments.default_tenant.as_str()),
+            signals: ShardTelemetryConfig {
+                logs: SignalConfig {
+                    logical_partitions,
+                    ..ShardTelemetryConfig::default().logs
+                },
+                traces: SignalConfig {
+                    logical_partitions,
+                    ..ShardTelemetryConfig::default().traces
+                },
+                metrics: SignalConfig {
+                    logical_partitions,
+                    ..ShardTelemetryConfig::default().metrics
+                },
+                ..ShardTelemetryConfig::default()
+            },
+            wait_for_index: true,
+            ..OtlpReceiverConfig::default()
+        },
+    )?
+    .with_production(production.clone());
+    let otlp_app = otlp_http_router(otlp_service.clone());
+    let prometheus_service = PrometheusService::new(
+        Arc::clone(&store),
+        PrometheusApiConfig {
+            tenant: Arc::from(arguments.default_tenant.as_str()),
+            logical_partitions,
+            ..PrometheusApiConfig::default()
+        },
+    )?
+    .with_production(production.clone());
+    let tempo_service = TempoService::new(
+        Arc::clone(&store),
+        TempoApiConfig {
+            tenant: Arc::from(arguments.default_tenant.as_str()),
+            ..TempoApiConfig::default()
+        },
+    )?
+    .with_production(production.clone());
     let clickhouse_token = arguments
         .clickhouse_token_file
         .as_ref()
@@ -191,7 +253,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(token) => loki_router_with_clickhouse(store.clone(), api_config, token)?,
             None => loki_router(store.clone(), api_config),
         },
-    };
+    }
+    .merge(prometheus_router(prometheus_service))
+    .merge(tempo_router(tempo_service));
     lifecycle.mark_ready();
     let (shutdown, _) = tokio::sync::broadcast::channel::<()>(1);
     let signal = shutdown.clone();
@@ -211,7 +275,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !administrative {
             shutdown_lifecycle.begin_draining();
             let result = tokio::task::spawn_blocking(move || {
-                shard_log::LokiStore::flush(shutdown_store.as_ref(), flush_timeout)
+                shard_telemetry::LokiStore::flush(shutdown_store.as_ref(), flush_timeout)
             })
             .await;
             match result {
@@ -230,6 +294,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
     let mut http_shutdown = shutdown.subscribe();
     let mut native_shutdown = shutdown.subscribe();
+    let mut otlp_http_shutdown = shutdown.subscribe();
+    let mut otlp_grpc_shutdown = shutdown.subscribe();
     if arguments.retention_seconds > 0 {
         let retention_store = Arc::clone(&store);
         let retention_lifecycle = Arc::clone(&lifecycle);
@@ -280,7 +346,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let _ = native_shutdown.recv().await;
         },
     );
-    tokio::try_join!(http, native)?;
+    let otlp_http = axum::serve(otlp_http_listener, otlp_app).with_graceful_shutdown(async move {
+        let _ = otlp_http_shutdown.recv().await;
+    });
+    let otlp_grpc = async move {
+        serve_otlp_grpc(arguments.otlp_grpc_listen, otlp_service, async move {
+            let _ = otlp_grpc_shutdown.recv().await;
+        })
+        .await
+        .map_err(std::io::Error::other)
+    };
+    tokio::try_join!(http, native, otlp_http, otlp_grpc)?;
     Ok(())
 }
 

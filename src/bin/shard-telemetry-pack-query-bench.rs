@@ -9,11 +9,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rayon::prelude::*;
-use shard_log::{
+use shard_stream_core::{LogicalPartitionId, TopicId, TopicPartition};
+use shard_telemetry::{
     CaseSensitivity, DecodedStructuralRecord, LogPredicate, LogQuery, PersistentQueryIndex,
     QueryHit, QuerySort, decode_structural_records,
 };
-use shard_stream_core::{LogicalPartitionId, TopicId, TopicPartition};
 
 const MANIFEST_HEADER_BYTES: usize = 17;
 const MANIFEST_ENTRY_BYTES: usize = 80;
@@ -231,7 +231,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         })?)
     };
 
-    println!("shard-log sealed-pack query benchmark");
+    println!("shard-telemetry sealed-pack query benchmark");
     println!("output directory: {}", settings.output_dir.display());
     println!(
         "index bytes: {}",
@@ -636,7 +636,7 @@ fn parse_settings() -> Result<Settings, Box<dyn Error>> {
     let output_dir = arguments
         .next()
         .map(PathBuf::from)
-        .ok_or("usage: shard-log-pack-query-bench <pack-directory> [--term TERM] [--field KEY=VALUE] [--contains TEXT] [--regex PATTERN] [--limit N] [--oldest] [--iterations N] [--cold-iterations N] [--workers N] [--emit-results PATH]")?;
+        .ok_or("usage: shard-telemetry-pack-query-bench <pack-directory> [--term TERM] [--field KEY=VALUE] [--contains TEXT] [--regex PATTERN] [--limit N] [--oldest] [--iterations N] [--cold-iterations N] [--workers N] [--emit-results PATH]")?;
     let mut settings = Settings {
         output_dir,
         terms: Vec::new(),

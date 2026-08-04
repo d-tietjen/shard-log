@@ -1,21 +1,23 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::Arc;
 
-use crate::{CompressionCohortId, LogDbError, LogDbResult, LokiEntry, MetadataField, OtlpLogEvent};
+use shard_stream_core::{LogicalPartitionId, TopicId, TopicPartition};
+
+use crate::{LokiEntry, TelemetryEnvelope};
 
 /// Fixed number of bytes in every native protocol frame header.
 pub const NATIVE_FRAME_HEADER_BYTES: usize = 32;
 /// Production maximum for one native request or response payload.
-pub const MAX_NATIVE_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_NATIVE_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
-const FRAME_MAGIC: [u8; 4] = *b"SLNP";
+const FRAME_MAGIC: [u8; 4] = *b"STNP";
 const FRAME_VERSION: u8 = 1;
 const FRAME_FLAG_RESPONSE: u8 = 1;
-const BATCH_MAGIC: [u8; 4] = *b"SLB1";
-const QUERY_MAGIC: [u8; 4] = *b"SLQ1";
-const APPEND_ACK_MAGIC: [u8; 4] = *b"SLA1";
-const BATCH_HEADER_BYTES: usize = 16;
+const LOG_QUERY_RESULT_MAGIC: [u8; 4] = *b"STR1";
+const TELEMETRY_BATCH_MAGIC: [u8; 4] = *b"STB1";
+const TELEMETRY_ACK_MAGIC: [u8; 4] = *b"STM1";
+const QUERY_MAGIC: [u8; 4] = *b"STQ1";
+const LOG_QUERY_RESULT_HEADER_BYTES: usize = 16;
 const QUERY_HEADER_BYTES: usize = 32;
 const MAX_TENANT_BYTES: usize = 1_024;
 const MAX_STREAMS: usize = 65_535;
@@ -23,10 +25,6 @@ const MAX_LABELS_PER_STREAM: usize = 256;
 const MAX_METADATA_PER_ENTRY: usize = 256;
 const MAX_QUERY_TERMS: usize = 256;
 const MAX_QUERY_LIMIT: u32 = 1_000_000;
-const LINEAR_NATIVE_KEY_LIMIT: usize = 16;
-const LABEL_PREFIX: &str = "resource.loki.label.";
-const METADATA_PREFIX: &str = "attr.loki.metadata.";
-const TENANT_FIELD: &str = "resource.loki.tenant";
 
 /// Native operation carried by a frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,405 +262,230 @@ impl NativeFrame {
     }
 }
 
-/// Decoded stream-grouped native append or query-result batch.
+/// Decoded stream-grouped native log query result.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeLogBatch {
-    /// Tenant whose records are carried by the batch.
+pub struct NativeLogQueryResult {
+    /// Tenant whose records are returned by the query.
     pub tenant: String,
-    /// Flattened records; stream labels are repeated only after decoding.
+    /// Flattened records; stream labels are encoded once per stream on the wire.
     pub entries: Vec<LokiEntry>,
 }
 
-/// Durable coordinates returned after a native append.
-///
-/// The native server configuration determines whether the response waits for
-/// exact-query visibility or only the authoritative compressed WAL commit.
+/// One routed STEL envelope in a signal-aware native append.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePartitionAppend {
+    /// Exact logical topic and partition selected before append.
+    pub topic_partition: TopicPartition,
+    /// Checksummed signal envelope for that partition.
+    pub envelope: TelemetryEnvelope,
+}
+
+/// Native protocol v1 append containing one envelope per resulting partition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeTelemetryBatch {
+    /// Routed partition appends. Duplicate partitions are rejected.
+    pub partitions: Vec<NativePartitionAppend>,
+}
+
+impl NativeTelemetryBatch {
+    /// Encodes the bounded signal-aware native v1 payload.
+    pub fn encode(&self) -> Result<Vec<u8>, NativeProtocolError> {
+        if self.partitions.is_empty() || self.partitions.len() > 256 {
+            return Err(NativeProtocolError::new(
+                "native telemetry batch requires 1..=256 partitions",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&TELEMETRY_BATCH_MAGIC);
+        encoded.extend_from_slice(
+            &u16::try_from(self.partitions.len())
+                .expect("partition count was bounded")
+                .to_le_bytes(),
+        );
+        encoded.extend_from_slice(&[0; 2]);
+        for partition in &self.partitions {
+            if !seen.insert(partition.topic_partition) {
+                return Err(NativeProtocolError::new(
+                    "native telemetry batch contains a duplicate partition",
+                ));
+            }
+            if partition.topic_partition.topic_id != partition.envelope.signal.topic_id() {
+                return Err(NativeProtocolError::new(
+                    "native telemetry partition topic disagrees with its signal",
+                ));
+            }
+            let envelope = partition
+                .envelope
+                .encode()
+                .map_err(|error| NativeProtocolError::new(error.to_string()))?;
+            encoded.extend_from_slice(&partition.topic_partition.topic_id.get().to_le_bytes());
+            encoded.extend_from_slice(&partition.topic_partition.partition_id.get().to_le_bytes());
+            encoded.extend_from_slice(
+                &u32::try_from(envelope.len())
+                    .map_err(|_| NativeProtocolError::new("STEL envelope exceeds u32"))?
+                    .to_le_bytes(),
+            );
+            encoded.extend_from_slice(&envelope);
+        }
+        if encoded.len() > MAX_NATIVE_FRAME_BYTES {
+            return Err(NativeProtocolError::new(
+                "native telemetry batch exceeds the frame limit",
+            ));
+        }
+        Ok(encoded)
+    }
+
+    /// Decodes and verifies every STEL envelope before returning any partition.
+    pub fn decode(payload: &[u8]) -> Result<Self, NativeProtocolError> {
+        if payload.len() < 8 || payload[..4] != TELEMETRY_BATCH_MAGIC {
+            return Err(NativeProtocolError::new(
+                "invalid native telemetry batch header",
+            ));
+        }
+        let count = usize::from(u16::from_le_bytes(
+            payload[4..6].try_into().expect("fixed range"),
+        ));
+        if count == 0 || count > 256 || payload[6..8] != [0, 0] {
+            return Err(NativeProtocolError::new(
+                "invalid native telemetry partition count or flags",
+            ));
+        }
+        let mut cursor = Cursor::at(payload, 8);
+        let mut partitions = Vec::with_capacity(count);
+        let mut seen = BTreeSet::new();
+        for _ in 0..count {
+            let topic_partition = TopicPartition::new(
+                TopicId::new(cursor.u128("telemetry topic ID")?),
+                LogicalPartitionId::new(cursor.u32("telemetry partition ID")?),
+            );
+            let envelope_len = cursor.u32("telemetry envelope length")? as usize;
+            let envelope =
+                TelemetryEnvelope::decode(cursor.bytes(envelope_len, "telemetry envelope")?)
+                    .map_err(|error| NativeProtocolError::new(error.to_string()))?;
+            if topic_partition.topic_id != envelope.signal.topic_id() {
+                return Err(NativeProtocolError::new(
+                    "native telemetry partition topic disagrees with its signal",
+                ));
+            }
+            if !seen.insert(topic_partition) {
+                return Err(NativeProtocolError::new(
+                    "native telemetry batch contains a duplicate partition",
+                ));
+            }
+            partitions.push(NativePartitionAppend {
+                topic_partition,
+                envelope,
+            });
+        }
+        cursor.finish()?;
+        Ok(Self { partitions })
+    }
+}
+
+/// Returns true when a native append payload uses the signal-aware v1 batch format.
+#[must_use]
+pub fn is_native_telemetry_batch(payload: &[u8]) -> bool {
+    payload.starts_with(&TELEMETRY_BATCH_MAGIC)
+}
+
+/// Per-partition acknowledgement returned by native protocol v1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NativeAppendAck {
-    /// Logical tenant partition selected for the batch.
-    pub partition_id: u32,
-    /// First durable offset reserved for the batch.
+pub struct NativePartitionAck {
+    /// Appended topic and partition.
+    pub topic_partition: TopicPartition,
+    /// First assigned durable offset.
     pub first_offset: u64,
-    /// Last durable offset reserved for the batch.
+    /// Last assigned durable offset.
     pub last_offset: u64,
 }
 
-impl NativeAppendAck {
-    /// Encodes a fixed 24-byte append acknowledgement payload.
-    #[must_use]
-    pub fn encode(self) -> [u8; 24] {
-        let mut encoded = [0; 24];
-        encoded[0..4].copy_from_slice(&APPEND_ACK_MAGIC);
-        encoded[4..8].copy_from_slice(&self.partition_id.to_le_bytes());
-        encoded[8..16].copy_from_slice(&self.first_offset.to_le_bytes());
-        encoded[16..24].copy_from_slice(&self.last_offset.to_le_bytes());
-        encoded
+/// Atomic native v1 response containing one acknowledgement per partition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeTelemetryAppendAck {
+    /// Partition acknowledgements in request order.
+    pub partitions: Vec<NativePartitionAck>,
+}
+
+impl NativeTelemetryAppendAck {
+    /// Encodes a native v1 multi-partition acknowledgement.
+    pub fn encode(&self) -> Result<Vec<u8>, NativeProtocolError> {
+        if self.partitions.len() > 256 {
+            return Err(NativeProtocolError::new(
+                "native acknowledgement exceeds 256 partitions",
+            ));
+        }
+        let mut encoded = Vec::with_capacity(8 + self.partitions.len() * 36);
+        encoded.extend_from_slice(&TELEMETRY_ACK_MAGIC);
+        encoded.extend_from_slice(
+            &u16::try_from(self.partitions.len())
+                .expect("ack partition count was bounded")
+                .to_le_bytes(),
+        );
+        encoded.extend_from_slice(&[0; 2]);
+        for partition in &self.partitions {
+            encoded.extend_from_slice(&partition.topic_partition.topic_id.get().to_le_bytes());
+            encoded.extend_from_slice(&partition.topic_partition.partition_id.get().to_le_bytes());
+            encoded.extend_from_slice(&partition.first_offset.to_le_bytes());
+            encoded.extend_from_slice(&partition.last_offset.to_le_bytes());
+        }
+        Ok(encoded)
     }
 
-    /// Decodes a fixed append acknowledgement payload.
+    /// Decodes a native v1 multi-partition acknowledgement.
     pub fn decode(payload: &[u8]) -> Result<Self, NativeProtocolError> {
-        if payload.len() != 24 || payload[0..4] != APPEND_ACK_MAGIC {
+        if payload.len() < 8 || payload[..4] != TELEMETRY_ACK_MAGIC {
             return Err(NativeProtocolError::new(
-                "invalid native append acknowledgement",
+                "invalid native telemetry acknowledgement",
             ));
         }
-        Ok(Self {
-            partition_id: u32::from_le_bytes(payload[4..8].try_into().expect("fixed range")),
-            first_offset: u64::from_le_bytes(payload[8..16].try_into().expect("fixed range")),
-            last_offset: u64::from_le_bytes(payload[16..24].try_into().expect("fixed range")),
-        })
+        let count = usize::from(u16::from_le_bytes(
+            payload[4..6].try_into().expect("fixed range"),
+        ));
+        if count > 256 || payload[6..8] != [0, 0] || payload.len() != 8 + count * 36 {
+            return Err(NativeProtocolError::new(
+                "invalid native telemetry acknowledgement length",
+            ));
+        }
+        let mut cursor = Cursor::at(payload, 8);
+        let mut partitions = Vec::with_capacity(count);
+        for _ in 0..count {
+            partitions.push(NativePartitionAck {
+                topic_partition: TopicPartition::new(
+                    TopicId::new(cursor.u128("ack topic ID")?),
+                    LogicalPartitionId::new(cursor.u32("ack partition ID")?),
+                ),
+                first_offset: cursor.u64("ack first offset")?,
+                last_offset: cursor.u64("ack last offset")?,
+            });
+        }
+        cursor.finish()?;
+        Ok(Self { partitions })
     }
 }
 
-/// Lightweight information read from a native batch header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct NativeBatchInfo<'a> {
-    /// UTF-8 tenant encoded by the batch.
-    pub tenant: &'a str,
-    /// Number of records declared by the batch.
-    pub record_count: u32,
-}
-
-#[derive(Debug)]
-struct NativeFieldView<'a> {
-    key: String,
-    raw_key: &'a str,
-    value: &'a str,
-}
-
-#[derive(Debug)]
-struct NativeStreamView<'a> {
-    labels: Vec<NativeFieldView<'a>>,
-    compression_cohort: CompressionCohortId,
-}
-
-#[derive(Debug)]
-struct NativeMetadataView<'a> {
-    key_id: usize,
-    value: &'a str,
-}
-
-#[derive(Debug)]
-struct NativeRecordView<'a> {
-    stream_id: usize,
-    timestamp_unix_nanos: u64,
-    message: &'a str,
-    metadata: std::ops::Range<usize>,
-}
-
-#[derive(Debug)]
-struct NativeMetadataKey<'a> {
-    raw: &'a str,
-    normalized: String,
-}
-
-#[derive(Debug, Default)]
-struct NativeMetadataKeys<'a> {
-    entries: Vec<NativeMetadataKey<'a>>,
-    ids: Option<HashMap<&'a str, usize>>,
-}
-
-impl<'a> NativeMetadataKeys<'a> {
-    fn intern(&mut self, key: &'a str) -> usize {
-        let existing = if let Some(ids) = &self.ids {
-            ids.get(key).copied()
-        } else {
-            self.entries.iter().position(|entry| entry.raw == key)
-        };
-        if let Some(id) = existing {
-            return id;
-        }
-        if self.entries.len() == LINEAR_NATIVE_KEY_LIMIT {
-            self.ids = Some(
-                self.entries
-                    .iter()
-                    .enumerate()
-                    .map(|(id, entry)| (entry.raw, id))
-                    .collect(),
-            );
-        }
-        let id = self.entries.len();
-        self.entries.push(NativeMetadataKey {
-            raw: key,
-            normalized: prefixed_key(METADATA_PREFIX, key),
-        });
-        if let Some(ids) = &mut self.ids {
-            ids.insert(key, id);
-        }
-        id
-    }
-}
-
-/// Fully validated borrowed view over one grouped native append batch.
-///
-/// The view owns only bounded record descriptors and normalized field-key
-/// dictionaries. Message bodies and field values remain slices of the caller's
-/// native frame.
-#[derive(Debug)]
-pub(crate) struct NativeBatchView<'a> {
+struct NativeLogQueryResultInfo<'a> {
     tenant: &'a str,
-    streams: Vec<NativeStreamView<'a>>,
-    records: Vec<NativeRecordView<'a>>,
-    metadata: Vec<NativeMetadataView<'a>>,
-    metadata_keys: NativeMetadataKeys<'a>,
+    record_count: u32,
 }
 
-impl NativeBatchView<'_> {
-    pub(crate) fn tenant(&self) -> &str {
-        self.tenant
-    }
-
-    pub(crate) fn record_count(&self) -> usize {
-        self.records.len()
-    }
-
-    pub(crate) fn record_cohort(&self, index: usize) -> Option<CompressionCohortId> {
-        let record = self.records.get(index)?;
-        self.streams
-            .get(record.stream_id)
-            .map(|stream| stream.compression_cohort)
-    }
-
-    pub(crate) fn record_timestamp(&self, index: usize) -> Option<u64> {
-        self.records
-            .get(index)
-            .map(|record| record.timestamp_unix_nanos)
-    }
-
-    pub(crate) fn record_message(&self, index: usize) -> Option<&str> {
-        self.records.get(index).map(|record| record.message)
-    }
-
-    pub(crate) fn record_field_count(&self, index: usize) -> Option<usize> {
-        let record = self.records.get(index)?;
-        let labels = self.streams.get(record.stream_id)?.labels.len();
-        Some(1 + labels + record.metadata.len())
-    }
-
-    pub(crate) fn record_field(&self, record_index: usize, index: usize) -> Option<(&str, &str)> {
-        let record = self.records.get(record_index)?;
-        if index == 0 {
-            return Some((TENANT_FIELD, self.tenant));
-        }
-        let stream = self.streams.get(record.stream_id)?;
-        if let Some(label) = stream.labels.get(index - 1) {
-            return Some((&label.key, label.value));
-        }
-        let metadata_index = record
-            .metadata
-            .start
-            .checked_add(index.checked_sub(1 + stream.labels.len())?)?;
-        if metadata_index >= record.metadata.end {
-            return None;
-        }
-        let metadata = self.metadata.get(metadata_index)?;
-        let key = self.metadata_keys.entries.get(metadata.key_id)?;
-        Some((&key.normalized, metadata.value))
-    }
-
-    #[inline(always)]
-    pub(crate) fn try_for_each_record_field<F>(
-        &self,
-        record_index: usize,
-        mut visitor: F,
-    ) -> LogDbResult<()>
-    where
-        F: FnMut(&str, &str) -> LogDbResult<()>,
-    {
-        let record = self
-            .records
-            .get(record_index)
-            .ok_or(LogDbError::InvalidBlockEncoding(
-                "validated native record index is out of range",
-            ))?;
-        let stream = self
-            .streams
-            .get(record.stream_id)
-            .ok_or(LogDbError::InvalidBlockEncoding(
-                "validated native stream index is out of range",
-            ))?;
-        visitor(TENANT_FIELD, self.tenant)?;
-        for label in &stream.labels {
-            visitor(&label.key, label.value)?;
-        }
-        for metadata in
-            self.metadata
-                .get(record.metadata.clone())
-                .ok_or(LogDbError::InvalidBlockEncoding(
-                    "validated native metadata range is out of bounds",
-                ))?
-        {
-            let key = self.metadata_keys.entries.get(metadata.key_id).ok_or(
-                LogDbError::InvalidBlockEncoding("validated native metadata key is out of range"),
-            )?;
-            visitor(&key.normalized, metadata.value)?;
-        }
-        Ok(())
-    }
-}
-
-fn prefixed_key(prefix: &str, key: &str) -> String {
-    let mut normalized = String::with_capacity(prefix.len() + key.len());
-    normalized.push_str(prefix);
-    normalized.push_str(key);
-    normalized
-}
-
-/// Validates a grouped native append while retaining message and value slices
-/// directly into `payload`.
-pub(crate) fn decode_native_log_batch_view(
+fn inspect_native_log_query_result(
     payload: &[u8],
-) -> Result<NativeBatchView<'_>, NativeProtocolError> {
-    let info = inspect_native_log_batch(payload)?;
-    let record_count =
-        usize::try_from(info.record_count).expect("u32 record count fits this platform");
-    if record_count > payload.len() / 16 {
+) -> Result<NativeLogQueryResultInfo<'_>, NativeProtocolError> {
+    if payload.len() < LOG_QUERY_RESULT_HEADER_BYTES {
         return Err(NativeProtocolError::new(
-            "native batch record count exceeds its bounded payload",
+            "native log query result is shorter than its header",
         ));
     }
-    let stream_count = usize::from(u16::from_le_bytes(
-        payload[6..8].try_into().expect("fixed range"),
-    ));
-    let mut cursor = Cursor::at(payload, BATCH_HEADER_BYTES + info.tenant.len());
-    let mut streams = Vec::with_capacity(stream_count);
-    let mut records = Vec::with_capacity(record_count);
-    let mut metadata = Vec::new();
-    let mut metadata_keys = NativeMetadataKeys::default();
-    for stream_id in 0..stream_count {
-        let label_count = usize::from(cursor.u16("label count")?);
-        if label_count > MAX_LABELS_PER_STREAM {
-            return Err(NativeProtocolError::new(
-                "native stream contains too many labels",
-            ));
-        }
-        if cursor.u16("stream reserved bytes")? != 0 {
-            return Err(NativeProtocolError::new(
-                "native stream reserved bytes must be zero",
-            ));
-        }
-        let entry_count = cursor.u32("entry count")? as usize;
-        records
-            .len()
-            .checked_add(entry_count)
-            .filter(|count| *count <= record_count)
-            .ok_or_else(|| {
-                NativeProtocolError::new("native stream counts exceed declared record count")
-            })?;
-        let mut labels = Vec::<NativeFieldView<'_>>::with_capacity(label_count);
-        let mut large_label_keys = (label_count > LINEAR_NATIVE_KEY_LIMIT).then(BTreeSet::new);
-        let mut cohort_hash = 0xcbf2_9ce4_8422_2325_u64;
-        for _ in 0..label_count {
-            let key = cursor.string16("label key")?;
-            let value = cursor.string16("label value")?;
-            let duplicate = if let Some(keys) = &mut large_label_keys {
-                !keys.insert(key)
-            } else {
-                labels.iter().any(|field| field.raw_key == key)
-            };
-            if key.is_empty() || duplicate {
-                return Err(NativeProtocolError::new(
-                    "native stream contains an empty or duplicate label",
-                ));
-            }
-            update_cohort_hash(&mut cohort_hash, key, value);
-            labels.push(NativeFieldView {
-                key: prefixed_key(LABEL_PREFIX, key),
-                raw_key: key,
-                value,
-            });
-        }
-        streams.push(NativeStreamView {
-            labels,
-            compression_cohort: CompressionCohortId::new(cohort_hash),
-        });
-        for _ in 0..entry_count {
-            let timestamp_unix_nanos = cursor.u64("timestamp")?;
-            if timestamp_unix_nanos > i64::MAX as u64 {
-                return Err(NativeProtocolError::new(
-                    "native log timestamp exceeds the signed i64 range",
-                ));
-            }
-            let line_len = cursor.u32("line length")? as usize;
-            let metadata_count = usize::from(cursor.u16("metadata count")?);
-            if metadata_count > MAX_METADATA_PER_ENTRY {
-                return Err(NativeProtocolError::new(
-                    "native entry contains too much structured metadata",
-                ));
-            }
-            if cursor.u16("entry reserved bytes")? != 0 {
-                return Err(NativeProtocolError::new(
-                    "native entry reserved bytes must be zero",
-                ));
-            }
-            let message = cursor.string(line_len, "log line")?;
-            let metadata_start = metadata.len();
-            let mut large_metadata_keys =
-                (metadata_count > LINEAR_NATIVE_KEY_LIMIT).then(BTreeSet::new);
-            for _ in 0..metadata_count {
-                let key = cursor.string16("metadata key")?;
-                let value = cursor.string16("metadata value")?;
-                let key_id = metadata_keys.intern(key);
-                let duplicate = if let Some(keys) = &mut large_metadata_keys {
-                    !keys.insert(key)
-                } else {
-                    metadata[metadata_start..]
-                        .iter()
-                        .any(|field: &NativeMetadataView<'_>| field.key_id == key_id)
-                };
-                if key.is_empty() || duplicate {
-                    return Err(NativeProtocolError::new(
-                        "native entry contains empty or duplicate metadata",
-                    ));
-                }
-                metadata.push(NativeMetadataView { key_id, value });
-            }
-            records.push(NativeRecordView {
-                stream_id,
-                timestamp_unix_nanos,
-                message,
-                metadata: metadata_start..metadata.len(),
-            });
-        }
-    }
-    if records.len() != record_count {
-        return Err(NativeProtocolError::new(format!(
-            "native batch decoded {} records, expected {}",
-            records.len(),
-            info.record_count
-        )));
-    }
-    cursor.finish()?;
-    Ok(NativeBatchView {
-        tenant: info.tenant,
-        streams,
-        records,
-        metadata,
-        metadata_keys,
-    })
-}
-
-/// Returns whether a payload declares the native grouped-batch format.
-#[must_use]
-pub fn is_native_log_batch(payload: &[u8]) -> bool {
-    payload.starts_with(&BATCH_MAGIC)
-}
-
-/// Reads the bounded batch header without decoding its records.
-pub fn inspect_native_log_batch(
-    payload: &[u8],
-) -> Result<NativeBatchInfo<'_>, NativeProtocolError> {
-    if payload.len() < BATCH_HEADER_BYTES {
+    if payload[0..4] != LOG_QUERY_RESULT_MAGIC {
         return Err(NativeProtocolError::new(
-            "native log batch is shorter than its header",
+            "invalid native log query result magic",
         ));
-    }
-    if payload[0..4] != BATCH_MAGIC {
-        return Err(NativeProtocolError::new("invalid native log batch magic"));
     }
     if payload[12..16] != [0; 4] {
         return Err(NativeProtocolError::new(
-            "native log batch reserved bytes must be zero",
+            "native log query result reserved bytes must be zero",
         ));
     }
     let tenant_len = usize::from(u16::from_le_bytes(
@@ -670,28 +493,28 @@ pub fn inspect_native_log_batch(
     ));
     if tenant_len > MAX_TENANT_BYTES {
         return Err(NativeProtocolError::new(
-            "native log batch tenant exceeds its limit",
+            "native log query result tenant exceeds its limit",
         ));
     }
-    let end = BATCH_HEADER_BYTES
+    let end = LOG_QUERY_RESULT_HEADER_BYTES
         .checked_add(tenant_len)
         .filter(|end| *end <= payload.len())
-        .ok_or_else(|| NativeProtocolError::new("native log batch tenant is truncated"))?;
-    let tenant = std::str::from_utf8(&payload[BATCH_HEADER_BYTES..end])
-        .map_err(|_| NativeProtocolError::new("native log batch tenant is not UTF-8"))?;
+        .ok_or_else(|| NativeProtocolError::new("native log query result tenant is truncated"))?;
+    let tenant = std::str::from_utf8(&payload[LOG_QUERY_RESULT_HEADER_BYTES..end])
+        .map_err(|_| NativeProtocolError::new("native log query result tenant is not UTF-8"))?;
     if tenant.is_empty() {
         return Err(NativeProtocolError::new(
-            "native log batch tenant must not be empty",
+            "native log query result tenant must not be empty",
         ));
     }
-    Ok(NativeBatchInfo {
+    Ok(NativeLogQueryResultInfo {
         tenant,
         record_count: u32::from_le_bytes(payload[8..12].try_into().expect("fixed range")),
     })
 }
 
 /// Encodes records with labels stored once per stream.
-pub fn encode_native_log_batch(
+pub fn encode_native_log_query_result(
     tenant: &str,
     entries: Vec<LokiEntry>,
 ) -> Result<Vec<u8>, NativeProtocolError> {
@@ -714,7 +537,7 @@ pub fn encode_native_log_batch(
     }
 
     let mut encoded = Vec::new();
-    encoded.extend_from_slice(&BATCH_MAGIC);
+    encoded.extend_from_slice(&LOG_QUERY_RESULT_MAGIC);
     put_u16(&mut encoded, tenant.len(), "tenant")?;
     put_u16(&mut encoded, streams.len(), "stream count")?;
     encoded.extend_from_slice(&record_count.to_le_bytes());
@@ -766,12 +589,14 @@ pub fn encode_native_log_batch(
 }
 
 /// Decodes and fully validates a grouped native log batch.
-pub fn decode_native_log_batch(payload: &[u8]) -> Result<NativeLogBatch, NativeProtocolError> {
-    let info = inspect_native_log_batch(payload)?;
+pub fn decode_native_log_query_result(
+    payload: &[u8],
+) -> Result<NativeLogQueryResult, NativeProtocolError> {
+    let info = inspect_native_log_query_result(payload)?;
     let stream_count = usize::from(u16::from_le_bytes(
         payload[6..8].try_into().expect("fixed range"),
     ));
-    let mut cursor = Cursor::at(payload, BATCH_HEADER_BYTES + info.tenant.len());
+    let mut cursor = Cursor::at(payload, LOG_QUERY_RESULT_HEADER_BYTES + info.tenant.len());
     let mut entries = Vec::with_capacity(info.record_count as usize);
     for _ in 0..stream_count {
         let label_count = usize::from(cursor.u16("label count")?);
@@ -847,262 +672,10 @@ pub fn decode_native_log_batch(payload: &[u8]) -> Result<NativeLogBatch, NativeP
         )));
     }
     cursor.finish()?;
-    Ok(NativeLogBatch {
+    Ok(NativeLogQueryResult {
         tenant: info.tenant.to_owned(),
         entries,
     })
-}
-
-/// Decodes a grouped native batch directly into normalized indexing events.
-///
-/// Stream labels are materialized once and cloned as shared `Arc` fields for
-/// each event, avoiding compatibility-layer maps on the durable ingest path.
-pub fn decode_native_log_events(
-    payload: &[u8],
-) -> Result<(String, Vec<OtlpLogEvent>), NativeProtocolError> {
-    let info = inspect_native_log_batch(payload)?;
-    let stream_count = usize::from(u16::from_le_bytes(
-        payload[6..8].try_into().expect("fixed range"),
-    ));
-    let tenant = info.tenant.to_owned();
-    let tenant_field = MetadataField::new(TENANT_FIELD, tenant.clone());
-    let mut cursor = Cursor::at(payload, BATCH_HEADER_BYTES + info.tenant.len());
-    let mut events = Vec::with_capacity(info.record_count as usize);
-    for _ in 0..stream_count {
-        let label_count = usize::from(cursor.u16("label count")?);
-        if label_count > MAX_LABELS_PER_STREAM {
-            return Err(NativeProtocolError::new(
-                "native stream contains too many labels",
-            ));
-        }
-        if cursor.u16("stream reserved bytes")? != 0 {
-            return Err(NativeProtocolError::new(
-                "native stream reserved bytes must be zero",
-            ));
-        }
-        let entry_count = cursor.u32("entry count")? as usize;
-        events
-            .len()
-            .checked_add(entry_count)
-            .filter(|count| *count <= info.record_count as usize)
-            .ok_or_else(|| {
-                NativeProtocolError::new("native stream counts exceed declared record count")
-            })?;
-        let mut label_keys = BTreeSet::new();
-        let mut label_fields = Vec::with_capacity(label_count + 1);
-        label_fields.push(tenant_field.clone());
-        let mut cohort_hash = 0xcbf2_9ce4_8422_2325_u64;
-        for _ in 0..label_count {
-            let key = cursor.string16("label key")?;
-            let value = cursor.string16("label value")?;
-            if key.is_empty() || !label_keys.insert(key) {
-                return Err(NativeProtocolError::new(
-                    "native stream contains an empty or duplicate label",
-                ));
-            }
-            update_cohort_hash(&mut cohort_hash, key, value);
-            label_fields.push(MetadataField::new(
-                format!("{LABEL_PREFIX}{key}"),
-                Arc::<str>::from(value),
-            ));
-        }
-        let compression_cohort = CompressionCohortId::new(cohort_hash);
-        let label_fields = Arc::new(label_fields);
-        let mut previous_line = None::<Arc<str>>;
-        let mut previous_single_metadata = None::<(Arc<str>, Arc<str>, Arc<Vec<MetadataField>>)>;
-        for _ in 0..entry_count {
-            let timestamp_unix_nanos = cursor.u64("timestamp")?;
-            if timestamp_unix_nanos > i64::MAX as u64 {
-                return Err(NativeProtocolError::new(
-                    "native log timestamp exceeds the signed i64 range",
-                ));
-            }
-            let line_len = cursor.u32("line length")? as usize;
-            let metadata_count = usize::from(cursor.u16("metadata count")?);
-            if metadata_count > MAX_METADATA_PER_ENTRY {
-                return Err(NativeProtocolError::new(
-                    "native entry contains too much structured metadata",
-                ));
-            }
-            if cursor.u16("entry reserved bytes")? != 0 {
-                return Err(NativeProtocolError::new(
-                    "native entry reserved bytes must be zero",
-                ));
-            }
-            let observed_line = cursor.string(line_len, "log line")?;
-            let line = match &previous_line {
-                Some(previous) if previous.as_ref() == observed_line => Arc::clone(previous),
-                _ => {
-                    let line = Arc::<str>::from(observed_line);
-                    previous_line = Some(Arc::clone(&line));
-                    line
-                }
-            };
-            let fields = match metadata_count {
-                0 => Arc::clone(&label_fields),
-                1 => {
-                    let key = cursor.string16("metadata key")?;
-                    let value = cursor.string16("metadata value")?;
-                    if key.is_empty() {
-                        return Err(NativeProtocolError::new(
-                            "native entry contains empty metadata",
-                        ));
-                    }
-                    match &previous_single_metadata {
-                        Some((previous_key, previous_value, fields))
-                            if previous_key.as_ref() == key && previous_value.as_ref() == value =>
-                        {
-                            Arc::clone(fields)
-                        }
-                        _ => {
-                            let key = Arc::<str>::from(key);
-                            let value = Arc::<str>::from(value);
-                            let mut fields = Vec::with_capacity(label_fields.len() + 1);
-                            fields.extend_from_slice(&label_fields);
-                            fields.push(MetadataField::new(
-                                format!("{METADATA_PREFIX}{key}"),
-                                Arc::clone(&value),
-                            ));
-                            let fields = Arc::new(fields);
-                            previous_single_metadata = Some((key, value, Arc::clone(&fields)));
-                            fields
-                        }
-                    }
-                }
-                _ => {
-                    let mut fields = Vec::with_capacity(label_fields.len() + metadata_count);
-                    fields.extend_from_slice(&label_fields);
-                    let mut metadata_keys = BTreeSet::new();
-                    for _ in 0..metadata_count {
-                        let key = cursor.string16("metadata key")?;
-                        let value = cursor.string16("metadata value")?;
-                        if key.is_empty() || !metadata_keys.insert(key) {
-                            return Err(NativeProtocolError::new(
-                                "native entry contains empty or duplicate metadata",
-                            ));
-                        }
-                        fields.push(MetadataField::new(
-                            format!("{METADATA_PREFIX}{key}"),
-                            Arc::<str>::from(value),
-                        ));
-                    }
-                    Arc::new(fields)
-                }
-            };
-            events.push(OtlpLogEvent {
-                timestamp_unix_nanos,
-                message: line,
-                fields,
-                compression_cohort,
-            });
-        }
-    }
-    if events.len() != info.record_count as usize {
-        return Err(NativeProtocolError::new(format!(
-            "native batch decoded {} records, expected {}",
-            events.len(),
-            info.record_count
-        )));
-    }
-    cursor.finish()?;
-    Ok((tenant, events))
-}
-
-/// Fully validates a grouped native batch without materializing its records.
-///
-/// Compatibility sinks use this before reserving offsets. The production
-/// native service instead validates while building a borrowed structural view.
-pub fn validate_native_log_batch(payload: &[u8]) -> Result<(), NativeProtocolError> {
-    let info = inspect_native_log_batch(payload)?;
-    let stream_count = usize::from(u16::from_le_bytes(
-        payload[6..8].try_into().expect("fixed range"),
-    ));
-    let mut cursor = Cursor::at(payload, BATCH_HEADER_BYTES + info.tenant.len());
-    let mut decoded_count = 0usize;
-    for _ in 0..stream_count {
-        let label_count = usize::from(cursor.u16("label count")?);
-        if label_count > MAX_LABELS_PER_STREAM {
-            return Err(NativeProtocolError::new(
-                "native stream contains too many labels",
-            ));
-        }
-        if cursor.u16("stream reserved bytes")? != 0 {
-            return Err(NativeProtocolError::new(
-                "native stream reserved bytes must be zero",
-            ));
-        }
-        let entry_count = cursor.u32("entry count")? as usize;
-        decoded_count = decoded_count
-            .checked_add(entry_count)
-            .filter(|count| *count <= info.record_count as usize)
-            .ok_or_else(|| {
-                NativeProtocolError::new("native stream counts exceed declared record count")
-            })?;
-        let mut label_keys = Vec::with_capacity(label_count);
-        for _ in 0..label_count {
-            let key = cursor.string16("label key")?;
-            let _value = cursor.string16("label value")?;
-            if key.is_empty() || label_keys.contains(&key) {
-                return Err(NativeProtocolError::new(
-                    "native stream contains an empty or duplicate label",
-                ));
-            }
-            label_keys.push(key);
-        }
-        for _ in 0..entry_count {
-            let timestamp_unix_nanos = cursor.u64("timestamp")?;
-            if timestamp_unix_nanos > i64::MAX as u64 {
-                return Err(NativeProtocolError::new(
-                    "native log timestamp exceeds the signed i64 range",
-                ));
-            }
-            let line_len = cursor.u32("line length")? as usize;
-            let metadata_count = usize::from(cursor.u16("metadata count")?);
-            if metadata_count > MAX_METADATA_PER_ENTRY {
-                return Err(NativeProtocolError::new(
-                    "native entry contains too much structured metadata",
-                ));
-            }
-            if cursor.u16("entry reserved bytes")? != 0 {
-                return Err(NativeProtocolError::new(
-                    "native entry reserved bytes must be zero",
-                ));
-            }
-            let _line = cursor.string(line_len, "log line")?;
-            match metadata_count {
-                0 => {}
-                1 => {
-                    let key = cursor.string16("metadata key")?;
-                    let _value = cursor.string16("metadata value")?;
-                    if key.is_empty() {
-                        return Err(NativeProtocolError::new(
-                            "native entry contains empty metadata",
-                        ));
-                    }
-                }
-                _ => {
-                    let mut metadata_keys = Vec::with_capacity(metadata_count);
-                    for _ in 0..metadata_count {
-                        let key = cursor.string16("metadata key")?;
-                        let _value = cursor.string16("metadata value")?;
-                        if key.is_empty() || metadata_keys.contains(&key) {
-                            return Err(NativeProtocolError::new(
-                                "native entry contains empty or duplicate metadata",
-                            ));
-                        }
-                        metadata_keys.push(key);
-                    }
-                }
-            }
-        }
-    }
-    if decoded_count != info.record_count as usize {
-        return Err(NativeProtocolError::new(format!(
-            "native batch decoded {decoded_count} records, expected {}",
-            info.record_count
-        )));
-    }
-    cursor.finish()
 }
 
 /// Sort direction for an indexed native query.
@@ -1318,19 +891,6 @@ fn validate_query(query: &NativeQuery) -> Result<(), NativeProtocolError> {
     Ok(())
 }
 
-fn update_cohort_hash(hash: &mut u64, key: &str, value: &str) {
-    for byte in key
-        .bytes()
-        .chain(std::iter::once(0xff))
-        .chain(value.bytes())
-    {
-        *hash ^= u64::from(byte);
-        *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-    }
-    *hash ^= 0xfe;
-    *hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-}
-
 fn payload_checksum(payload: &[u8]) -> u32 {
     u32::from_le_bytes(
         blake3::hash(payload).as_bytes()[0..4]
@@ -1416,6 +976,12 @@ impl<'a> Cursor<'a> {
         ))
     }
 
+    fn u128(&mut self, field: &'static str) -> Result<u128, NativeProtocolError> {
+        Ok(u128::from_le_bytes(
+            self.bytes(16, field)?.try_into().expect("fixed range"),
+        ))
+    }
+
     fn string(&mut self, len: usize, field: &'static str) -> Result<&'a str, NativeProtocolError> {
         std::str::from_utf8(self.bytes(len, field)?)
             .map_err(|_| NativeProtocolError::new(format!("native {field} is not UTF-8")))
@@ -1441,6 +1007,41 @@ impl<'a> Cursor<'a> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn signal_aware_batch_and_partition_ack_round_trip() {
+        let topic_partition =
+            TopicPartition::new(crate::TRACES_TOPIC_ID, LogicalPartitionId::new(7));
+        let batch = NativeTelemetryBatch {
+            partitions: vec![NativePartitionAppend {
+                topic_partition,
+                envelope: TelemetryEnvelope::new(
+                    crate::TelemetrySignal::Traces,
+                    "tenant-a",
+                    2,
+                    &b"route"[..],
+                    &b"payload"[..],
+                )
+                .unwrap(),
+            }],
+        };
+        assert_eq!(
+            NativeTelemetryBatch::decode(&batch.encode().unwrap()).unwrap(),
+            batch
+        );
+
+        let acknowledgement = NativeTelemetryAppendAck {
+            partitions: vec![NativePartitionAck {
+                topic_partition,
+                first_offset: 10,
+                last_offset: 11,
+            }],
+        };
+        assert_eq!(
+            NativeTelemetryAppendAck::decode(&acknowledgement.encode().unwrap()).unwrap(),
+            acknowledgement
+        );
+    }
+
     fn entries() -> Vec<LokiEntry> {
         vec![
             LokiEntry {
@@ -1465,70 +1066,33 @@ mod tests {
     }
 
     #[test]
-    fn grouped_batch_round_trips_byte_exact_text_and_metadata() {
+    fn log_query_result_round_trips_byte_exact_text_and_metadata() {
         let expected = entries();
-        let encoded = encode_native_log_batch("tenant-a", expected.clone()).expect("batch encodes");
-        let info = inspect_native_log_batch(&encoded).expect("header");
-        assert_eq!(info.tenant, "tenant-a");
-        assert_eq!(info.record_count, 2);
-        validate_native_log_batch(&encoded).expect("batch validates without materializing");
-        let decoded = decode_native_log_batch(&encoded).expect("batch decodes");
+        let encoded = encode_native_log_query_result("tenant-a", expected.clone())
+            .expect("query result encodes");
+        let decoded = decode_native_log_query_result(&encoded).expect("query result decodes");
         assert_eq!(decoded.tenant, "tenant-a");
         assert_eq!(decoded.entries, expected);
-        let (tenant, events) = decode_native_log_events(&encoded).expect("direct events");
-        assert_eq!(tenant, "tenant-a");
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].message.as_ref(), "request café");
-        assert!(events[0].fields.iter().any(|field| {
-            field.key.as_ref() == "resource.loki.label.region" && field.value.as_ref() == "東京"
-        }));
-        let borrowed = decode_native_log_batch_view(&encoded).expect("borrowed view");
-        assert_eq!(borrowed.tenant(), "tenant-a");
-        assert_eq!(borrowed.record_count(), 2);
-        assert_eq!(borrowed.record_timestamp(0), Some(10));
-        assert_eq!(borrowed.record_message(0), Some("request café"));
-        assert_eq!(borrowed.record_field_count(0), Some(4));
-        assert_eq!(
-            borrowed.record_field(0, 0),
-            Some(("resource.loki.tenant", "tenant-a"))
-        );
-        assert_eq!(
-            borrowed.record_field(0, 2),
-            Some(("resource.loki.label.region", "東京"))
-        );
-        assert_eq!(
-            borrowed.record_field(0, 3),
-            Some(("attr.loki.metadata.trace_id", "abc"))
-        );
-        assert_eq!(borrowed.record_field(0, 4), None);
     }
 
     #[test]
-    fn batch_rejects_truncation_count_mismatch_and_trailing_bytes() {
-        let encoded = encode_native_log_batch("tenant-a", entries()).expect("batch");
+    fn log_query_result_rejects_truncation_count_mismatch_and_trailing_bytes() {
+        let encoded = encode_native_log_query_result("tenant-a", entries()).expect("query result");
         for end in 0..encoded.len() {
-            assert!(decode_native_log_batch(&encoded[..end]).is_err(), "{end}");
             assert!(
-                decode_native_log_batch_view(&encoded[..end]).is_err(),
+                decode_native_log_query_result(&encoded[..end]).is_err(),
                 "{end}"
             );
-            assert!(validate_native_log_batch(&encoded[..end]).is_err(), "{end}");
         }
         let mut count = encoded.clone();
         count[8..12].copy_from_slice(&3_u32.to_le_bytes());
-        assert!(decode_native_log_batch(&count).is_err());
-        assert!(decode_native_log_batch_view(&count).is_err());
-        assert!(validate_native_log_batch(&count).is_err());
+        assert!(decode_native_log_query_result(&count).is_err());
         let mut reserved = encoded.clone();
         reserved[12] = 1;
-        assert!(decode_native_log_batch(&reserved).is_err());
-        assert!(decode_native_log_batch_view(&reserved).is_err());
-        assert!(validate_native_log_batch(&reserved).is_err());
+        assert!(decode_native_log_query_result(&reserved).is_err());
         let mut trailing = encoded;
         trailing.push(0);
-        assert!(decode_native_log_batch(&trailing).is_err());
-        assert!(decode_native_log_batch_view(&trailing).is_err());
-        assert!(validate_native_log_batch(&trailing).is_err());
+        assert!(decode_native_log_query_result(&trailing).is_err());
     }
 
     #[test]
@@ -1546,7 +1110,7 @@ mod tests {
         assert!(decoded.verify_payload(&[1, 2, 4]).is_err());
 
         let mut invalid = header;
-        invalid[4] = 2;
+        invalid[4] = 3;
         assert!(NativeFrameHeader::decode(&invalid).is_err());
     }
 

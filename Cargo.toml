@@ -1,11 +1,22 @@
 [package]
-name = "shard-log"
+name = "shard-telemetry"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "Stripe-aligned, object-tiered OTLP log indexing for shard-stream"
-repository = "https://github.com/d-tietjen/shard-log"
+description = "Signal-native, object-tiered observability storage for shard-stream"
+repository = "https://github.com/d-tietjen/shard-telemetry"
+homepage = "https://github.com/d-tietjen/shard-telemetry"
+readme = "README.md"
 rust-version = "1.93"
+publish = false
+keywords = ["telemetry", "observability", "opentelemetry", "prometheus", "database"]
+categories = ["database", "development-tools::debugging"]
+exclude = [
+    ".github/",
+    "deploy/",
+    "scripts/",
+    "clickhouse/",
+]
 
 # Keep this standalone repository independent when it is checked out beneath
 # an unrelated Cargo workspace (as it is on the Adam benchmark host).
@@ -16,23 +27,24 @@ arrow-array = "58.1"
 arrow-ipc = "58.1"
 arrow-schema = "58.1"
 axum = { version = "0.8", features = ["ws"] }
+base64 = "0.22"
 blake3 = "1"
 brotli = "8"
 bzip2 = "0.6"
 bytes = "1.12"
 bytes-handoff = "1.3"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4.5", features = ["derive"] }
-flate3 = "1.2"
+crc32c = "0.6"
 foldhash = "0.2"
 form_urlencoded = "1.2"
-opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic-messages", "logs"] }
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "logs", "metrics", "trace", "with-serde"] }
 pco = "1.0.2"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 fs2 = "0.4"
 libdeflater = "1.25"
 lz4 = "1.28"
 lz4_flex = "0.11"
-lz4_rust = { package = "lz4r", version = "1.10" }
 lzfse = "0.2"
 lzfse_rust = "0.2"
 lzma-rust2 = "0.16"
@@ -41,10 +53,12 @@ memmap2 = "0.9"
 minlz = "1.2"
 prost = "0.14"
 prost-types = "0.14"
+promql-parser = "0.10"
 rayon = "1"
 regex = "1"
+rmp-serde = "1.3"
 rustix = { version = "1.1", features = ["fs"] }
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 serde_urlencoded = "0.7"
 shard-stream-core = { git = "https://github.com/d-tietjen/shard-stream.git", rev = "c658e97862cea83160dcc0110583649f8ede0e60", version = "=0.1.0" }
@@ -53,9 +67,9 @@ shard-stream-protocol = { git = "https://github.com/d-tietjen/shard-stream.git",
 snap = "1"
 tokio = { version = "1.48", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1"
+tonic = { version = "0.14", features = ["gzip", "transport"] }
 tower = { version = "0.5", features = ["util"] }
 xz2 = "0.1"
-zenflate = "0.3"
 zlib-rs = "0.6"
 zopfli = "0.8"
 zstd = { version = "0.13", features = ["zdict_builder"] }

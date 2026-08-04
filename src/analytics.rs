@@ -18,7 +18,7 @@ use crate::loki_api::LokiApiError;
 use crate::query::message_has_term;
 use crate::{LokiStore, MetadataField};
 
-/// Pinned ClickHouse release whose evaluator defines ShardLog SQL semantics.
+/// Pinned ClickHouse release whose evaluator defines ShardTelemetry SQL semantics.
 pub const CLICKHOUSE_COMPATIBILITY_TARGET: &str = "26.3.17.56-lts";
 
 /// Version of the typed columnar boundary exposed to analytical engines.
@@ -27,7 +27,7 @@ pub const ANALYTICS_SCHEMA_VERSION: u16 = 1;
 const DEFAULT_SCAN_BATCH_ROWS: usize = 8_192;
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 
-/// One stable column available from ShardLog's analytical scan boundary.
+/// One stable column available from ShardTelemetry's analytical scan boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum AnalyticsColumn {
     /// Loki tenant owning the record.
@@ -348,11 +348,11 @@ pub(crate) fn arrow_stream_response(
         HeaderValue::from_static("application/vnd.apache.arrow.stream"),
     );
     response.headers_mut().insert(
-        HeaderName::from_static("x-shardlog-schema-version"),
+        HeaderName::from_static("x-shardtelemetry-schema-version"),
         HeaderValue::from_static("1"),
     );
     response.headers_mut().insert(
-        HeaderName::from_static("x-shardlog-clickhouse-target"),
+        HeaderName::from_static("x-shardtelemetry-clickhouse-target"),
         HeaderValue::from_static(CLICKHOUSE_COMPATIBILITY_TARGET),
     );
     response

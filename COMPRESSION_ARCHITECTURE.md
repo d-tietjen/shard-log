@@ -11,6 +11,55 @@ block selection. The stripe-local zstd context compresses each resulting
 payload. This retains the single-writer stripe model, durable offsets, and
 exact record reconstruction while giving each codec homogeneous data.
 
+Logs, traces, and metrics all use the single pre-release v1 durable format, but
+their payloads remain signal-native:
+
+- log frames use structural templates, Pco timestamps, field dictionaries, and
+  the compressed-domain term/field index;
+- trace heads are collected by trace and then packed by partition into bounded
+  8 MiB multi-trace blocks; each block prefix/XOR encodes IDs, Pco-encodes times
+  and durations, and refers to exact tenant/resource/scope/name/attribute/event/
+  link/status values through block-local ordinals before Zstd-1;
+- metric chunks delta-of-delta encode timestamps, Pco-encode integer samples,
+  Gorilla-bitpack exact floating-point XOR windows, and Zstd-encode homogeneous
+  histogram/summary lanes. Description, metadata, and exemplar sets use
+  chunk-local ordinals.
+
+The ordinal builders use linear search for up to 16 distinct values and promote
+to a hash table only for higher-cardinality blocks. This keeps common repeated
+telemetry on the cache-friendly path while bounding high-cardinality insertion
+cost. Every dictionary is part of its checksummed block; no mutable global
+interner is required for decoding.
+
+Resource contexts, scope contexts, and typed attributes also receive stable
+128-bit content identities. The owner stripe indexes those identities together
+with trace links from logs, spans, span links, and metric exemplars. Correlation
+postings contain only durable record references and are strictly bounded; if
+the optional navigation index is full, ingestion and native per-signal indexes
+remain exact and available.
+
+Every immutable trace block and metric chunk also carries a compact
+shared-identity Bloom filter. Catalog trace-ID ranges and these filters prune
+cold object reads; candidate blocks are always decoded and compared exactly, so
+filter collisions can add work but cannot add results. Primary trace IDs use
+the exact sorted block range, leaving the trace Bloom bits for cross-trace span
+links. Filters are computed while source records are still owned by the stripe
+and survive object-tier restart without retaining record bodies in RAM.
+
+Cold queries keep immutable control and payload data in separate recoverable
+SSD caches. Catalog pages, group manifests, query indexes, and metric recovery
+indexes use the bounded control cache; compressed log frames, trace blocks,
+and metric chunks use the payload cache. The standalone defaults reserve 8 GiB
+and 512 GiB respectively. Both caches verify object checksums and per-chunk
+integrity before returning bytes, and expose hit, miss, occupancy, and source
+byte counters through `TelemetryService`.
+
+Selected payload extents are sorted and read as one batch. The cache retains
+the current 4 MiB chunk in memory while copying adjacent block ranges, so one
+query neither reopens the same SSD chunk for every block nor repeats an object
+range request. This is an execution optimization only: every block retains its
+own checksum and is verified independently before decode.
+
 The Adam error-loop corpus reached 33.13x with bzip2 and 27.56x with zstd-9 as
 raw 8 MiB blocks. A trained dictionary and the current line-template prototype
 did not improve that corpus materially. That is evidence to optimize data
@@ -222,7 +271,7 @@ original `Arc`s. The crate is an ownership and boundary primitive—the integer
 collator still performs the scoring.
 
 `CompressionPlacementId` selects active blocks and immutable dictionaries.
-`DurableLogRecord::compression_cohort` remains the producer-derived cohort.
+`DurableLog::compression_cohort` remains the producer-derived cohort.
 Because final placement does not exist until block scoring,
 `IndexReceipt` returns the record temperature, tentative collection placement,
 and zero or more descriptors sealed by that append. Every descriptor stores
@@ -315,7 +364,7 @@ queue, share a collator or compressor, or lock around compression.
 
 The structural encoder accepts a `StructuralRecordView`, allowing a parser to
 expose borrowed message, timestamp, offset, and metadata fields without first
-allocating a `DurableLogRecord` and per-record `Arc`s. Tokenization stores byte
+allocating a `DurableLog` and per-record `Arc`s. Tokenization stores byte
 ranges into the normalized message. Template groups use a hash only to find
 candidates and then compare every literal byte, so hash collisions cannot
 merge unlike templates. Only selected template literals are copied.
@@ -377,15 +426,17 @@ borrowed byte ranges. This removes a `pread`-to-`Vec` copy from performance
 measurement without putting memory mapping or unsafe code in the storage
 library. Production callers may provide any stable borrowed input buffer.
 
-The final optimized Pco-8 run with locality disabled stored 628,417,043 bytes
-at 136.69x and 7,570.75 MiB/s on 16 physical cores. All 10,240 payload
-checksums and sampled exact reconstructions passed. The same binary sustained
-1,157.26 MiB/s on one physical core across the full 80 GiB corpus. The
-locality-enabled precursor stored 628,473,667 bytes at 1,005.02 MiB/s after
-528 unproductive splits and 83,512,504 bytes of membership handoff. Routing
-therefore remains disabled by default. The prior ShardLog format stored
-826,364,011 bytes at 103.95x; the final paired ClickHouse run stored
-1,175,169,126 bytes at 73.10x and 927.43 MiB/s.
+The current single pre-release format, with locality disabled, stored
+620,912,446 bytes at 138.34x and 3,622.67 MiB/s on 16 physical cores. All
+10,240 payload checksums and sampled exact reconstructions passed. It is
+7,561,221 bytes smaller than the accepted historical Pco-8 result even though
+the current payload retains its compression-derived lookup index. The
+historical one-core implementation sustained 1,157.26 MiB/s, but that result
+predates the current frame index and is not presented as a current per-core
+measurement. The locality-enabled precursor performed 528 unproductive splits
+and 83,512,504 bytes of membership handoff, so routing remains disabled by
+default. The fresh retained ClickHouse baseline stored 1,175,650,470 bytes at
+73.07x and 915.72 MiB/s.
 
 ## Dictionary policy
 
@@ -470,7 +521,7 @@ selection, bounded fair sampling, cumulative payback, immutable publication,
 sparse assignment runs, checksums, decompression, and byte-identical
 reconstruction.
 
-`shard-log-locality-bench` measures fingerprint sizes, tentative 16-shard
+`shard-telemetry-locality-bench` measures fingerprint sizes, tentative 16-shard
 probe cost, complete block score/split/assignment throughput,
 `bytes-handoff` membership volume, persistent state, combined single-thread
 throughput, and p50/p99 seal latency. `run-head-to-head.sh` performs sequential
@@ -515,18 +566,20 @@ index on the native/Loki durable path:
 2. `encode_indexed_structural_records` builds template IDs, token templates,
    attribute dictionaries, repeated field sets, and their forward record
    columns in one pass.
-3. The structural frame embeds an `SLI1` index section. Static terms point to
-   template IDs, repeated exact fields point to field-set IDs, and bit-packed
-   forward columns map those dictionary IDs back to record ordinals.
-4. Dynamic terms and direct/high-cardinality fields use bounded membership
-   filters and fail open to a candidate superset. Selective structural decode
-   and `LogQuery::matches` remain the exact authority.
+3. The structural frame embeds one index section without a second format
+   header. Collision-safe 24-bit fingerprints point to template or field-set
+   IDs. Forward columns choose run-length or bit-packed encoding per block.
+4. The template-ID column is authoritative for body reconstruction, so the body
+   lane does not repeat a kind byte and template ID for every record. Dynamic
+   terms and direct/high-cardinality fields use one shared bounded membership
+   hint and fail open to a candidate superset. Selective structural decode and
+   `LogQuery::matches` remain the exact authority.
 5. The enclosing `SLW1` ingest pack stores independently checksummed,
    Zstd-compressed cohort frames. Its group descriptor includes record count,
    structural length, compressed checksum, and minimum/maximum timestamp.
 6. Live ingestion hands only the already-encoded index section to the owning
    stripe. Recovery reconstructs the same index from the durable compressed
-   frame; it does not recreate millions of `DurableLogRecord` objects or a
+   frame; it does not recreate millions of `DurableLog` objects or a
    second term/field map.
 
 The in-memory stripe state retains `Bytes` slices over authoritative compressed
@@ -559,9 +612,9 @@ Current limitations are explicit:
 - Arbitrary LogQL substring and regex predicates remain residual filters.
   The older sealed-block query directory has trigram rejection, but those
   trigrams have not yet been folded into the compressor-derived frame index.
-- Compressed frames are resident in the stripe after recovery. The next storage
-  step is publishing the same frame descriptors through the SSD/object-tier
-  catalog and retaining only directory/index state for cold frames.
+- Cold queries still decode each selected signal-native block. The next
+  storage step is adding bounded asynchronous prefetch and more selective
+  trace/metric lane decoding without weakening exact reconstruction.
 - The native decoder still materializes owned strings before structural
   encoding. A borrowed native-record view would remove the UTF-8 validation,
   allocation, and free costs visible in the current production profile.

@@ -1,6 +1,6 @@
 # Tiered storage architecture
 
-ShardLog's durable tier is designed so data volume can grow to at least one
+ShardTelemetry's durable tier is designed so data volume can grow to at least one
 pebibyte without requiring a process to load a corpus-wide block catalog,
 enumerate an object-store bucket, or validate every payload at startup.
 
@@ -13,7 +13,7 @@ The implementation follows shard-stream's proven lifecycle:
 - local data is released only after object durability is visible; and
 - retention publishes new metadata before deleting unreachable bytes.
 
-ShardLog changes the manifest shape. shard-stream's per-shard pack list is
+ShardTelemetry changes the manifest shape. shard-stream's per-shard pack list is
 small enough to keep in one manifest. A petabyte-scale log database needs a
 partition-scoped hierarchy of roots, catalog pages, block groups, query-index
 segments, dictionaries, and payload ranges.
@@ -105,7 +105,7 @@ The owning shard worker is the only normal publisher for a
 
 Retries with identical content are accepted. Reusing a sequence with different
 content is corruption. Two writers may upload the same immutable objects, but
-only one can advance `CURRENT`; the other receives `LogDbError::StaleCatalog`
+only one can advance `CURRENT`; the other receives `TelemetryError::StaleCatalog`
 and must reopen the authoritative root before retrying.
 
 Crashes before step 7 leave invisible immutable objects. They are harmless and
@@ -116,7 +116,7 @@ did not run.
 `LocalObjectStore` implements these rules with synchronized temporary writes,
 atomic rename, parent-directory synchronization, BLAKE3 verification, and a
 filesystem update lock. A production S3-compatible adapter implements the same
-`LogObjectStore` contract with immutable create, bounded GET, range GET, HEAD,
+`TelemetryObjectStore` contract with immutable create, bounded GET, range GET, HEAD,
 and conditional replacement. If an object service cannot conditionally replace
 `CURRENT`, the adapter must provide an equivalent external fencing primitive;
 unconditional last-writer-wins publication is not safe.
@@ -141,7 +141,7 @@ This preserves the existing hot/cold query compatibility contract. Catalog
 and trigram collisions can only create extra reads; reconstruction and exact
 filtering remain authoritative.
 
-`LogObjectTier::open` deliberately validates only `CURRENT` and the immutable
+`TelemetryObjectTier::open` deliberately validates only `CURRENT` and the immutable
 root. A page is verified when its bounds are touched, a group manifest when
 selected, and a full artifact when read. Verifying every referenced payload on
 startup would turn process recovery into a petabyte scan. A separate
@@ -186,7 +186,7 @@ There are three explicit durability states:
 | State | Meaning |
 | --- | --- |
 | Stream durable | shard-stream has synchronized the source append |
-| SSD staged | ShardLog block, query index, and group files can be retried locally |
+| SSD staged | ShardTelemetry block, query index, and group files can be retried locally |
 | Object durable | `CURRENT` selects a root that reaches every required immutable artifact |
 
 An object-durable acknowledgement, when requested, must wait through the
@@ -197,7 +197,7 @@ data and query index.
 
 On restart:
 
-1. Recover shard-stream and replay any source offsets beyond ShardLog's durable
+1. Recover shard-stream and replay any source offsets beyond ShardTelemetry's durable
    index checkpoint.
 2. Open each known catalog directly; do not list the bucket.
 3. Reconcile synchronized local spool groups against the selected root.
@@ -228,30 +228,33 @@ must publish the replacement before removing the original. Legal hold is a
 root-selection policy: held groups remain reachable regardless of the normal
 time cutoff.
 
-Deletion is intentionally outside `LogObjectStore`'s online query/publication
+Deletion is intentionally outside `TelemetryObjectStore`'s online query/publication
 contract. The garbage collector should use a separately authorized object
 client so an ingest or query process cannot erase durable data.
 
 ## Worker integration
 
-The next worker-level integration mirrors shard-stream's existing pack
-offloader:
+The worker-level integration mirrors shard-stream's pack offloader:
 
 - one mutable group builder belongs to each shard worker;
 - block compression, query-index construction, and local spool writes remain
   worker local;
-- a group closes on target bytes, block count, maximum age, explicit object
-  durability, or shutdown;
+- a group closes on target bytes, block count, explicit flush, or shutdown;
 - publication runs in sequence order for each shard/partition namespace;
 - backpressure is based on unpublished SSD spool bytes, never total retained
   object bytes; and
 - local spool retention advances only from authoritative catalog generations.
 
-The implemented `BlockCatalog` range fields, `write_staged_payload_pack`,
-`LogObjectTier`, `mark_group_offloaded`, and `SsdObjectCache` are the durable
-boundaries for that coordinator. The automatic worker coordinator and concrete
-cloud-provider adapter are not connected yet; the structural benchmark's
-pack writer remains a benchmark path until that integration is complete.
+`LogStripe::offload_indexed_groups` constructs append-aligned payload and query
+artifacts, publishes them through `TelemetryObjectTier`, and releases resident frames
+only after the new `CURRENT` generation is selected. On restart, catalog
+checkpoints skip already-published recovery transactions. Queries load a group
+index before payload and verify each selected frame checksum after range read.
+
+The standalone binary ships `LocalObjectStore`. The public `TelemetryObjectStore`
+trait is the stable integration point for S3-compatible and other cloud
+adapters; adapters must preserve immutable create and conditional `CURRENT`
+replacement semantics.
 
 ## Required operational metrics
 
