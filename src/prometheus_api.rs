@@ -15,9 +15,10 @@ use serde_json::{Value, json};
 use crate::prometheus_protocol::v1 as prometheus_v1;
 use crate::prometheus_xor::encode_xor_chunk;
 use crate::{
-    DurableTelemetryStore, MetricKind, MetricValue, NumberValue, ProductionRuntime, PromqlEngine,
-    PromqlLimits, PromqlValue, RemoteWriteDecoder, RemoteWriteStats, RemoteWriteVersion,
-    ServiceState, TelemetryError, TelemetryResult, TelemetryRouter, TelemetryValue,
+    DurableTelemetryStore, ExponentialHistogramBuckets, HistogramCount, MetricKind, MetricValue,
+    NumberValue, ProductionRuntime, PromqlEngine, PromqlLimits, PromqlValue, RemoteWriteDecoder,
+    RemoteWriteStats, RemoteWriteVersion, ServiceState, TelemetryError, TelemetryResult,
+    TelemetryRouter, TelemetryValue,
 };
 
 /// Single-tenant Prometheus compatibility limits.
@@ -785,24 +786,35 @@ async fn remote_read(
                 query.start_timestamp_ms,
                 query.end_timestamp_ms,
             )?;
-            let mut series =
-                BTreeMap::<BTreeMap<String, String>, Vec<prometheus_v1::Sample>>::new();
+            let mut series = BTreeMap::<
+                BTreeMap<String, String>,
+                BTreeMap<i64, (shard_stream_core::LogicalOffset, RemoteReadValue)>,
+            >::new();
             for point in points {
-                if let Some(value) = remote_read_float(&point.value) {
-                    series
-                        .entry(metric_labels(&point))
-                        .or_default()
-                        .push(prometheus_v1::Sample {
-                            value,
-                            timestamp: i64::try_from(point.timestamp_unix_nanos / 1_000_000)
-                                .unwrap_or(i64::MAX),
-                        });
+                let timestamp =
+                    i64::try_from(point.timestamp_unix_nanos / 1_000_000).unwrap_or(i64::MAX);
+                let Some(value) = remote_read_value(&point, timestamp) else {
+                    continue;
+                };
+                let values = series.entry(metric_labels(&point)).or_default();
+                if values
+                    .get(&timestamp)
+                    .is_none_or(|(offset, _)| *offset < point.record_ref.offset)
+                {
+                    values.insert(timestamp, (point.record_ref.offset, value));
                 }
             }
             let timeseries = series
                 .into_iter()
-                .map(|(labels, mut samples)| {
-                    samples.sort_unstable_by_key(|sample| sample.timestamp);
+                .map(|(labels, values)| {
+                    let mut samples = Vec::new();
+                    let mut histograms = Vec::new();
+                    for (_, (_, value)) in values {
+                        match value {
+                            RemoteReadValue::Sample(sample) => samples.push(sample),
+                            RemoteReadValue::Histogram(histogram) => histograms.push(*histogram),
+                        }
+                    }
                     prometheus_v1::TimeSeries {
                         labels: labels
                             .into_iter()
@@ -810,7 +822,7 @@ async fn remote_read(
                             .collect(),
                         samples,
                         exemplars: Vec::new(),
-                        histograms: Vec::new(),
+                        histograms,
                     }
                 })
                 .collect();
@@ -1186,6 +1198,155 @@ fn remote_read_float(value: &MetricValue) -> Option<f64> {
     }
 }
 
+enum RemoteReadValue {
+    Sample(prometheus_v1::Sample),
+    Histogram(Box<prometheus_v1::Histogram>),
+}
+
+fn remote_read_value(
+    point: &crate::DurableMetricPoint,
+    timestamp_ms: i64,
+) -> Option<RemoteReadValue> {
+    if let Some(value) = remote_read_float(&point.value) {
+        return Some(RemoteReadValue::Sample(prometheus_v1::Sample {
+            value,
+            timestamp: timestamp_ms,
+        }));
+    }
+    let start_timestamp = i64::try_from(point.start_time_unix_nanos / 1_000_000).ok()?;
+    let histogram = match &point.value {
+        MetricValue::ExplicitHistogram(value) => {
+            let (positive_deltas, positive_counts) = histogram_count_lanes(&value.bucket_counts)?;
+            let positive_spans = if value.bucket_counts.is_empty() {
+                Vec::new()
+            } else {
+                vec![prometheus_v1::BucketSpan {
+                    offset: 0,
+                    length: u32::try_from(value.bucket_counts.len()).ok()?,
+                }]
+            };
+            prometheus_v1::Histogram {
+                count: Some(histogram_count(value.count)),
+                sum: value.sum_bits.map_or(0.0, f64::from_bits),
+                schema: -53,
+                zero_threshold: 0.0,
+                zero_count: Some(prometheus_v1::histogram::ZeroCount::Int(0)),
+                negative_spans: Vec::new(),
+                negative_deltas: Vec::new(),
+                negative_counts: Vec::new(),
+                positive_spans,
+                positive_deltas,
+                positive_counts,
+                reset_hint: value.reset_hint,
+                timestamp: timestamp_ms,
+                custom_values: value
+                    .explicit_bounds_bits
+                    .iter()
+                    .copied()
+                    .map(f64::from_bits)
+                    .collect(),
+                start_timestamp,
+            }
+        }
+        MetricValue::ExponentialHistogram(value) => {
+            let (negative_spans, negative_deltas, negative_counts) =
+                histogram_buckets(value.negative.as_ref())?;
+            let (positive_spans, positive_deltas, positive_counts) =
+                histogram_buckets(value.positive.as_ref())?;
+            prometheus_v1::Histogram {
+                count: Some(histogram_count(value.count)),
+                sum: value.sum_bits.map_or(0.0, f64::from_bits),
+                schema: value.scale,
+                zero_threshold: f64::from_bits(value.zero_threshold_bits),
+                zero_count: Some(histogram_zero_count(value.zero_count)),
+                negative_spans,
+                negative_deltas,
+                negative_counts,
+                positive_spans,
+                positive_deltas,
+                positive_counts,
+                reset_hint: value.reset_hint,
+                timestamp: timestamp_ms,
+                custom_values: Vec::new(),
+                start_timestamp,
+            }
+        }
+        MetricValue::Gauge(_) | MetricValue::Sum(_) | MetricValue::Summary(_) => return None,
+    };
+    Some(RemoteReadValue::Histogram(Box::new(histogram)))
+}
+
+fn histogram_count(value: HistogramCount) -> prometheus_v1::histogram::Count {
+    match value {
+        HistogramCount::Integer(value) => prometheus_v1::histogram::Count::Int(value),
+        HistogramCount::DoubleBits(bits) => {
+            prometheus_v1::histogram::Count::Float(f64::from_bits(bits))
+        }
+    }
+}
+
+fn histogram_zero_count(value: HistogramCount) -> prometheus_v1::histogram::ZeroCount {
+    match value {
+        HistogramCount::Integer(value) => prometheus_v1::histogram::ZeroCount::Int(value),
+        HistogramCount::DoubleBits(bits) => {
+            prometheus_v1::histogram::ZeroCount::Float(f64::from_bits(bits))
+        }
+    }
+}
+
+fn histogram_buckets(
+    buckets: Option<&ExponentialHistogramBuckets>,
+) -> Option<(Vec<prometheus_v1::BucketSpan>, Vec<i64>, Vec<f64>)> {
+    let Some(buckets) = buckets else {
+        return Some((Vec::new(), Vec::new(), Vec::new()));
+    };
+    let spans = buckets
+        .spans
+        .iter()
+        .map(|span| prometheus_v1::BucketSpan {
+            offset: span.offset,
+            length: span.length,
+        })
+        .collect();
+    let (deltas, counts) = histogram_count_lanes(&buckets.bucket_counts)?;
+    Some((spans, deltas, counts))
+}
+
+fn histogram_count_lanes(counts: &[HistogramCount]) -> Option<(Vec<i64>, Vec<f64>)> {
+    if counts
+        .iter()
+        .all(|count| matches!(count, HistogramCount::Integer(_)))
+    {
+        let mut previous = 0_i64;
+        let mut deltas = Vec::with_capacity(counts.len());
+        for count in counts {
+            let HistogramCount::Integer(count) = count else {
+                unreachable!("integer lane was checked")
+            };
+            let count = i64::try_from(*count).ok()?;
+            deltas.push(count.checked_sub(previous)?);
+            previous = count;
+        }
+        Some((deltas, Vec::new()))
+    } else if counts
+        .iter()
+        .all(|count| matches!(count, HistogramCount::DoubleBits(_)))
+    {
+        Some((
+            Vec::new(),
+            counts
+                .iter()
+                .map(|count| match count {
+                    HistogramCount::DoubleBits(bits) => f64::from_bits(*bits),
+                    HistogramCount::Integer(_) => unreachable!("float lane was checked"),
+                })
+                .collect(),
+        ))
+    } else {
+        None
+    }
+}
+
 fn prometheus_metric_type(kind: &MetricKind) -> &'static str {
     match kind {
         MetricKind::Gauge => "gauge",
@@ -1308,6 +1469,7 @@ fn parse_prometheus_duration(value: &str) -> Result<i64, String> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use axum::body::{Body, to_bytes};
@@ -1317,14 +1479,17 @@ mod tests {
     use super::*;
     use crate::{DurableTelemetryConfig, StripeConfig};
 
+    static TEST_DIRECTORY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
     fn test_service() -> (PrometheusService, std::path::PathBuf) {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "shard-telemetry-prometheus-api-{}-{nonce}",
-            std::process::id()
+            "shard-telemetry-prometheus-api-{}-{nonce}-{}",
+            std::process::id(),
+            TEST_DIRECTORY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
         ));
         let store = Arc::new(
             DurableTelemetryStore::open(DurableTelemetryConfig {
@@ -1572,6 +1737,101 @@ mod tests {
         assert_eq!(chunk.max_time_ms, 2_000);
         assert_eq!(chunk.r#type, prometheus_v1::ChunkEncoding::Xor as i32);
         assert_eq!(u16::from_be_bytes(chunk.data[..2].try_into().unwrap()), 2);
+
+        drop(service);
+        fs::remove_dir_all(directory).expect("remove test store");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sample_remote_read_round_trips_native_histograms() {
+        let (service, directory) = test_service();
+        let app = prometheus_router(service.clone());
+        let write = prometheus_v1::WriteRequest {
+            timeseries: vec![prometheus_v1::TimeSeries {
+                labels: vec![prometheus_v1::Label {
+                    name: "__name__".into(),
+                    value: "request_duration".into(),
+                }],
+                samples: Vec::new(),
+                exemplars: Vec::new(),
+                histograms: vec![prometheus_v1::Histogram {
+                    count: Some(prometheus_v1::histogram::Count::Int(3)),
+                    sum: 6.0,
+                    schema: 0,
+                    zero_threshold: 0.001,
+                    zero_count: Some(prometheus_v1::histogram::ZeroCount::Int(0)),
+                    negative_spans: Vec::new(),
+                    negative_deltas: Vec::new(),
+                    negative_counts: Vec::new(),
+                    positive_spans: vec![prometheus_v1::BucketSpan {
+                        offset: 0,
+                        length: 2,
+                    }],
+                    positive_deltas: vec![1, 1],
+                    positive_counts: Vec::new(),
+                    reset_hint: prometheus_v1::histogram::ResetHint::No as i32,
+                    timestamp: 2_000,
+                    custom_values: Vec::new(),
+                    start_timestamp: 1_000,
+                }],
+            }],
+            metadata: Vec::new(),
+        };
+        let compressed = snap::raw::Encoder::new()
+            .compress_vec(&write.encode_to_vec())
+            .unwrap();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/write")
+                    .header(header::CONTENT_TYPE, "application/x-protobuf")
+                    .header(header::CONTENT_ENCODING, "snappy")
+                    .header("x-prometheus-remote-write-version", "1.0.0")
+                    .body(Body::from(compressed))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let read = prometheus_v1::ReadRequest {
+            queries: vec![prometheus_v1::Query {
+                start_timestamp_ms: 0,
+                end_timestamp_ms: 3_000,
+                matchers: vec![prometheus_v1::LabelMatcher {
+                    r#type: prometheus_v1::LabelMatcherType::Equal as i32,
+                    name: "__name__".into(),
+                    value: "request_duration".into(),
+                }],
+                hints: None,
+            }],
+            accepted_response_types: vec![prometheus_v1::ReadRequestResponseType::Samples as i32],
+        };
+        let compressed = snap::raw::Encoder::new()
+            .compress_vec(&read.encode_to_vec())
+            .unwrap();
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/read")
+                    .header(header::CONTENT_ENCODING, "snappy")
+                    .body(Body::from(compressed))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1_024 * 1_024).await.unwrap();
+        let protobuf = snap::raw::Decoder::new().decompress_vec(&body).unwrap();
+        let response = prometheus_v1::ReadResponse::decode(protobuf.as_slice()).unwrap();
+        let histogram = &response.results[0].timeseries[0].histograms[0];
+        assert_eq!(histogram.schema, 0);
+        assert_eq!(histogram.positive_deltas, vec![1, 1]);
+        assert_eq!(histogram.sum.to_bits(), 6.0_f64.to_bits());
+        assert_eq!(histogram.start_timestamp, 1_000);
 
         drop(service);
         fs::remove_dir_all(directory).expect("remove test store");

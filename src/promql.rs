@@ -6,7 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use promql_parser::label::{MatchOp, Matcher};
 use promql_parser::parser::{
     AggregateExpr, AtModifier, BinaryExpr, Call, Expr, LabelModifier, MatrixSelector, Offset,
-    VectorSelector, parse,
+    SubqueryExpr, VectorMatchCardinality, VectorSelector, parse,
 };
 
 use crate::{
@@ -263,9 +263,7 @@ impl PromqlEngine {
             Expr::Aggregate(aggregate) => self.aggregate(aggregate, context),
             Expr::Binary(binary) => self.binary(binary, context),
             Expr::Call(call) => self.call(call, context),
-            Expr::Subquery(_) => Err(PromqlError::new(
-                "subquery execution is not enabled until its compatibility gate passes",
-            )),
+            Expr::Subquery(subquery) => self.eval_subquery(subquery, context),
             Expr::Extension(_) => Err(PromqlError::new("unsupported PromQL extension node")),
         }
     }
@@ -343,6 +341,84 @@ impl PromqlEngine {
                     samples.sort_unstable_by_key(|(timestamp, _)| *timestamp);
                     PromqlSeries { labels, samples }
                 })
+                .collect(),
+        ))
+    }
+
+    fn eval_subquery(
+        &self,
+        subquery: &SubqueryExpr,
+        context: &EvalContext,
+    ) -> Result<PromqlValue, PromqlError> {
+        let end_ms = subquery_time(subquery, context)?;
+        let range_ms = i64::try_from(subquery.range.as_millis()).unwrap_or(i64::MAX);
+        let start_ms = end_ms.saturating_sub(range_ms);
+        let step = subquery.step.unwrap_or(Duration::from_secs(60));
+        let step_ms = i64::try_from(step.as_millis()).unwrap_or(i64::MAX);
+        if step_ms <= 0 {
+            return Err(PromqlError::new("PromQL subquery step must be positive"));
+        }
+        let first_ms = start_ms
+            .div_euclid(step_ms)
+            .saturating_add(1)
+            .saturating_mul(step_ms);
+        let step_count = if first_ms > end_ms {
+            0
+        } else {
+            usize::try_from((end_ms - first_ms) / step_ms)
+                .unwrap_or(usize::MAX)
+                .saturating_add(1)
+        };
+        if step_count > self.limits.max_steps {
+            return Err(PromqlError::new("PromQL subquery exceeds the step limit"));
+        }
+
+        let mut series = BTreeMap::<BTreeMap<String, String>, Vec<(i64, f64)>>::new();
+        for ordinal in 0..step_count {
+            let eval_ms = first_ms.saturating_add(
+                i64::try_from(ordinal)
+                    .unwrap_or(i64::MAX)
+                    .saturating_mul(step_ms),
+            );
+            match self.eval(
+                &subquery.expr,
+                &EvalContext {
+                    eval_ms,
+                    start_ms: context.start_ms,
+                    end_ms: context.end_ms,
+                    lookback: context.lookback,
+                },
+            )? {
+                PromqlValue::Vector(samples) => {
+                    for sample in samples {
+                        if sample.value.to_bits() != PROMETHEUS_STALE_NAN_BITS {
+                            series
+                                .entry(sample.labels)
+                                .or_default()
+                                .push((eval_ms, sample.value));
+                        }
+                    }
+                }
+                PromqlValue::Scalar { value, .. } => {
+                    series
+                        .entry(BTreeMap::new())
+                        .or_default()
+                        .push((eval_ms, value));
+                }
+                PromqlValue::Matrix(_) | PromqlValue::String { .. } => {
+                    return Err(PromqlError::new(
+                        "PromQL subquery expression must return an instant vector or scalar",
+                    ));
+                }
+            }
+            if series.len() > self.limits.max_series {
+                return Err(PromqlError::new("PromQL series limit exceeded"));
+            }
+        }
+        Ok(PromqlValue::Matrix(
+            series
+                .into_iter()
+                .map(|(labels, samples)| PromqlSeries { labels, samples })
                 .collect(),
         ))
     }
@@ -461,26 +537,9 @@ impl PromqlEngine {
                     binary.return_bool(),
                 )?)
                 .map(PromqlValue::Vector),
-            (PromqlValue::Vector(left), PromqlValue::Vector(right)) => {
-                let mut right_by_key = HashMap::new();
-                for sample in right {
-                    right_by_key.insert(match_key(&sample.labels, binary), sample.value);
-                }
-                let mut output = Vec::new();
-                for mut sample in left {
-                    if let Some(right) = right_by_key.get(&match_key(&sample.labels, binary))
-                        && let Some(value) =
-                            binary_float(&op, sample.value, *right, binary.return_bool())?
-                    {
-                        sample.value = value;
-                        if !binary.op.is_comparison_operator() {
-                            sample.labels.remove("__name__");
-                        }
-                        output.push(sample);
-                    }
-                }
-                self.bound_vector(output).map(PromqlValue::Vector)
-            }
+            (PromqlValue::Vector(left), PromqlValue::Vector(right)) => self
+                .bound_vector(binary_vectors(left, right, binary, &op)?)
+                .map(PromqlValue::Vector),
             _ => Err(PromqlError::new("unsupported PromQL binary operand types")),
         }
     }
@@ -647,6 +706,22 @@ fn selector_time(selector: &VectorSelector, context: &EvalContext) -> Result<i64
         .ok_or_else(|| PromqlError::new("PromQL selector timestamp overflow"))
 }
 
+fn subquery_time(subquery: &SubqueryExpr, context: &EvalContext) -> Result<i64, PromqlError> {
+    let at = match subquery.at.as_ref() {
+        None => context.eval_ms,
+        Some(AtModifier::Start) => context.start_ms,
+        Some(AtModifier::End) => context.end_ms,
+        Some(AtModifier::At(time)) => system_time_millis(*time)?,
+    };
+    let offset = match subquery.offset.as_ref() {
+        None => 0,
+        Some(Offset::Pos(duration)) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
+        Some(Offset::Neg(duration)) => -i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
+    };
+    at.checked_sub(offset)
+        .ok_or_else(|| PromqlError::new("PromQL subquery timestamp overflow"))
+}
+
 fn system_time_millis(time: SystemTime) -> Result<i64, PromqlError> {
     match time.duration_since(UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_millis())
@@ -716,6 +791,165 @@ fn match_key(labels: &BTreeMap<String, String>, binary: &BinaryExpr) -> Vec<(Str
         }
     }
     labels
+}
+
+fn binary_vectors(
+    left: Vec<PromqlSample>,
+    right: Vec<PromqlSample>,
+    binary: &BinaryExpr,
+    operation: &str,
+) -> Result<Vec<PromqlSample>, PromqlError> {
+    let mut left_by_key = HashMap::<Vec<(String, String)>, Vec<usize>>::new();
+    let mut right_by_key = HashMap::<Vec<(String, String)>, Vec<usize>>::new();
+    for (index, sample) in left.iter().enumerate() {
+        left_by_key
+            .entry(match_key(&sample.labels, binary))
+            .or_default()
+            .push(index);
+    }
+    for (index, sample) in right.iter().enumerate() {
+        right_by_key
+            .entry(match_key(&sample.labels, binary))
+            .or_default()
+            .push(index);
+    }
+
+    if binary.op.is_set_operator() {
+        return match operation {
+            "and" => Ok(left
+                .into_iter()
+                .filter(|sample| right_by_key.contains_key(&match_key(&sample.labels, binary)))
+                .collect()),
+            "unless" => Ok(left
+                .into_iter()
+                .filter(|sample| !right_by_key.contains_key(&match_key(&sample.labels, binary)))
+                .collect()),
+            "or" => {
+                let mut output = left;
+                output.extend(right.into_iter().filter(|sample| {
+                    !left_by_key.contains_key(&match_key(&sample.labels, binary))
+                }));
+                Ok(output)
+            }
+            _ => Err(PromqlError::new(format!(
+                "unsupported PromQL set operator {operation}"
+            ))),
+        };
+    }
+
+    let cardinality = binary
+        .modifier
+        .as_ref()
+        .map_or(VectorMatchCardinality::OneToOne, |modifier| {
+            modifier.card.clone()
+        });
+    match &cardinality {
+        VectorMatchCardinality::OneToOne => {
+            reject_duplicate_match_groups(&left_by_key, "left")?;
+            reject_duplicate_match_groups(&right_by_key, "right")?;
+            let mut output = Vec::new();
+            for mut sample in left {
+                let key = match_key(&sample.labels, binary);
+                let Some(right_index) = right_by_key.get(&key).and_then(|group| group.first())
+                else {
+                    continue;
+                };
+                if let Some(value) = binary_float(
+                    operation,
+                    sample.value,
+                    right[*right_index].value,
+                    binary.return_bool(),
+                )? {
+                    sample.value = value;
+                    normalize_binary_labels(&mut sample.labels, binary, None);
+                    output.push(sample);
+                }
+            }
+            Ok(output)
+        }
+        VectorMatchCardinality::ManyToOne(included) => {
+            reject_duplicate_match_groups(&right_by_key, "right")?;
+            let mut output = Vec::new();
+            for mut sample in left {
+                let key = match_key(&sample.labels, binary);
+                let Some(right_index) = right_by_key.get(&key).and_then(|group| group.first())
+                else {
+                    continue;
+                };
+                let one = &right[*right_index];
+                if let Some(value) =
+                    binary_float(operation, sample.value, one.value, binary.return_bool())?
+                {
+                    sample.value = value;
+                    normalize_binary_labels(
+                        &mut sample.labels,
+                        binary,
+                        Some((&one.labels, included)),
+                    );
+                    output.push(sample);
+                }
+            }
+            Ok(output)
+        }
+        VectorMatchCardinality::OneToMany(included) => {
+            reject_duplicate_match_groups(&left_by_key, "left")?;
+            let mut output = Vec::new();
+            for mut sample in right {
+                let key = match_key(&sample.labels, binary);
+                let Some(left_index) = left_by_key.get(&key).and_then(|group| group.first()) else {
+                    continue;
+                };
+                let one = &left[*left_index];
+                if let Some(value) =
+                    binary_float(operation, one.value, sample.value, binary.return_bool())?
+                {
+                    sample.value = value;
+                    normalize_binary_labels(
+                        &mut sample.labels,
+                        binary,
+                        Some((&one.labels, included)),
+                    );
+                    output.push(sample);
+                }
+            }
+            Ok(output)
+        }
+        VectorMatchCardinality::ManyToMany => Err(PromqlError::new(
+            "many-to-many matching is only valid for PromQL set operators",
+        )),
+    }
+}
+
+fn reject_duplicate_match_groups(
+    groups: &HashMap<Vec<(String, String)>, Vec<usize>>,
+    side: &str,
+) -> Result<(), PromqlError> {
+    if groups.values().any(|group| group.len() > 1) {
+        Err(PromqlError::new(format!(
+            "many-to-many matching: duplicate series on the {side} side"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn normalize_binary_labels(
+    labels: &mut BTreeMap<String, String>,
+    binary: &BinaryExpr,
+    include_from_one: Option<(&BTreeMap<String, String>, &promql_parser::label::Labels)>,
+) {
+    if !binary.op.is_comparison_operator() || binary.return_bool() || binary.is_matching_on() {
+        labels.remove("__name__");
+    }
+    if let Some((one, included)) = include_from_one {
+        for name in &included.labels {
+            if let Some(value) = one.get(name) {
+                labels.insert(name.clone(), value.clone());
+            } else {
+                labels.remove(name);
+            }
+        }
+    }
 }
 
 fn binary_vector_scalar(
@@ -901,7 +1135,29 @@ fn nanos_to_millis(nanoseconds: u64) -> Result<i64, PromqlError> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::*;
+    use crate::{DurableTelemetryConfig, StripeConfig};
+
+    fn sample(labels: &[(&str, &str)], value: f64) -> PromqlSample {
+        PromqlSample {
+            labels: labels
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect(),
+            timestamp_ms: 1,
+            value,
+        }
+    }
+
+    fn binary(expression: &str) -> BinaryExpr {
+        match parse(expression).unwrap() {
+            Expr::Binary(binary) => binary,
+            _ => panic!("expected binary expression"),
+        }
+    }
 
     #[test]
     fn comparisons_filter_unless_bool_is_requested() {
@@ -915,5 +1171,96 @@ mod tests {
         let samples = vec![(0, 8.0), (1_000, 10.0), (2_000, 2.0), (3_000, 4.0)];
         assert_eq!(counter_rate(&samples, false), 2.0);
         assert_eq!(counter_rate(&samples, true), 2.0);
+    }
+
+    #[test]
+    fn subqueries_execute_through_the_bounded_evaluator() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "shard-telemetry-promql-subquery-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = Arc::new(
+            DurableTelemetryStore::open(DurableTelemetryConfig {
+                data_directory: directory.clone(),
+                object_store_directory: None,
+                recovery_journal: true,
+                retention: None,
+                shard_count: 1,
+                tenant_partitions: 1,
+                append_linger: Duration::ZERO,
+                stripe: StripeConfig::default(),
+                indexed_ack_timeout: Duration::from_secs(30),
+            })
+            .unwrap(),
+        );
+        let engine = PromqlEngine::new(store, Arc::from("tenant"), PromqlLimits::default());
+        assert_eq!(
+            engine.query("up[5m:1m]", 600_000).unwrap(),
+            PromqlValue::Matrix(Vec::new())
+        );
+        drop(engine);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn vector_matching_honors_group_left_and_included_labels() {
+        let expression = binary("left * on(job) group_left(zone) right");
+        let left = vec![
+            sample(
+                &[("__name__", "left"), ("job", "api"), ("instance", "a")],
+                2.0,
+            ),
+            sample(
+                &[("__name__", "left"), ("job", "api"), ("instance", "b")],
+                3.0,
+            ),
+        ];
+        let right = vec![sample(
+            &[("__name__", "right"), ("job", "api"), ("zone", "west")],
+            4.0,
+        )];
+        let output = binary_vectors(left, right, &expression, "*").unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0].value, 8.0);
+        assert_eq!(output[1].value, 12.0);
+        assert_eq!(
+            output[0].labels.get("zone").map(String::as_str),
+            Some("west")
+        );
+        assert!(!output[0].labels.contains_key("__name__"));
+    }
+
+    #[test]
+    fn vector_set_operators_keep_prometheus_side_semantics() {
+        let left = vec![
+            sample(&[("job", "api")], 1.0),
+            sample(&[("job", "worker")], 2.0),
+        ];
+        let right = vec![
+            sample(&[("job", "api")], 10.0),
+            sample(&[("job", "db")], 30.0),
+        ];
+        let and = binary("left and on(job) right");
+        assert_eq!(
+            binary_vectors(left.clone(), right.clone(), &and, "and")
+                .unwrap()
+                .into_iter()
+                .map(|sample| sample.value)
+                .collect::<Vec<_>>(),
+            vec![1.0]
+        );
+        let or = binary("left or on(job) right");
+        assert_eq!(
+            binary_vectors(left, right, &or, "or")
+                .unwrap()
+                .into_iter()
+                .map(|sample| sample.value)
+                .collect::<Vec<_>>(),
+            vec![1.0, 2.0, 30.0]
+        );
     }
 }

@@ -31,7 +31,7 @@ const LABEL_PREFIX: &str = "resource.loki.label.";
 const METADATA_PREFIX: &str = "attr.loki.metadata.";
 const TENANT_FIELD: &str = "resource.loki.tenant";
 
-/// Standalone durable Loki-store configuration.
+/// Standalone durable ShardTelemetry configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DurableTelemetryConfig {
     /// Directory containing shard-stream packs, coordinator state, and index journals.
@@ -94,7 +94,7 @@ impl DurableTelemetryConfig {
     }
 }
 
-/// Loki protocol backend whose acknowledged writes are durable shard-stream
+/// Signal-native store whose acknowledged writes are durable shard-stream
 /// appends and whose reads execute on the owning ShardTelemetry stripe workers.
 pub struct DurableTelemetryStore {
     _data_directory_lease: DataDirectoryLease,
