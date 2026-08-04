@@ -236,21 +236,21 @@ METRIC_QUERY="SELECT raw FROM benchmark.metrics WHERE tenant = 'production-examp
 CORRELATION_QUERY="SELECT raw FROM benchmark.traces WHERE resource_id = toUInt128('$RESOURCE_ID') AND service_name = '$SERVICE_NAME' LIMIT 1000 FORMAT Null"
 docker exec "$CH_CONTAINER" clickhouse-benchmark --concurrency 1 \
     --iterations "$LOOKUP_ITERATIONS" --query "$TRACE_QUERY" \
-    >"$RUN_DIR/clickhouse-trace-lookup.txt"
+    >"$RUN_DIR/clickhouse-trace-lookup.txt" 2>&1
 docker exec "$CH_CONTAINER" clickhouse-benchmark --concurrency 1 \
     --iterations "$LOOKUP_ITERATIONS" --query "$METRIC_QUERY" \
-    >"$RUN_DIR/clickhouse-metric-lookup.txt"
+    >"$RUN_DIR/clickhouse-metric-lookup.txt" 2>&1
 docker exec "$CH_CONTAINER" clickhouse-benchmark --concurrency 1 \
     --iterations "$LOOKUP_ITERATIONS" --query "$CORRELATION_QUERY" \
-    >"$RUN_DIR/clickhouse-correlation-lookup.txt"
+    >"$RUN_DIR/clickhouse-correlation-lookup.txt" 2>&1
 
 field_from_signal() {
     local signal=$1
     local field=$2
     awk -v signal="$signal" -v field="$field" '
         $1 == signal {
-            for (index = 2; index <= NF; index++) {
-                split($index, pair, "=")
+            for (position = 2; position <= NF; position++) {
+                split($position, pair, "=")
                 if (pair[1] == field) {
                     print pair[2]
                     exit
