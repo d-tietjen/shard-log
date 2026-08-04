@@ -1,5 +1,8 @@
 use std::collections::BTreeMap;
+use std::fs::{self, File};
 use std::hint::black_box;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,11 +24,17 @@ const TRACE_BLOCK_SOURCE_BYTES: usize = 8 * 1024 * 1024;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut records = 32_768usize;
     let mut iterations = 2_000usize;
+    let mut clickhouse_dir = None::<PathBuf>;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--records" => records = parse_usize(args.next(), "--records")?,
             "--iterations" => iterations = parse_usize(args.next(), "--iterations")?,
+            "--clickhouse-dir" => {
+                clickhouse_dir = Some(PathBuf::from(
+                    args.next().ok_or("missing value for --clickhouse-dir")?,
+                ));
+            }
             _ => return Err(format!("unknown argument {argument}").into()),
         }
     }
@@ -34,6 +43,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let corpus = Corpus::generate(records)?;
+    if let Some(output_dir) = clickhouse_dir.as_deref() {
+        export_clickhouse_corpus(&corpus, output_dir)?;
+    }
     println!("ShardTelemetry signal benchmark (v1)");
     println!("records_per_signal={records} lookup_iterations={iterations}");
 
@@ -52,6 +64,231 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         correlation_result.lookup_p99.as_secs_f64() * 1e6,
     );
     Ok(())
+}
+
+fn export_clickhouse_corpus(
+    corpus: &Corpus,
+    output_dir: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fs::create_dir_all(output_dir)?;
+    let trace_path = output_dir.join("traces.rowbinary");
+    let metric_path = output_dir.join("metrics.rowbinary");
+    let trace_expected_path = output_dir.join("trace-lookup-expected.rowbinary");
+    let metric_expected_path = output_dir.join("metric-lookup-expected.rowbinary");
+    let selected_trace = corpus.spans[corpus.spans.len() / 2].trace_id;
+    let selected_series = corpus.points[corpus.points.len() / 2].series_fingerprint();
+
+    let mut traces = BufWriter::new(File::create(&trace_path)?);
+    let mut trace_expected = Vec::new();
+    let mut trace_source_bytes = 0usize;
+    let mut trace_expected_rows = 0usize;
+    for span in &corpus.spans {
+        let raw = rmp_serde::to_vec(span)?;
+        trace_source_bytes = trace_source_bytes.saturating_add(raw.len());
+        write_trace_row(&mut traces, span, &raw)?;
+        if span.trace_id == selected_trace {
+            write_rowbinary_string(&mut trace_expected, &raw)?;
+            trace_expected_rows += 1;
+        }
+    }
+    traces.flush()?;
+    fs::write(&trace_expected_path, trace_expected)?;
+
+    let mut metrics = BufWriter::new(File::create(&metric_path)?);
+    let mut metric_expected = Vec::new();
+    let mut metric_source_bytes = 0usize;
+    let mut metric_expected_rows = 0usize;
+    for point in &corpus.points {
+        let raw = rmp_serde::to_vec(point)?;
+        metric_source_bytes = metric_source_bytes.saturating_add(raw.len());
+        write_metric_row(&mut metrics, point, &raw)?;
+        if point.series_fingerprint() == selected_series {
+            write_rowbinary_string(&mut metric_expected, &raw)?;
+            metric_expected_rows += 1;
+        }
+    }
+    metrics.flush()?;
+    fs::write(&metric_expected_path, metric_expected)?;
+
+    let resource = corpus.resource.id();
+    let manifest = format!(
+        concat!(
+            "records_per_signal={}\n",
+            "trace_source_bytes={}\n",
+            "metric_source_bytes={}\n",
+            "trace_id_hex={}\n",
+            "trace_lookup_rows={}\n",
+            "series_id={}\n",
+            "metric_lookup_rows={}\n",
+            "resource_id={}\n",
+            "service_name=checkout-api\n"
+        ),
+        corpus.spans.len(),
+        trace_source_bytes,
+        metric_source_bytes,
+        selected_trace,
+        trace_expected_rows,
+        selected_series.get(),
+        metric_expected_rows,
+        resource.get(),
+    );
+    fs::write(output_dir.join("manifest.env"), manifest)?;
+    Ok(())
+}
+
+fn write_trace_row(
+    output: &mut impl Write,
+    span: &DurableSpan,
+    raw: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_rowbinary_string(output, span.tenant.as_bytes())?;
+    output.write_all(span.trace_id.as_bytes())?;
+    output.write_all(span.span_id.as_bytes())?;
+    write_nullable_fixed(
+        output,
+        span.parent_span_id.map(|value| *value.as_bytes()).as_ref(),
+    )?;
+    output.write_all(&span.record_ref.offset.get().to_le_bytes())?;
+    output.write_all(&span.start_time_unix_nanos.to_le_bytes())?;
+    output.write_all(&span.duration_nanos.to_le_bytes())?;
+    write_rowbinary_string(output, span.name.as_bytes())?;
+    output.write_all(&span.kind.to_le_bytes())?;
+    output.write_all(
+        &span
+            .status
+            .as_ref()
+            .map_or(0, |status| status.code)
+            .to_le_bytes(),
+    )?;
+    output.write_all(&span.resource_id().get().to_le_bytes())?;
+    output.write_all(&span.scope_id().get().to_le_bytes())?;
+    write_rowbinary_string(
+        output,
+        attribute_string(&span.resource.attributes, "service.name"),
+    )?;
+    write_rowbinary_string(
+        output,
+        attribute_string(&span.resource.attributes, "deployment.environment"),
+    )?;
+    write_rowbinary_string(output, attribute_string(&span.attributes, "http.route"))?;
+    output.write_all(
+        &attribute_integer(&span.attributes, "http.response.status_code")
+            .unwrap_or_default()
+            .to_le_bytes(),
+    )?;
+    write_rowbinary_string(output, raw)?;
+    Ok(())
+}
+
+fn write_metric_row(
+    output: &mut impl Write,
+    point: &DurableMetricPoint,
+    raw: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_rowbinary_string(output, point.identity.tenant.as_bytes())?;
+    output.write_all(&point.series_fingerprint().get().to_le_bytes())?;
+    output.write_all(&point.record_ref.offset.get().to_le_bytes())?;
+    output.write_all(&point.timestamp_unix_nanos.to_le_bytes())?;
+    output.write_all(&point.start_time_unix_nanos.to_le_bytes())?;
+    write_rowbinary_string(output, point.identity.name.as_bytes())?;
+    write_rowbinary_string(output, point.identity.unit.as_bytes())?;
+    write_rowbinary_string(output, b"gauge")?;
+    output.write_all(&point.identity.resource_id().get().to_le_bytes())?;
+    output.write_all(&point.identity.scope_id().get().to_le_bytes())?;
+    write_rowbinary_string(
+        output,
+        attribute_string(&point.identity.resource.attributes, "service.name"),
+    )?;
+    write_rowbinary_string(
+        output,
+        attribute_string(
+            &point.identity.resource.attributes,
+            "deployment.environment",
+        ),
+    )?;
+    write_rowbinary_string(
+        output,
+        attribute_string(&point.identity.point_attributes, "http.route"),
+    )?;
+    output.write_all(
+        &attribute_integer(
+            &point.identity.point_attributes,
+            "http.response.status_code",
+        )
+        .unwrap_or_default()
+        .to_le_bytes(),
+    )?;
+    write_rowbinary_string(
+        output,
+        attribute_string(&point.identity.point_attributes, "instance"),
+    )?;
+    let value = match point.value {
+        MetricValue::Gauge(NumberValue::DoubleBits(bits)) => f64::from_bits(bits),
+        MetricValue::Gauge(NumberValue::Integer(value)) => value as f64,
+        _ => return Err("ClickHouse benchmark exporter currently expects gauge points".into()),
+    };
+    output.write_all(&value.to_bits().to_le_bytes())?;
+    let exemplar_trace = point
+        .exemplars
+        .iter()
+        .find_map(|exemplar| exemplar.trace_id)
+        .map(|value| *value.as_bytes());
+    write_nullable_fixed(output, exemplar_trace.as_ref())?;
+    write_rowbinary_string(output, raw)?;
+    Ok(())
+}
+
+fn attribute_string<'a>(attributes: &'a [TelemetryAttribute], key: &str) -> &'a [u8] {
+    attributes
+        .iter()
+        .find(|attribute| attribute.key.as_ref() == key)
+        .and_then(|attribute| match &attribute.value {
+            Some(TelemetryValue::String(value)) => Some(value.as_bytes()),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+fn attribute_integer(attributes: &[TelemetryAttribute], key: &str) -> Option<i64> {
+    attributes
+        .iter()
+        .find(|attribute| attribute.key.as_ref() == key)
+        .and_then(|attribute| match attribute.value.as_ref() {
+            Some(TelemetryValue::Integer(value)) => Some(*value),
+            _ => None,
+        })
+}
+
+fn write_nullable_fixed<const N: usize>(
+    output: &mut impl Write,
+    value: Option<&[u8; N]>,
+) -> std::io::Result<()> {
+    match value {
+        Some(value) => {
+            output.write_all(&[0])?;
+            output.write_all(value)
+        }
+        None => output.write_all(&[1]),
+    }
+}
+
+fn write_rowbinary_string(output: &mut impl Write, value: &[u8]) -> std::io::Result<()> {
+    write_var_uint(output, value.len())?;
+    output.write_all(value)
+}
+
+fn write_var_uint(output: &mut impl Write, mut value: usize) -> std::io::Result<()> {
+    loop {
+        let mut byte = (value & 0x7f) as u8;
+        value >>= 7;
+        if value != 0 {
+            byte |= 0x80;
+        }
+        output.write_all(&[byte])?;
+        if value == 0 {
+            return Ok(());
+        }
+    }
 }
 
 fn parse_usize(value: Option<String>, flag: &str) -> Result<usize, Box<dyn std::error::Error>> {
@@ -237,6 +474,10 @@ impl Corpus {
                     TelemetryAttribute::new(
                         "instance",
                         TelemetryValue::String(Arc::from(format!("node-{}", series_ordinal % 16))),
+                    ),
+                    TelemetryAttribute::new(
+                        "benchmark.series",
+                        TelemetryValue::Integer(series_ordinal as i64),
                     ),
                 ]),
             });
@@ -594,4 +835,61 @@ fn mix(mut value: u64) -> u64 {
     value ^= value >> 27;
     value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use super::*;
+
+    #[test]
+    fn generated_metric_corpus_has_128_distinct_series() {
+        let corpus = Corpus::generate(256).unwrap();
+        let mut counts = BTreeMap::<SeriesFingerprint, usize>::new();
+        for point in &corpus.points {
+            *counts.entry(point.series_fingerprint()).or_default() += 1;
+        }
+        assert_eq!(counts.len(), 128);
+        assert!(counts.values().all(|count| *count == 2));
+    }
+
+    #[test]
+    fn clickhouse_export_records_exact_lookup_inputs() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let output = std::env::temp_dir().join(format!(
+            "shard-telemetry-clickhouse-export-{}-{unique}",
+            std::process::id()
+        ));
+        let corpus = Corpus::generate(128).unwrap();
+        export_clickhouse_corpus(&corpus, &output).unwrap();
+
+        let manifest = fs::read_to_string(output.join("manifest.env")).unwrap();
+        assert!(manifest.contains("records_per_signal=128\n"));
+        assert!(manifest.contains("trace_lookup_rows=8\n"));
+        assert!(manifest.contains("metric_lookup_rows=1\n"));
+        assert!(fs::metadata(output.join("traces.rowbinary")).unwrap().len() > 0);
+        assert!(
+            fs::metadata(output.join("metrics.rowbinary"))
+                .unwrap()
+                .len()
+                > 0
+        );
+        assert!(
+            fs::metadata(output.join("trace-lookup-expected.rowbinary"))
+                .unwrap()
+                .len()
+                > 0
+        );
+        assert!(
+            fs::metadata(output.join("metric-lookup-expected.rowbinary"))
+                .unwrap()
+                .len()
+                > 0
+        );
+        fs::remove_dir_all(output).unwrap();
+    }
 }
