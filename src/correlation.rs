@@ -1,10 +1,9 @@
 //! Bounded stripe-local links between logs, traces, and metrics.
 
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash};
 use std::sync::Arc;
 
+use foldhash::{HashMap, HashMapExt, HashSet, HashSetExt};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -756,9 +755,7 @@ impl CorrelationIndex {
 }
 
 fn identity_hash(value: &impl Hash) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    value.hash(&mut hasher);
-    hasher.finish()
+    foldhash::fast::FixedState::with_seed(0x5348_4152_4443_4f52).hash_one(value)
 }
 
 #[cfg(test)]

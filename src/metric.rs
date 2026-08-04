@@ -1,8 +1,8 @@
-use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::hash::{Hash, Hasher};
+use std::collections::BTreeMap;
+use std::hash::{BuildHasher, Hash};
 use std::sync::Arc;
 
+use foldhash::{HashMap, HashMapExt, HashSet};
 use pco::ChunkConfig;
 use pco::standalone::{simple_compress, simple_decompress_into};
 use serde::{Deserialize, Serialize};
@@ -1563,9 +1563,8 @@ impl MetricStripe {
     }
 
     fn series_fingerprint(&mut self, identity: &Arc<MetricIdentity>) -> SeriesFingerprint {
-        let mut hasher = DefaultHasher::new();
-        identity.hash(&mut hasher);
-        let hash = hasher.finish();
+        let hash = foldhash::fast::FixedState::with_seed(0x5348_4152_444d_4554)
+            .hash_one(identity.as_ref());
         let slot = hash as usize & (SERIES_ID_CACHE_ENTRIES - 1);
         if let Some(cached) = &self.identity_fingerprints[slot]
             && cached.hash == hash
