@@ -1943,6 +1943,7 @@ dependencies = [
  "bytes",
  "bytes-handoff",
  "bzip2",
+ "chrono",
  "clap",
  "crc32c",
  "flate2",

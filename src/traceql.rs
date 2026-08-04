@@ -47,12 +47,45 @@ pub struct TraceqlTrace {
     pub selected_fields: Arc<Vec<String>>,
 }
 
+/// One trace-linked exemplar emitted by a TraceQL metrics query.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraceqlMetricExemplar {
+    /// Trace that contributed the sample.
+    pub trace_id: TraceId,
+    /// Span that contributed the sample.
+    pub span_id: crate::SpanId,
+    /// Bucket timestamp in Unix milliseconds.
+    pub timestamp_ms: u64,
+    /// Aggregate value for the bucket.
+    pub value: f64,
+}
+
+/// One TraceQL metrics sample.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraceqlMetricSample {
+    /// Bucket timestamp in Unix milliseconds.
+    pub timestamp_ms: u64,
+    /// Aggregate value.
+    pub value: f64,
+}
+
+/// One Prometheus-like time series derived directly from matching spans.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraceqlMetricSeries {
+    /// TraceQL grouping labels.
+    pub labels: BTreeMap<String, String>,
+    /// Samples ordered by time.
+    pub samples: Vec<TraceqlMetricSample>,
+    /// Bounded trace-linked exemplars.
+    pub exemplars: Vec<TraceqlMetricExemplar>,
+}
+
 /// TraceQL parse or execution error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraceqlError(String);
 
 impl TraceqlError {
-    fn new(message: impl Into<String>) -> Self {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
         Self(message.into())
     }
 }
@@ -159,6 +192,115 @@ impl TraceqlEngine {
             })
             .map_err(|error| TraceqlError::new(error.to_string()))?;
         Ok((!spans.is_empty()).then(|| summarize(trace_id, spans, Arc::default())))
+    }
+
+    /// Evaluates a bounded TraceQL metrics expression over an inclusive time range.
+    pub fn query_metrics(
+        &self,
+        expression: &str,
+        start_time_unix_nanos: u64,
+        end_time_unix_nanos: u64,
+        step_nanos: u64,
+        instant: bool,
+        max_exemplars: usize,
+    ) -> Result<Vec<TraceqlMetricSeries>, TraceqlError> {
+        if start_time_unix_nanos > end_time_unix_nanos || step_nanos == 0 {
+            return Err(TraceqlError::new("invalid TraceQL metrics time range"));
+        }
+        let metric = TraceMetricQuery::parse(expression)?;
+        let spans = self
+            .store
+            .query_traces(&TraceQuery {
+                tenant: Arc::clone(&self.tenant),
+                trace_id: metric.spanset.exact_trace_id(),
+                start_time_unix_nanos: Some(start_time_unix_nanos),
+                end_time_unix_nanos: end_time_unix_nanos.checked_add(1),
+                limit: self.limits.max_spans,
+                ..TraceQuery::default()
+            })
+            .map_err(|error| TraceqlError::new(error.to_string()))?;
+        let mut traces = BTreeMap::<TraceId, Vec<DurableSpan>>::new();
+        for span in spans {
+            traces.entry(span.trace_id).or_default().push(span);
+        }
+        let mut buckets = BTreeMap::<MetricGroup, BTreeMap<u64, MetricBucket>>::new();
+        for (trace_id, mut spans) in traces {
+            spans.sort_unstable_by_key(|span| (span.start_time_unix_nanos, span.record_ref.offset));
+            for index in metric.spanset.evaluate(&spans) {
+                let span = &spans[index];
+                let Some(labels) = metric.labels(span, &spans) else {
+                    continue;
+                };
+                let Some(value) = metric.observed_value(span, &spans) else {
+                    continue;
+                };
+                let bucket_timestamp = if instant {
+                    end_time_unix_nanos
+                } else {
+                    let ordinal = span
+                        .start_time_unix_nanos
+                        .saturating_sub(start_time_unix_nanos)
+                        / step_nanos;
+                    start_time_unix_nanos
+                        .saturating_add(ordinal.saturating_add(1).saturating_mul(step_nanos))
+                        .min(end_time_unix_nanos)
+                };
+                let bucket = buckets
+                    .entry(MetricGroup(labels))
+                    .or_default()
+                    .entry(bucket_timestamp)
+                    .or_default();
+                bucket.values.push(value);
+                if bucket.exemplar.is_none() && max_exemplars > 0 {
+                    bucket.exemplar = Some((trace_id, span.span_id));
+                }
+            }
+        }
+
+        let denominator_seconds = if instant {
+            end_time_unix_nanos
+                .saturating_sub(start_time_unix_nanos)
+                .max(1) as f64
+                / 1_000_000_000.0
+        } else {
+            step_nanos as f64 / 1_000_000_000.0
+        };
+        let mut remaining_exemplars = max_exemplars;
+        let mut series = Vec::with_capacity(buckets.len());
+        for (MetricGroup(labels), samples) in buckets {
+            let mut output_samples = Vec::with_capacity(samples.len());
+            let mut exemplars = Vec::new();
+            for (timestamp_nanos, bucket) in samples {
+                let value = metric.aggregate(&bucket.values, denominator_seconds);
+                if !metric.passes(value) {
+                    continue;
+                }
+                let timestamp_ms = timestamp_nanos / 1_000_000;
+                output_samples.push(TraceqlMetricSample {
+                    timestamp_ms,
+                    value,
+                });
+                if remaining_exemplars > 0
+                    && let Some((trace_id, span_id)) = bucket.exemplar
+                {
+                    exemplars.push(TraceqlMetricExemplar {
+                        trace_id,
+                        span_id,
+                        timestamp_ms,
+                        value,
+                    });
+                    remaining_exemplars -= 1;
+                }
+            }
+            if !output_samples.is_empty() {
+                series.push(TraceqlMetricSeries {
+                    labels,
+                    samples: output_samples,
+                    exemplars,
+                });
+            }
+        }
+        metric.limit_series(series)
     }
 }
 
@@ -377,6 +519,317 @@ impl TraceAggregate {
             ))),
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct TraceMetricQuery {
+    spanset: TraceqlQuery,
+    function: TraceMetricFunction,
+    field: Option<String>,
+    quantile: Option<f64>,
+    group_by: Vec<String>,
+    threshold: Option<(Comparison, Literal)>,
+    series_limit: Option<(bool, usize)>,
+}
+
+impl TraceMetricQuery {
+    fn parse(input: &str) -> Result<Self, TraceqlError> {
+        let parts = split_traceql_pipeline(input);
+        let metric_index = parts
+            .iter()
+            .position(|part| TraceMetricFunction::recognizes(part))
+            .ok_or_else(|| TraceqlError::new("TraceQL metrics query has no metrics function"))?;
+        if metric_index == 0 {
+            return Err(TraceqlError::new(
+                "TraceQL metrics query requires a spanset before the function",
+            ));
+        }
+        let spanset = TraceqlQuery::parse(&parts[..metric_index].join(" | "))?;
+        let (function, field, quantile, group_by, threshold) =
+            parse_trace_metric_stage(parts[metric_index])?;
+        let mut series_limit = None;
+        for stage in &parts[metric_index + 1..] {
+            let stage = stage.trim();
+            let (descending, value) = if let Some(value) = stage
+                .strip_prefix("topk(")
+                .and_then(|value| value.strip_suffix(')'))
+            {
+                (true, value)
+            } else if let Some(value) = stage
+                .strip_prefix("bottomk(")
+                .and_then(|value| value.strip_suffix(')'))
+            {
+                (false, value)
+            } else {
+                return Err(TraceqlError::new(format!(
+                    "unsupported TraceQL metrics pipeline stage {stage:?}"
+                )));
+            };
+            let limit = value
+                .trim()
+                .parse::<usize>()
+                .ok()
+                .filter(|limit| *limit > 0)
+                .ok_or_else(|| TraceqlError::new("TraceQL topk/bottomk requires positive k"))?;
+            if series_limit.replace((descending, limit)).is_some() {
+                return Err(TraceqlError::new(
+                    "TraceQL metrics query has multiple series limits",
+                ));
+            }
+        }
+        Ok(Self {
+            spanset,
+            function,
+            field,
+            quantile,
+            group_by,
+            threshold,
+            series_limit,
+        })
+    }
+
+    fn labels(
+        &self,
+        span: &DurableSpan,
+        trace: &[DurableSpan],
+    ) -> Option<BTreeMap<String, String>> {
+        let mut labels = BTreeMap::new();
+        for field in &self.group_by {
+            let value = field_values(span, trace, field).into_iter().next()?;
+            labels.insert(field.clone(), observed_string(&value));
+        }
+        Some(labels)
+    }
+
+    fn observed_value(&self, span: &DurableSpan, trace: &[DurableSpan]) -> Option<f64> {
+        match self.function {
+            TraceMetricFunction::Rate | TraceMetricFunction::Count => Some(1.0),
+            TraceMetricFunction::Sum
+            | TraceMetricFunction::Minimum
+            | TraceMetricFunction::Maximum
+            | TraceMetricFunction::Average
+            | TraceMetricFunction::Quantile => self
+                .field
+                .as_deref()
+                .and_then(|field| field_values(span, trace, field).into_iter().next())
+                .and_then(|value| numeric_observed(&value)),
+        }
+    }
+
+    fn aggregate(&self, values: &[f64], denominator_seconds: f64) -> f64 {
+        match self.function {
+            TraceMetricFunction::Rate => values.len() as f64 / denominator_seconds,
+            TraceMetricFunction::Count => values.len() as f64,
+            TraceMetricFunction::Sum => values.iter().sum(),
+            TraceMetricFunction::Minimum => {
+                values.iter().copied().reduce(f64::min).unwrap_or(f64::NAN)
+            }
+            TraceMetricFunction::Maximum => {
+                values.iter().copied().reduce(f64::max).unwrap_or(f64::NAN)
+            }
+            TraceMetricFunction::Average => values.iter().sum::<f64>() / values.len().max(1) as f64,
+            TraceMetricFunction::Quantile => trace_quantile(values, self.quantile.unwrap_or(0.5)),
+        }
+    }
+
+    fn passes(&self, value: f64) -> bool {
+        self.threshold
+            .as_ref()
+            .is_none_or(|(comparison, expected)| {
+                compare(&[ObservedValue::Float(value)], expected, *comparison)
+            })
+    }
+
+    fn limit_series(
+        &self,
+        mut series: Vec<TraceqlMetricSeries>,
+    ) -> Result<Vec<TraceqlMetricSeries>, TraceqlError> {
+        if let Some((descending, limit)) = self.series_limit {
+            series.sort_by(|left, right| {
+                let left = left.samples.last().map_or(f64::NAN, |sample| sample.value);
+                let right = right.samples.last().map_or(f64::NAN, |sample| sample.value);
+                let order = left.total_cmp(&right);
+                if descending { order.reverse() } else { order }
+            });
+            series.truncate(limit);
+        }
+        Ok(series)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TraceMetricFunction {
+    Rate,
+    Count,
+    Sum,
+    Minimum,
+    Maximum,
+    Average,
+    Quantile,
+}
+
+impl TraceMetricFunction {
+    fn recognizes(input: &str) -> bool {
+        let input = input.trim();
+        [
+            "rate(",
+            "count_over_time(",
+            "sum_over_time(",
+            "min_over_time(",
+            "max_over_time(",
+            "avg_over_time(",
+            "quantile_over_time(",
+        ]
+        .iter()
+        .any(|prefix| input.starts_with(prefix))
+    }
+
+    fn parse(input: &str) -> Result<Self, TraceqlError> {
+        match input {
+            "rate" => Ok(Self::Rate),
+            "count_over_time" => Ok(Self::Count),
+            "sum_over_time" => Ok(Self::Sum),
+            "min_over_time" => Ok(Self::Minimum),
+            "max_over_time" => Ok(Self::Maximum),
+            "avg_over_time" => Ok(Self::Average),
+            "quantile_over_time" => Ok(Self::Quantile),
+            _ => Err(TraceqlError::new(format!(
+                "unsupported TraceQL metrics function {input:?}"
+            ))),
+        }
+    }
+}
+
+type ParsedTraceMetricStage = (
+    TraceMetricFunction,
+    Option<String>,
+    Option<f64>,
+    Vec<String>,
+    Option<(Comparison, Literal)>,
+);
+
+fn parse_trace_metric_stage(input: &str) -> Result<ParsedTraceMetricStage, TraceqlError> {
+    let input = input.split(" with (").next().unwrap_or(input).trim();
+    let open = input
+        .find('(')
+        .ok_or_else(|| TraceqlError::new("TraceQL metrics function is missing '('"))?;
+    let close = find_closing_parenthesis_at(input, open)
+        .ok_or_else(|| TraceqlError::new("TraceQL metrics function is missing ')'"))?;
+    let function = TraceMetricFunction::parse(input[..open].trim())?;
+    let arguments = split_quoted(&input[open + 1..close], ",");
+    let (field, quantile) = match function {
+        TraceMetricFunction::Rate | TraceMetricFunction::Count => {
+            if arguments.len() != 1 || !arguments[0].is_empty() {
+                return Err(TraceqlError::new(
+                    "TraceQL rate/count_over_time takes no field",
+                ));
+            }
+            (None, None)
+        }
+        TraceMetricFunction::Sum
+        | TraceMetricFunction::Minimum
+        | TraceMetricFunction::Maximum
+        | TraceMetricFunction::Average => {
+            if arguments.len() != 1 || arguments[0].is_empty() {
+                return Err(TraceqlError::new(
+                    "TraceQL metrics function requires one field",
+                ));
+            }
+            (Some(arguments[0].trim_start_matches('.').to_owned()), None)
+        }
+        TraceMetricFunction::Quantile => {
+            if arguments.len() != 2 || arguments[0].is_empty() {
+                return Err(TraceqlError::new(
+                    "TraceQL quantile_over_time requires field and quantile",
+                ));
+            }
+            let quantile = arguments[1]
+                .parse::<f64>()
+                .ok()
+                .filter(|value| (0.0..=1.0).contains(value))
+                .ok_or_else(|| {
+                    TraceqlError::new("TraceQL quantile must be between zero and one")
+                })?;
+            (
+                Some(arguments[0].trim_start_matches('.').to_owned()),
+                Some(quantile),
+            )
+        }
+    };
+
+    let mut suffix = input[close + 1..].trim();
+    let mut group_by = Vec::new();
+    if let Some(group) = suffix.strip_prefix("by") {
+        let group = group.trim_start();
+        let group_open = group
+            .strip_prefix('(')
+            .ok_or_else(|| TraceqlError::new("TraceQL metrics by is missing '('"))?;
+        let group_close = group_open
+            .find(')')
+            .ok_or_else(|| TraceqlError::new("TraceQL metrics by is missing ')'"))?;
+        group_by = split_quoted(&group_open[..group_close], ",")
+            .into_iter()
+            .map(|field| field.trim().trim_start_matches('.').to_owned())
+            .filter(|field| !field.is_empty())
+            .collect();
+        suffix = group_open[group_close + 1..].trim();
+    }
+    let threshold = if suffix.is_empty() {
+        None
+    } else {
+        comparison_tokens()
+            .into_iter()
+            .find_map(|(token, comparison)| {
+                suffix.strip_prefix(token).map(|expected| {
+                    Literal::parse(expected.trim()).map(|expected| (comparison, expected))
+                })
+            })
+            .transpose()?
+            .ok_or_else(|| TraceqlError::new("invalid TraceQL metrics comparison"))?
+            .into()
+    };
+    Ok((function, field, quantile, group_by, threshold))
+}
+
+fn find_closing_parenthesis_at(input: &str, open: usize) -> Option<usize> {
+    let mut depth = 0_u32;
+    for (index, character) in input.char_indices().skip_while(|(index, _)| *index < open) {
+        match character {
+            '(' => depth = depth.saturating_add(1),
+            ')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn trace_quantile(values: &[f64], quantile: f64) -> f64 {
+    if values.is_empty() {
+        return f64::NAN;
+    }
+    let mut values = values.to_vec();
+    values.sort_by(|left, right| left.total_cmp(right));
+    if values.len() == 1 {
+        return values[0];
+    }
+    let rank = quantile * (values.len() - 1) as f64;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    values[lower] + (values[upper] - values[lower]) * (rank - lower as f64)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct MetricGroup(BTreeMap<String, String>);
+
+#[derive(Debug, Default)]
+struct MetricBucket {
+    values: Vec<f64>,
+    exemplar: Option<(TraceId, crate::SpanId)>,
 }
 
 fn group_by_field(group: Vec<usize>, spans: &[DurableSpan], field: &str) -> Vec<Vec<usize>> {
@@ -1397,5 +1850,23 @@ mod tests {
                 .evaluate(&spans),
             vec![0, 1, 2]
         );
+    }
+
+    #[test]
+    fn metrics_parser_accepts_grouping_threshold_quantile_and_series_limits() {
+        let rate = TraceMetricQuery::parse("{} | rate() by (resource.service.name) > 1 | topk(10)")
+            .unwrap();
+        assert_eq!(rate.function, TraceMetricFunction::Rate);
+        assert_eq!(rate.group_by, vec!["resource.service.name"]);
+        assert_eq!(rate.series_limit, Some((true, 10)));
+        assert!(rate.passes(2.0));
+        assert!(!rate.passes(1.0));
+
+        let quantile =
+            TraceMetricQuery::parse("{ status = 2 } | quantile_over_time(duration, .99)").unwrap();
+        assert_eq!(quantile.function, TraceMetricFunction::Quantile);
+        assert_eq!(quantile.field.as_deref(), Some("duration"));
+        assert_eq!(quantile.quantile, Some(0.99));
+        assert_eq!(quantile.aggregate(&[1.0, 2.0, 3.0], 1.0), 2.98);
     }
 }

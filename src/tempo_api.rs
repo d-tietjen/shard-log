@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::extract::{Path, Query, State};
@@ -25,6 +26,14 @@ pub struct TempoApiConfig {
     pub max_traces: usize,
     /// Maximum spans inspected by one query.
     pub max_spans: usize,
+    /// Maximum duration accepted by one TraceQL metrics query.
+    pub max_metrics_duration: Duration,
+    /// Maximum number of samples in one TraceQL metrics series.
+    pub max_metric_steps: usize,
+    /// Maximum number of trace-derived metric series.
+    pub max_metric_series: usize,
+    /// Maximum exemplars returned by one trace-derived metric query.
+    pub max_exemplars: usize,
 }
 
 impl Default for TempoApiConfig {
@@ -33,13 +42,23 @@ impl Default for TempoApiConfig {
             tenant: Arc::from("default"),
             max_traces: 1_000,
             max_spans: 1_000_000,
+            max_metrics_duration: Duration::from_secs(24 * 60 * 60),
+            max_metric_steps: 11_000,
+            max_metric_series: 100_000,
+            max_exemplars: 100,
         }
     }
 }
 
 impl TempoApiConfig {
     fn validate(&self) -> TelemetryResult<()> {
-        if self.tenant.is_empty() || self.max_traces == 0 || self.max_spans == 0 {
+        if self.tenant.is_empty()
+            || self.max_traces == 0
+            || self.max_spans == 0
+            || self.max_metrics_duration.is_zero()
+            || self.max_metric_steps == 0
+            || self.max_metric_series == 0
+        {
             return Err(TelemetryError::InvalidConfiguration(
                 "Tempo tenant and query limits must be nonempty".into(),
             ));
@@ -147,6 +166,8 @@ pub fn tempo_router(service: TempoService) -> Router {
         .route("/api/search", get(search))
         .route("/api/v2/search/tags", get(tags))
         .route("/api/v2/search/tag/{tag}/values", get(tag_values))
+        .route("/api/metrics/query_range", get(metrics_query_range))
+        .route("/api/metrics/query", get(metrics_query_instant))
         .with_state(service)
 }
 
@@ -163,6 +184,16 @@ struct SearchParameters {
     start: Option<u64>,
     end: Option<u64>,
     limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct MetricsParameters {
+    q: String,
+    start: Option<String>,
+    end: Option<String>,
+    since: Option<String>,
+    step: Option<String>,
+    exemplars: Option<usize>,
 }
 
 async fn trace_by_id(
@@ -262,6 +293,206 @@ async fn search(
             &format!("TraceQL worker failed: {error}"),
         ),
     }
+}
+
+async fn metrics_query_range(
+    State(service): State<TempoService>,
+    headers: HeaderMap,
+    Query(parameters): Query<MetricsParameters>,
+) -> Response {
+    metrics_query(service, headers, parameters, false).await
+}
+
+async fn metrics_query_instant(
+    State(service): State<TempoService>,
+    headers: HeaderMap,
+    Query(parameters): Query<MetricsParameters>,
+) -> Response {
+    metrics_query(service, headers, parameters, true).await
+}
+
+async fn metrics_query(
+    service: TempoService,
+    headers: HeaderMap,
+    parameters: MetricsParameters,
+    instant: bool,
+) -> Response {
+    let _permit = match service.authorize(&headers) {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+    if parameters.q.trim().is_empty() {
+        return tempo_error(StatusCode::BAD_REQUEST, "TraceQL metrics query is required");
+    }
+    let (start, end, step, exemplars) =
+        match resolve_metrics_range(&parameters, &service.config, instant) {
+            Ok(range) => range,
+            Err(error) => return tempo_error(StatusCode::BAD_REQUEST, &error),
+        };
+    let expression = parameters.q;
+    let engine = service.engine();
+    let max_series = service.config.max_metric_series;
+    let result = tokio::task::spawn_blocking(move || {
+        let series = engine.query_metrics(&expression, start, end, step, instant, exemplars)?;
+        if series.len() > max_series {
+            return Err(crate::TraceqlError::new(
+                "TraceQL metrics series limit exceeded",
+            ));
+        }
+        Ok(series)
+    })
+    .await;
+    match result {
+        Ok(Ok(series)) => traceql_metrics_success(series),
+        Ok(Err(error)) => tempo_error(StatusCode::UNPROCESSABLE_ENTITY, &error.to_string()),
+        Err(error) => tempo_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("TraceQL metrics worker failed: {error}"),
+        ),
+    }
+}
+
+fn resolve_metrics_range(
+    parameters: &MetricsParameters,
+    config: &TempoApiConfig,
+    instant: bool,
+) -> Result<(u64, u64, u64, usize), String> {
+    if parameters.since.is_some() && (parameters.start.is_some() || parameters.end.is_some()) {
+        return Err("Tempo metrics since cannot be combined with start or end".into());
+    }
+    let now: u64 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "system clock precedes the Unix epoch")?
+        .as_nanos()
+        .try_into()
+        .map_err(|_| "system clock exceeds the telemetry timestamp range")?;
+    let (start, end) =
+        if let Some(since) = &parameters.since {
+            let duration = parse_tempo_duration_nanos(since)?;
+            (now.saturating_sub(duration), now)
+        } else if parameters.start.is_some() || parameters.end.is_some() {
+            let start = parameters.start.as_deref().ok_or_else(|| {
+                "Tempo metrics start and end must be provided together".to_owned()
+            })?;
+            let end = parameters.end.as_deref().ok_or_else(|| {
+                "Tempo metrics start and end must be provided together".to_owned()
+            })?;
+            (parse_tempo_time(start)?, parse_tempo_time(end)?)
+        } else {
+            (now.saturating_sub(60 * 60 * 1_000_000_000), now)
+        };
+    if start >= end {
+        return Err("Tempo metrics start must precede end".into());
+    }
+    let duration = end - start;
+    if duration > u64::try_from(config.max_metrics_duration.as_nanos()).unwrap_or(u64::MAX) {
+        return Err("Tempo metrics query exceeds the duration limit".into());
+    }
+    let step = if instant {
+        duration
+    } else if let Some(step) = &parameters.step {
+        parse_tempo_duration_nanos(step)?
+    } else {
+        (duration / 100_u64).max(1_000_000_000_u64)
+    };
+    if step == 0 {
+        return Err("Tempo metrics step must be positive".into());
+    }
+    let steps = usize::try_from(duration / step)
+        .unwrap_or(usize::MAX)
+        .saturating_add(1);
+    if steps > config.max_metric_steps {
+        return Err("Tempo metrics query exceeds the step limit".into());
+    }
+    Ok((
+        start,
+        end,
+        step,
+        parameters
+            .exemplars
+            .unwrap_or(config.max_exemplars)
+            .min(config.max_exemplars),
+    ))
+}
+
+fn parse_tempo_time(value: &str) -> Result<u64, String> {
+    if let Ok(value) = value.parse::<u64>() {
+        return if value >= 10_000_000_000 {
+            Ok(value)
+        } else {
+            value
+                .checked_mul(1_000_000_000)
+                .ok_or_else(|| "Tempo metrics timestamp overflows nanoseconds".into())
+        };
+    }
+    let timestamp = chrono::DateTime::parse_from_rfc3339(value)
+        .map_err(|_| format!("invalid Tempo metrics timestamp {value:?}"))?
+        .timestamp_nanos_opt()
+        .ok_or_else(|| "Tempo metrics RFC3339 timestamp exceeds nanoseconds".to_owned())?;
+    u64::try_from(timestamp).map_err(|_| "Tempo metrics timestamps must be after epoch".into())
+}
+
+fn parse_tempo_duration_nanos(value: &str) -> Result<u64, String> {
+    let (number, multiplier) = [
+        ("ns", 1_f64),
+        ("us", 1_000.0),
+        ("ms", 1_000_000.0),
+        ("s", 1_000_000_000.0),
+        ("m", 60_000_000_000.0),
+        ("h", 3_600_000_000_000.0),
+        ("d", 86_400_000_000_000.0),
+    ]
+    .into_iter()
+    .find_map(|(suffix, multiplier)| {
+        value
+            .strip_suffix(suffix)
+            .map(|number| (number, multiplier))
+    })
+    .ok_or_else(|| format!("invalid Tempo duration {value:?}"))?;
+    let nanos = number
+        .parse::<f64>()
+        .map_err(|_| format!("invalid Tempo duration {value:?}"))?
+        * multiplier;
+    if !nanos.is_finite() || nanos <= 0.0 || nanos > u64::MAX as f64 {
+        return Err(format!("invalid Tempo duration {value:?}"));
+    }
+    Ok(nanos.round() as u64)
+}
+
+fn traceql_metrics_success(series: Vec<crate::TraceqlMetricSeries>) -> Response {
+    let series = series
+        .into_iter()
+        .map(|series| {
+            json!({
+                "labels": series.labels.into_iter().map(|(key, value)| json!({
+                    "key": key,
+                    "value": {"stringValue": value}
+                })).collect::<Vec<_>>(),
+                "samples": series.samples.into_iter().map(|sample| json!({
+                    "timestampMs": sample.timestamp_ms.to_string(),
+                    "value": sample.value
+                })).collect::<Vec<_>>(),
+                "exemplars": series.exemplars.into_iter().map(|exemplar| json!({
+                    "labels": [
+                        {"key": "trace:id", "value": {"stringValue": exemplar.trace_id.to_string()}},
+                        {"key": "span:id", "value": {"stringValue": exemplar.span_id.to_string()}}
+                    ],
+                    "value": exemplar.value,
+                    "timestampMs": exemplar.timestamp_ms.to_string()
+                })).collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+    tempo_success(json!({
+        "series": series,
+        "metrics": {
+            "inspectedBytes": "0",
+            "inspectedTraces": 0,
+            "totalJobs": 1,
+            "completedJobs": 1
+        },
+        "status": "COMPLETE"
+    }))
 }
 
 async fn tags(State(service): State<TempoService>, headers: HeaderMap) -> Response {
@@ -464,7 +695,14 @@ fn tempo_error(status: StatusCode, message: &str) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
     use super::*;
+    use crate::{DurableTelemetryConfig, StripeConfig};
 
     #[test]
     fn trace_ids_fail_closed_on_length_hex_and_zero() {
@@ -491,5 +729,60 @@ mod tests {
         }]);
         assert!(value["traces"][0]["spanSets"].is_array());
         assert!(value["traces"][0].get("spanSet").is_none());
+    }
+
+    #[test]
+    fn metrics_time_parser_accepts_seconds_nanoseconds_and_rfc3339() {
+        assert_eq!(parse_tempo_time("2").unwrap(), 2_000_000_000);
+        assert_eq!(parse_tempo_time("20000000000").unwrap(), 20_000_000_000);
+        assert_eq!(
+            parse_tempo_time("1970-01-01T00:00:02Z").unwrap(),
+            2_000_000_000
+        );
+        assert_eq!(parse_tempo_duration_nanos("1.5s").unwrap(), 1_500_000_000);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn traceql_metrics_routes_return_tempo_series_envelope() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!(
+            "shard-telemetry-tempo-metrics-{}-{nonce}",
+            std::process::id()
+        ));
+        let store = Arc::new(
+            DurableTelemetryStore::open(DurableTelemetryConfig {
+                data_directory: directory.clone(),
+                object_store_directory: None,
+                recovery_journal: true,
+                retention: None,
+                shard_count: 1,
+                tenant_partitions: 1,
+                append_linger: Duration::ZERO,
+                stripe: StripeConfig::default(),
+                indexed_ack_timeout: Duration::from_secs(30),
+            })
+            .unwrap(),
+        );
+        let service = TempoService::new(store, TempoApiConfig::default()).unwrap();
+        let response = tempo_router(service.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/api/metrics/query_range?q=%7B%7D%20%7C%20rate%28%29&start=1&end=2&step=1s")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), 1_024 * 1_024).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["status"], "COMPLETE");
+        assert_eq!(value["series"], json!([]));
+
+        drop(service);
+        fs::remove_dir_all(directory).unwrap();
     }
 }

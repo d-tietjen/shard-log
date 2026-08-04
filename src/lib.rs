@@ -138,7 +138,10 @@ pub use trace::{
     DurableSpan, SpanEvent, SpanLink, SpanStatus, TraceApplyOutcome, TraceDirectory, TraceQuery,
     TraceStripe, TraceSummary, decode_trace_block, encode_trace_block,
 };
-pub use traceql::{TraceqlEngine, TraceqlError, TraceqlLimits, TraceqlTrace};
+pub use traceql::{
+    TraceqlEngine, TraceqlError, TraceqlLimits, TraceqlMetricExemplar, TraceqlMetricSample,
+    TraceqlMetricSeries, TraceqlTrace,
+};
 pub use types::{
     CaseSensitivity, DurableLog, LogMatch, LogPredicate, LogQuery, LogRegex, MetadataField,
     NumericComparison, QueryCursor, QueryOrder, QuerySort, TelemetryRecordRef, TextMatchKind,
