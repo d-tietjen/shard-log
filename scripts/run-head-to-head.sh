@@ -5,7 +5,7 @@ SOURCE=${SOURCE:-/home/dtietjen/log-compression-samples/clickhouse-docker-json-e
 EXPECTED_SHA256=${EXPECTED_SHA256:-4fd6379bd89fcb44688a3ebd611729416c82f110fbf49ffef905d9df0ebf0508}
 EXPECTED_FILE_BYTES=${EXPECTED_FILE_BYTES:-85899345920}
 SHARD_TELEMETRY_BIN=${SHARD_TELEMETRY_BIN:-/home/dtietjen/shard-telemetry-target-20260729/release/shard-telemetry-structural-bench}
-SHARD_TELEMETRY_VARIANTS_FILE=${SHARD_TELEMETRY_VARIANTS_FILE:-}
+LOCALITY_MODE=${LOCALITY_MODE:-disabled}
 RESULT_ROOT=${RESULT_ROOT:-/home/dtietjen/shard-telemetry-head-to-head}
 RUN_ID=${RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}
 CORE_COUNT=${CORE_COUNT:-16}
@@ -14,63 +14,12 @@ CLICKHOUSE_IMAGE=${CLICKHOUSE_IMAGE:-sha256:770156c537ca9124046e138a3b5845c64ea5
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 CLICKHOUSE_CONFIG=$SCRIPT_DIR/clickhouse-benchmark.xml
 
-declare -a VARIANT_LABELS=()
-declare -a VARIANT_SLUGS=()
-declare -a VARIANT_BINS=()
-declare -a VARIANT_MODES=()
-declare -A SEEN_VARIANT_SLUGS=()
-
-add_variant() {
-    local label=$1
-    local slug=$2
-    local binary=$3
-    local mode=$4
-    [[ -n $label && $label != *$'\t'* && $label != *$'\n'* ]] || {
-        echo "invalid variant label: $label" >&2
-        exit 2
-    }
-    [[ $slug =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || {
-        echo "invalid variant slug: $slug" >&2
-        exit 2
-    }
-    [[ -z ${SEEN_VARIANT_SLUGS[$slug]+present} ]] || {
-        echo "duplicate variant slug: $slug" >&2
-        exit 2
-    }
-    [[ $mode == enabled || $mode == disabled ]] || {
-        echo "variant mode must be enabled or disabled, got: $mode" >&2
-        exit 2
-    }
-    [[ -x $binary ]] || {
-        echo "ShardTelemetry variant binary is not executable: $binary" >&2
-        exit 2
-    }
-    SEEN_VARIANT_SLUGS[$slug]=1
-    VARIANT_LABELS+=("$label")
-    VARIANT_SLUGS+=("$slug")
-    VARIANT_BINS+=("$binary")
-    VARIANT_MODES+=("$mode")
+[[ -x $SHARD_TELEMETRY_BIN ]] || {
+    echo "ShardTelemetry binary is not executable: $SHARD_TELEMETRY_BIN" >&2
+    exit 2
 }
-
-if [[ -n $SHARD_TELEMETRY_VARIANTS_FILE ]]; then
-    [[ -f $SHARD_TELEMETRY_VARIANTS_FILE ]] || {
-        echo "variant manifest does not exist: $SHARD_TELEMETRY_VARIANTS_FILE" >&2
-        exit 2
-    }
-    while IFS=$'\t' read -r label slug binary mode extra; do
-        [[ -z $label || $label == \#* ]] && continue
-        [[ -z $extra ]] || {
-            echo "variant manifest row has more than four columns: $label" >&2
-            exit 2
-        }
-        add_variant "$label" "$slug" "$binary" "$mode"
-    done <"$SHARD_TELEMETRY_VARIANTS_FILE"
-else
-    add_variant ShardTelemetry-disabled disabled "$SHARD_TELEMETRY_BIN" disabled
-    add_variant ShardTelemetry-enabled enabled "$SHARD_TELEMETRY_BIN" enabled
-fi
-[[ ${#VARIANT_LABELS[@]} -gt 0 ]] || {
-    echo "variant manifest contains no benchmark variants" >&2
+[[ $LOCALITY_MODE == enabled || $LOCALITY_MODE == disabled ]] || {
+    echo "LOCALITY_MODE must be enabled or disabled, got: $LOCALITY_MODE" >&2
     exit 2
 }
 
@@ -151,14 +100,9 @@ fi
     echo "clickhouse_container_uid_gid=$CONTAINER_UID:$CONTAINER_GID"
     echo "core_count=$CORE_COUNT"
     echo "block_bytes=$BLOCK_BYTES"
-    echo "shard_telemetry_variant_count=${#VARIANT_LABELS[@]}"
-    for index in "${!VARIANT_LABELS[@]}"; do
-        echo "variant_${index}_label=${VARIANT_LABELS[$index]}"
-        echo "variant_${index}_slug=${VARIANT_SLUGS[$index]}"
-        echo "variant_${index}_mode=${VARIANT_MODES[$index]}"
-        echo "variant_${index}_binary=${VARIANT_BINS[$index]}"
-        echo "variant_${index}_binary_sha256=$(sha256sum "${VARIANT_BINS[$index]}" | awk '{ print $1 }')"
-    done
+    echo "shard_telemetry_binary=$SHARD_TELEMETRY_BIN"
+    echo "shard_telemetry_binary_sha256=$(sha256sum "$SHARD_TELEMETRY_BIN" | awk '{ print $1 }')"
+    echo "shard_telemetry_locality=$LOCALITY_MODE"
     echo "clickhouse_image=$CLICKHOUSE_IMAGE"
     echo "clickhouse_image_id=$IMAGE_ID"
     echo "clickhouse_source_mode=skip-first-line"
@@ -178,45 +122,26 @@ prewarm_source() {
 }
 
 run_shard_telemetry() {
-    local mode=$1
-    local label=$2
-    local slug=$3
-    local binary=$4
-    echo "$label: prewarming $SOURCE_BYTES bytes"
-    prewarm_source "$label"
-    echo "$label: ingesting on CPUs $CPU_SET"
+    echo "ShardTelemetry: prewarming $SOURCE_BYTES bytes"
+    prewarm_source ShardTelemetry
+    echo "ShardTelemetry: ingesting on CPUs $CPU_SET"
     /usr/bin/time -f 'wall_seconds=%e\nuser_seconds=%U\nsystem_seconds=%S\nmax_rss_kib=%M' \
-        -o "$RUN_DIR/shard-telemetry-${slug}-time.txt" \
-        taskset -c "$CPU_SET" "$binary" "$SOURCE" \
+        -o "$RUN_DIR/shard-telemetry-time.txt" \
+        taskset -c "$CPU_SET" "$SHARD_TELEMETRY_BIN" "$SOURCE" \
         --limit-bytes "$SOURCE_BYTES" \
         --block-bytes "$BLOCK_BYTES" \
         --workers "$CORE_COUNT" \
-        --locality "$mode" \
-        --output-dir "$RUN_DIR/shard-telemetry-${slug}-packs" \
-        --report "$RUN_DIR/shard-telemetry-${slug}-report.txt"
+        --locality "$LOCALITY_MODE" \
+        --output-dir "$RUN_DIR/shard-telemetry-packs" \
+        --report "$RUN_DIR/shard-telemetry-report.txt"
 }
 
-for index in "${!VARIANT_LABELS[@]}"; do
-    run_shard_telemetry \
-        "${VARIANT_MODES[$index]}" \
-        "${VARIANT_LABELS[$index]}" \
-        "${VARIANT_SLUGS[$index]}" \
-        "${VARIANT_BINS[$index]}"
-done
+run_shard_telemetry
 
-REFERENCE_REPORT=$RUN_DIR/shard-telemetry-${VARIANT_SLUGS[0]}-report.txt
+REFERENCE_REPORT=$RUN_DIR/shard-telemetry-report.txt
 SHARD_RECORDS=$(awk -F': ' '$1 == "records" { print $2 }' "$REFERENCE_REPORT")
 SHARD_REJECTED_RECORDS=$(awk -F': ' '$1 == "rejected complete records" { print $2 }' "$REFERENCE_REPORT")
 SHARD_SOURCE_BYTES=$(awk -F': ' '$1 == "source bytes" { print $2 }' "$REFERENCE_REPORT")
-for index in "${!VARIANT_LABELS[@]}"; do
-    report=$RUN_DIR/shard-telemetry-${VARIANT_SLUGS[$index]}-report.txt
-    variant_records=$(awk -F': ' '$1 == "records" { print $2 }' "$report")
-    variant_source_bytes=$(awk -F': ' '$1 == "source bytes" { print $2 }' "$report")
-    if [[ $variant_records -ne $SHARD_RECORDS || $variant_source_bytes -ne $SHARD_SOURCE_BYTES ]]; then
-        echo "ShardTelemetry version mismatch: reference=$SHARD_RECORDS/$SHARD_SOURCE_BYTES ${VARIANT_LABELS[$index]}=$variant_records/$variant_source_bytes" >&2
-        exit 1
-    fi
-done
 
 CH_DATA=$RUN_DIR/clickhouse-data
 CH_LOGS=$RUN_DIR/clickhouse-logs
@@ -298,19 +223,15 @@ fi
 
 {
     printf 'engine\tsource_bytes\trecords\tstored_bytes\telapsed_seconds\tthroughput_mib_s\tcompression_ratio\n'
-    for index in "${!VARIANT_LABELS[@]}"; do
-        report=$RUN_DIR/shard-telemetry-${VARIANT_SLUGS[$index]}-report.txt
-        variant_stored_bytes=$(awk -F': ' '$1 == "durable pack plus manifest" {
-            split($2, value, " "); print value[1]
-        }' "$report")
-        variant_elapsed=$(awk -F': ' '$1 == "ingest elapsed seconds" { print $2 }' "$report")
-        awk -v engine="${VARIANT_LABELS[$index]}" -v source="$SHARD_SOURCE_BYTES" \
-            -v records="$SHARD_RECORDS" -v stored="$variant_stored_bytes" \
-            -v elapsed="$variant_elapsed" \
-            'BEGIN { printf "%s\t%.0f\t%.0f\t%.0f\t%.6f\t%.2f\t%.2f\n",
-                engine, source, records, stored, elapsed,
-                source / 1048576 / elapsed, source / stored }'
-    done
+    shard_stored_bytes=$(awk -F': ' '$1 == "durable pack plus manifest" {
+        split($2, value, " "); print value[1]
+    }' "$REFERENCE_REPORT")
+    shard_elapsed=$(awk -F': ' '$1 == "ingest elapsed seconds" { print $2 }' "$REFERENCE_REPORT")
+    awk -v source="$SHARD_SOURCE_BYTES" -v records="$SHARD_RECORDS" \
+        -v stored="$shard_stored_bytes" -v elapsed="$shard_elapsed" \
+        'BEGIN { printf "ShardTelemetry\t%.0f\t%.0f\t%.0f\t%.6f\t%.2f\t%.2f\n",
+            source, records, stored, elapsed,
+            source / 1048576 / elapsed, source / stored }'
     awk -v source="$SHARD_SOURCE_BYTES" -v records="$CH_RECORDS" \
         -v stored="$CH_STORED_BYTES" -v elapsed="$CH_ELAPSED" \
         'BEGIN { printf "ClickHouse\t%.0f\t%.0f\t%.0f\t%.6f\t%.2f\t%.2f\n",

@@ -358,41 +358,23 @@ is against accepted Docker source bytes, so it includes the gain from replacing
 JSON syntax with typed log fields; it is not a transparent byte-for-byte JSON
 archive metric.
 
-On Adam, the sequential head-to-head harness gives ShardTelemetry variants and a
-typed ClickHouse `MergeTree` the same immutable corpus, 16 physical cores, and
-source prewarm. By default it runs locality-disabled and locality-enabled legs
-for `SHARD_TELEMETRY_BIN` before ClickHouse:
+On Adam, the sequential head-to-head harness gives the one current
+ShardTelemetry binary and a typed ClickHouse `MergeTree` the same immutable
+corpus, 16 physical cores, and source prewarm. It runs the production-default
+locality-disabled path before ClickHouse:
 
 ```text
 scripts/run-head-to-head.sh
 ```
 
-For a cross-version comparison, set `SHARD_TELEMETRY_VARIANTS_FILE` to a
-tab-separated manifest with `label`, filesystem-safe `slug`, `binary`, and
-`enabled|disabled` columns. The harness runs every row sequentially and records
-each binary's SHA-256:
-
-```text
-TinyLFU-disabled	tinylfu-disabled	/path/to/old-bench	disabled
-TinyLFU-enabled	tinylfu-enabled	/path/to/old-bench	enabled
-BlockCollator-disabled	block-disabled	/path/to/new-bench	disabled
-BlockCollator-enabled	block-enabled	/path/to/new-bench	enabled
-```
-
-```text
-SHARD_TELEMETRY_VARIANTS_FILE=/path/to/variants.tsv scripts/run-head-to-head.sh
-```
-
 It verifies the 80 GiB source checksum, pins both engines to CPUs `0-15`,
 persists each engine into an isolated new result directory, requires equal
 accepted row counts, and records provenance plus a TSV summary.
-The current [80 GiB timestamp-codec and locality acceptance
-result](BENCHMARKS.md) measured the default Pco/zstd layout at 1,104.68 MiB/s
-and 136.68x versus 932.71 MiB/s and 73.09x for ClickHouse. It stored
-628,473,667 bytes, 23.95% less than the previous ShardTelemetry layout. The
-homogeneous corpus remained in base placement; enabling the block collator
-changed no bytes and fell below the strict 1 GiB/s gate, which is why routing
-is now opt-in.
+The current [80 GiB acceptance result](BENCHMARKS.md) measured the sole
+Pco/zstd format at 3,622.67 MiB/s and 138.34x versus 915.72 MiB/s and 73.07x
+for ClickHouse. It stored 620,912,446 bytes, including its embedded
+compression-derived lookup index. The homogeneous corpus remains in base
+placement, so locality routing stays opt-in.
 
 Run component-level fingerprint, tentative-shard probe, block
 score/split/assignment, handoff, throughput, and seal-latency measurements

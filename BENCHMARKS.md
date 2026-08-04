@@ -1,5 +1,83 @@
 # Compression benchmark results
 
+## Current single-format 80 GiB acceptance — 2026-08-04
+
+This is the current pre-release result for commit
+`e5e3c368ef50762f791daf8fa963cf4a216c4f7a`. It measures the only supported
+`STEL` structural format; there are no legacy readers, compatibility formats,
+or alternate ShardTelemetry implementations in this comparison.
+
+Host: Adam, AMD Ryzen 9 3950X, Linux 6.8
+
+CPUs: physical cores `0-15`; SMT siblings `16-31` were excluded
+
+Corpus: 85,899,345,920-byte immutable ClickHouse Docker JSON log
+
+SHA-256: `4fd6379bd89fcb44688a3ebd611729416c82f110fbf49ffef905d9df0ebf0508`
+
+The direct durable-storage path normalized and accepted 85,899,343,853 bytes
+across 607,363,459 records. Seven malformed complete records totaling 1,973
+bytes were rejected and reported. The run used 8 MiB blocks, 16 workers,
+Zstandard level 1, the production-default disabled locality router, and no
+second persistent term/field sidecar.
+
+| Metric | Current ShardTelemetry |
+| --- | ---: |
+| Structural bytes before Zstd | 15,026,825,037 |
+| Embedded compression-derived index before Zstd | 384,399,867 |
+| Zstd payload bytes | 620,093,229 |
+| Manifest bytes | 819,217 |
+| Durable total | **620,912,446** |
+| Raw-source compression ratio | **138.34x** |
+| Wall time | **22.613 s** |
+| End-to-end throughput | **3,622.67 MiB/s** |
+
+All 10,240 payload checksums passed. The verifier also reconstructed the first,
+middle, and final blocks exactly. Compared with the accepted historical Pco-8
+result, the current format stores 7,561,221 fewer bytes and is 1.20% smaller.
+Compared with the first telemetry expansion run, it stores 40,419,454 fewer
+bytes and is 6.11% smaller. This closes the homogeneous-corpus no-regression
+gate while retaining the embedded lookup index.
+
+The storage improvement comes from making the frame index complementary to the
+codec: adaptive run-length/bit-packed ordinal columns, authoritative template
+IDs reused by body decoding, collision-safe 24-bit term/field fingerprints,
+and one shared fail-open membership hint. Fingerprint and filter collisions can
+only add candidates; exact selective decode remains the result authority.
+
+### Same-host retained engine comparison
+
+The rows below use the same Adam host, physical CPU set, and immutable corpus.
+They were run sequentially and retained independently. ShardTelemetry and
+ClickHouse use their native storage harnesses; Loki includes its HTTP JSON
+compatibility boundary, so the table is an engine-level result rather than a
+same-protocol claim.
+
+| Engine | Settled durable bytes | Ratio | Wall time | Throughput |
+| --- | ---: | ---: | ---: | ---: |
+| ShardTelemetry `e5e3c36` | **620,912,446** | **138.34x** | **22.613 s** | **3,622.67 MiB/s** |
+| ClickHouse 26.5.1.882 | 1,175,650,470 | 73.07x | 89.46 s | 915.72 MiB/s |
+| Loki 3.7.2 | 4,905,868,184 | 17.51x | 1,010.043 s | 81.11 MiB/s |
+
+On this corpus ShardTelemetry is 3.96x faster than ClickHouse and uses 47.2%
+fewer durable bytes. It is 44.7x faster than the Loki compatibility run and
+uses 7.90x less settled storage. These results do not establish the separate
+1 GiB/s-per-core or 80%-scaling-through-16-cores gates: the measured aggregate
+rate is 3.54 GiB/s, or about 226 MiB/s per assigned core if divided naively.
+
+Retained Adam evidence:
+
+```text
+/home/dtietjen/shard-telemetry-validation-suite-20260803/shard-telemetry-e5e3c36-full80-20260804
+/home/dtietjen/shard-telemetry-validation-suite-20260803/head-to-head/stel-current-ca5-20260803
+/home/dtietjen/shard-telemetry-validation-suite-20260803/loki/loki-3.7.2-e004916-20260803
+```
+
+The current ShardTelemetry report and stdout both have SHA-256
+`37dfda750bc715518f23ddb61d814a02eede28acc24adde9b3e9fe3c14185757`.
+The settled Loki correction summary has SHA-256
+`c6a8f6918dc792fa7003a771c0f26268630430f5f012b14af43d5e411e7949c1`.
+
 ## Native fully indexed ingest optimization series — 1 GiB
 
 Date: 2026-07-30  
@@ -730,7 +808,7 @@ This is a local implementation smoke test, not an acceptance result. In
 particular, block score throughput operates on already fingerprinted compact
 records and must not be interpreted as end-to-end log ingest throughput.
 
-### Current 80 GiB cross-version matrix
+### Historical 80 GiB implementation ablation
 
 Run date: 2026-07-29 local / 2026-07-30 UTC  
 Host: Adam, Ryzen 9 3950X, Linux 6.8  
@@ -742,7 +820,7 @@ Source SHA-256:
 The matrix used one immutable source and mandatory equality gates for
 85,899,343,853 accepted source bytes and 607,363,459 records:
 
-| Version and mode | Stored bytes | Ratio | Seconds | MiB/s |
+| Historical implementation and mode | Stored bytes | Ratio | Seconds | MiB/s |
 | --- | ---: | ---: | ---: | ---: |
 | Historical TinyLFU, disabled | 826,364,011 | 103.95x | 70.060 | 1,169.28 |
 | Historical TinyLFU, enabled | 826,364,011 | 103.95x | 76.604 | 1,069.40 |

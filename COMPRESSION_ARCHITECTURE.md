@@ -377,15 +377,17 @@ borrowed byte ranges. This removes a `pread`-to-`Vec` copy from performance
 measurement without putting memory mapping or unsafe code in the storage
 library. Production callers may provide any stable borrowed input buffer.
 
-The final optimized Pco-8 run with locality disabled stored 628,417,043 bytes
-at 136.69x and 7,570.75 MiB/s on 16 physical cores. All 10,240 payload
-checksums and sampled exact reconstructions passed. The same binary sustained
-1,157.26 MiB/s on one physical core across the full 80 GiB corpus. The
-locality-enabled precursor stored 628,473,667 bytes at 1,005.02 MiB/s after
-528 unproductive splits and 83,512,504 bytes of membership handoff. Routing
-therefore remains disabled by default. The prior ShardTelemetry format stored
-826,364,011 bytes at 103.95x; the final paired ClickHouse run stored
-1,175,169,126 bytes at 73.10x and 927.43 MiB/s.
+The current single pre-release format, with locality disabled, stored
+620,912,446 bytes at 138.34x and 3,622.67 MiB/s on 16 physical cores. All
+10,240 payload checksums and sampled exact reconstructions passed. It is
+7,561,221 bytes smaller than the accepted historical Pco-8 result even though
+the current payload retains its compression-derived lookup index. The
+historical one-core implementation sustained 1,157.26 MiB/s, but that result
+predates the current frame index and is not presented as a current per-core
+measurement. The locality-enabled precursor performed 528 unproductive splits
+and 83,512,504 bytes of membership handoff, so routing remains disabled by
+default. The fresh retained ClickHouse baseline stored 1,175,650,470 bytes at
+73.07x and 915.72 MiB/s.
 
 ## Dictionary policy
 
@@ -515,12 +517,14 @@ index on the native/Loki durable path:
 2. `encode_indexed_structural_records` builds template IDs, token templates,
    attribute dictionaries, repeated field sets, and their forward record
    columns in one pass.
-3. The structural frame embeds an `SLI1` index section. Static terms point to
-   template IDs, repeated exact fields point to field-set IDs, and bit-packed
-   forward columns map those dictionary IDs back to record ordinals.
-4. Dynamic terms and direct/high-cardinality fields use bounded membership
-   filters and fail open to a candidate superset. Selective structural decode
-   and `LogQuery::matches` remain the exact authority.
+3. The structural frame embeds one index section without a second format
+   header. Collision-safe 24-bit fingerprints point to template or field-set
+   IDs. Forward columns choose run-length or bit-packed encoding per block.
+4. The template-ID column is authoritative for body reconstruction, so the body
+   lane does not repeat a kind byte and template ID for every record. Dynamic
+   terms and direct/high-cardinality fields use one shared bounded membership
+   hint and fail open to a candidate superset. Selective structural decode and
+   `LogQuery::matches` remain the exact authority.
 5. The enclosing `SLW1` ingest pack stores independently checksummed,
    Zstd-compressed cohort frames. Its group descriptor includes record count,
    structural length, compressed checksum, and minimum/maximum timestamp.
