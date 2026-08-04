@@ -17,7 +17,6 @@ mod error;
 mod ingest_pack;
 mod locality;
 mod loki_api;
-mod loki_store;
 mod metric;
 mod native_protocol;
 mod native_server;
@@ -40,6 +39,7 @@ mod storage_format;
 mod stripe;
 mod structural;
 mod telemetry;
+mod telemetry_store;
 mod tempo_api;
 mod tempo_protocol;
 mod tier;
@@ -72,7 +72,6 @@ pub use loki_api::{
     loki_router, loki_router_with_clickhouse, single_tenant_loki_api_router,
     single_tenant_loki_router,
 };
-pub use loki_store::{DurableLokiConfig, DurableLokiStore, RetentionReport};
 pub use metric::{
     DurableMetricPoint, ExplicitHistogramValue, ExponentialHistogramBuckets,
     ExponentialHistogramValue, HistogramBucketSpan, HistogramCount, MetricApplyOutcome,
@@ -125,6 +124,7 @@ pub use telemetry::{
     ShardTelemetryConfig, SignalConfig, SpanId, TRACES_TOPIC_ID, TelemetryAttribute,
     TelemetryEntityRef, TelemetryRouter, TelemetrySignal, TelemetryValue, TraceId,
 };
+pub use telemetry_store::{DurableTelemetryConfig, DurableTelemetryStore, RetentionReport};
 pub use tempo_api::{TempoApiConfig, TempoService, tempo_router};
 pub use tier::{
     CatalogGroupEntry, CatalogPage, CatalogPageRef, CatalogPointer, CatalogRoot, LocalObjectStore,

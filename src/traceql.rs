@@ -5,7 +5,7 @@ use std::sync::Arc;
 use regex::Regex;
 
 use crate::{
-    DurableLokiStore, DurableSpan, TelemetryAttribute, TelemetryValue, TraceId, TraceQuery,
+    DurableSpan, DurableTelemetryStore, TelemetryAttribute, TelemetryValue, TraceId, TraceQuery,
 };
 
 /// Bounded TraceQL execution limits.
@@ -66,7 +66,7 @@ impl std::error::Error for TraceqlError {}
 /// Clean-room Rust TraceQL evaluator backed by trace-owner stripes.
 #[derive(Clone)]
 pub struct TraceqlEngine {
-    store: Arc<DurableLokiStore>,
+    store: Arc<DurableTelemetryStore>,
     tenant: Arc<str>,
     limits: TraceqlLimits,
 }
@@ -84,7 +84,7 @@ impl fmt::Debug for TraceqlEngine {
 impl TraceqlEngine {
     /// Creates a bounded single-tenant evaluator.
     #[must_use]
-    pub fn new(store: Arc<DurableLokiStore>, tenant: Arc<str>, limits: TraceqlLimits) -> Self {
+    pub fn new(store: Arc<DurableTelemetryStore>, tenant: Arc<str>, limits: TraceqlLimits) -> Self {
         Self {
             store,
             tenant,

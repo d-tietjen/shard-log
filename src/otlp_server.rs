@@ -32,7 +32,7 @@ use tonic::codec::CompressionEncoding;
 use tonic::{Request, Response as GrpcResponse, Status};
 
 use crate::{
-    DurableLokiStore, NativePartitionAppend, NativeTelemetryBatch, OtlpLogDecoder,
+    DurableTelemetryStore, NativePartitionAppend, NativeTelemetryBatch, OtlpLogDecoder,
     OtlpTelemetryDecoder, ProductionRuntime, ServiceState, ShardTelemetryConfig, TelemetryError,
     TelemetryResult, TelemetryRouter, prepare_log_envelope, prepare_metric_envelope,
     prepare_trace_envelope,
@@ -82,7 +82,7 @@ impl OtlpReceiverConfig {
 /// Shared OTLP transport implementation backed by the durable telemetry store.
 #[derive(Clone)]
 pub struct OtlpIngestService {
-    store: Arc<DurableLokiStore>,
+    store: Arc<DurableTelemetryStore>,
     config: OtlpReceiverConfig,
     router: TelemetryRouter,
     production: Option<Arc<ProductionRuntime>>,
@@ -99,7 +99,10 @@ impl std::fmt::Debug for OtlpIngestService {
 
 impl OtlpIngestService {
     /// Creates a transport-independent OTLP ingestion service.
-    pub fn new(store: Arc<DurableLokiStore>, config: OtlpReceiverConfig) -> TelemetryResult<Self> {
+    pub fn new(
+        store: Arc<DurableTelemetryStore>,
+        config: OtlpReceiverConfig,
+    ) -> TelemetryResult<Self> {
         config.validate()?;
         let router = TelemetryRouter::from_config(&config.signals);
         Ok(Self {

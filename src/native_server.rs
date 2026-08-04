@@ -8,7 +8,7 @@ use tokio::sync::{Semaphore, mpsc};
 
 use crate::loki_api::LokiApiError;
 use crate::{
-    DurableLokiStore, MAX_NATIVE_FRAME_BYTES, NATIVE_FRAME_HEADER_BYTES, NativeFrame,
+    DurableTelemetryStore, MAX_NATIVE_FRAME_BYTES, NATIVE_FRAME_HEADER_BYTES, NativeFrame,
     NativeFrameHeader, NativeOpcode, NativeStatus, NativeTelemetryBatch, ProductionRuntime,
     ServiceState, decode_native_query, encode_native_log_query_result, is_native_telemetry_batch,
 };
@@ -88,7 +88,7 @@ impl NativeServerConfig {
 /// copied from each request frame.
 pub async fn serve_native<F>(
     listener: TcpListener,
-    store: Arc<DurableLokiStore>,
+    store: Arc<DurableTelemetryStore>,
     config: NativeServerConfig,
     shutdown: F,
 ) -> io::Result<()>
@@ -129,7 +129,7 @@ where
 
 async fn serve_connection(
     socket: TcpStream,
-    store: Arc<DurableLokiStore>,
+    store: Arc<DurableTelemetryStore>,
     config: NativeServerConfig,
 ) -> io::Result<()> {
     let (mut reader, mut writer) = socket.into_split();
@@ -287,7 +287,7 @@ fn authenticate_frame(
 async fn dispatch(
     header: NativeFrameHeader,
     payload: Vec<u8>,
-    store: Arc<DurableLokiStore>,
+    store: Arc<DurableTelemetryStore>,
     config: &NativeServerConfig,
 ) -> NativeFrame {
     if matches!(header.opcode, NativeOpcode::Query)
@@ -515,10 +515,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        DurableLokiConfig, LokiEntry, NativeLogQueryResult, NativePartitionAppend, NativeQuery,
-        NativeQueryDirection, NativeTelemetryAppendAck, NativeTelemetryBatch, ServiceLifecycle,
-        SingleTenantConfig, StripeConfig, decode_native_log_query_result, encode_native_query,
-        prepare_loki_log_envelope,
+        DurableTelemetryConfig, LokiEntry, NativeLogQueryResult, NativePartitionAppend,
+        NativeQuery, NativeQueryDirection, NativeTelemetryAppendAck, NativeTelemetryBatch,
+        ServiceLifecycle, SingleTenantConfig, StripeConfig, decode_native_log_query_result,
+        encode_native_query, prepare_loki_log_envelope,
     };
 
     #[derive(Debug)]
@@ -541,7 +541,7 @@ mod tests {
             std::process::id()
         ));
         let store = Arc::new(
-            DurableLokiStore::open(DurableLokiConfig {
+            DurableTelemetryStore::open(DurableTelemetryConfig {
                 data_directory: directory.clone(),
                 object_store_directory: None,
                 recovery_journal: false,
@@ -652,7 +652,7 @@ mod tests {
             std::process::id()
         ));
         let store = Arc::new(
-            DurableLokiStore::open(DurableLokiConfig {
+            DurableTelemetryStore::open(DurableTelemetryConfig {
                 data_directory: directory.clone(),
                 object_store_directory: None,
                 recovery_journal: false,

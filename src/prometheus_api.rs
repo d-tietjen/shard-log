@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use crate::prometheus_protocol::v1 as prometheus_v1;
 use crate::prometheus_xor::encode_xor_chunk;
 use crate::{
-    DurableLokiStore, MetricKind, MetricValue, NumberValue, ProductionRuntime, PromqlEngine,
+    DurableTelemetryStore, MetricKind, MetricValue, NumberValue, ProductionRuntime, PromqlEngine,
     PromqlLimits, PromqlValue, RemoteWriteDecoder, RemoteWriteStats, RemoteWriteVersion,
     ServiceState, TelemetryError, TelemetryResult, TelemetryRouter, TelemetryValue,
 };
@@ -60,7 +60,7 @@ impl PrometheusApiConfig {
 /// Shared Prometheus protocol service backed by signal-native metric stripes.
 #[derive(Clone)]
 pub struct PrometheusService {
-    store: Arc<DurableLokiStore>,
+    store: Arc<DurableTelemetryStore>,
     config: PrometheusApiConfig,
     router: TelemetryRouter,
     production: Option<Arc<ProductionRuntime>>,
@@ -77,7 +77,10 @@ impl std::fmt::Debug for PrometheusService {
 
 impl PrometheusService {
     /// Creates a Prometheus API service.
-    pub fn new(store: Arc<DurableLokiStore>, config: PrometheusApiConfig) -> TelemetryResult<Self> {
+    pub fn new(
+        store: Arc<DurableTelemetryStore>,
+        config: PrometheusApiConfig,
+    ) -> TelemetryResult<Self> {
         config.validate()?;
         Ok(Self {
             store,
@@ -1312,7 +1315,7 @@ mod tests {
     use tower::ServiceExt;
 
     use super::*;
-    use crate::{DurableLokiConfig, StripeConfig};
+    use crate::{DurableTelemetryConfig, StripeConfig};
 
     fn test_service() -> (PrometheusService, std::path::PathBuf) {
         let nonce = SystemTime::now()
@@ -1324,7 +1327,7 @@ mod tests {
             std::process::id()
         ));
         let store = Arc::new(
-            DurableLokiStore::open(DurableLokiConfig {
+            DurableTelemetryStore::open(DurableTelemetryConfig {
                 data_directory: directory.clone(),
                 object_store_directory: None,
                 recovery_journal: false,

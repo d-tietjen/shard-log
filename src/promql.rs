@@ -10,7 +10,7 @@ use promql_parser::parser::{
 };
 
 use crate::{
-    DurableLokiStore, DurableMetricPoint, MetricQuery, MetricValue, NumberValue,
+    DurableMetricPoint, DurableTelemetryStore, MetricQuery, MetricValue, NumberValue,
     prometheus_string_labels,
 };
 
@@ -105,7 +105,7 @@ impl std::error::Error for PromqlError {}
 /// Rust PromQL evaluator backed by ShardTelemetry metric stripes.
 #[derive(Clone)]
 pub struct PromqlEngine {
-    store: Arc<DurableLokiStore>,
+    store: Arc<DurableTelemetryStore>,
     tenant: Arc<str>,
     limits: PromqlLimits,
 }
@@ -123,7 +123,7 @@ impl fmt::Debug for PromqlEngine {
 impl PromqlEngine {
     /// Creates a bounded single-tenant evaluator.
     #[must_use]
-    pub fn new(store: Arc<DurableLokiStore>, tenant: Arc<str>, limits: PromqlLimits) -> Self {
+    pub fn new(store: Arc<DurableTelemetryStore>, tenant: Arc<str>, limits: PromqlLimits) -> Self {
         Self {
             store,
             tenant,

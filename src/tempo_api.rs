@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use crate::tempo_protocol::trace_by_id_response;
 use crate::{
-    DurableLokiStore, DurableSpan, ProductionRuntime, ServiceState, TelemetryError,
+    DurableSpan, DurableTelemetryStore, ProductionRuntime, ServiceState, TelemetryError,
     TelemetryResult, TelemetryValue, TraceId, TraceqlEngine, TraceqlLimits, TraceqlTrace,
 };
 
@@ -51,7 +51,7 @@ impl TempoApiConfig {
 /// Shared Tempo-compatible query service.
 #[derive(Clone)]
 pub struct TempoService {
-    store: Arc<DurableLokiStore>,
+    store: Arc<DurableTelemetryStore>,
     config: TempoApiConfig,
     production: Option<Arc<ProductionRuntime>>,
 }
@@ -67,7 +67,7 @@ impl std::fmt::Debug for TempoService {
 
 impl TempoService {
     /// Creates a bounded Tempo query service.
-    pub fn new(store: Arc<DurableLokiStore>, config: TempoApiConfig) -> TelemetryResult<Self> {
+    pub fn new(store: Arc<DurableTelemetryStore>, config: TempoApiConfig) -> TelemetryResult<Self> {
         config.validate()?;
         Ok(Self {
             store,

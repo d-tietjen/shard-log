@@ -4,11 +4,12 @@ use std::sync::Arc;
 
 use clap::Parser;
 use shard_telemetry::{
-    DurableLokiConfig, DurableLokiStore, LokiApiConfig, NativeServerConfig, OtlpIngestService,
-    OtlpReceiverConfig, ProductionRuntime, PrometheusApiConfig, PrometheusService,
-    ServiceLifecycle, ShardTelemetryConfig, SignalConfig, SingleTenantConfig, StripeConfig,
-    TempoApiConfig, TempoService, loki_router, loki_router_with_clickhouse, otlp_http_router,
-    prometheus_router, serve_native, serve_otlp_grpc, single_tenant_loki_router, tempo_router,
+    DurableTelemetryConfig, DurableTelemetryStore, LokiApiConfig, NativeServerConfig,
+    OtlpIngestService, OtlpReceiverConfig, ProductionRuntime, PrometheusApiConfig,
+    PrometheusService, ServiceLifecycle, ShardTelemetryConfig, SignalConfig, SingleTenantConfig,
+    StripeConfig, TempoApiConfig, TempoService, loki_router, loki_router_with_clickhouse,
+    otlp_http_router, prometheus_router, serve_native, serve_otlp_grpc, single_tenant_loki_router,
+    tempo_router,
 };
 
 #[derive(Debug, Parser)]
@@ -172,7 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(arguments.listen).await?;
     let native_listener = tokio::net::TcpListener::bind(arguments.native_listen).await?;
     let otlp_http_listener = tokio::net::TcpListener::bind(arguments.otlp_http_listen).await?;
-    let store = Arc::new(DurableLokiStore::open(DurableLokiConfig {
+    let store = Arc::new(DurableTelemetryStore::open(DurableTelemetryConfig {
         data_directory: arguments.data_directory,
         object_store_directory: arguments.object_store_directory,
         recovery_journal: arguments.recovery_journal,

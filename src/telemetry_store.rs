@@ -33,7 +33,7 @@ const TENANT_FIELD: &str = "resource.loki.tenant";
 
 /// Standalone durable Loki-store configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DurableLokiConfig {
+pub struct DurableTelemetryConfig {
     /// Directory containing shard-stream packs, coordinator state, and index journals.
     pub data_directory: PathBuf,
     /// Optional local object-store directory used by shard-stream and ShardTelemetry.
@@ -62,7 +62,7 @@ pub struct DurableLokiConfig {
     pub indexed_ack_timeout: Duration,
 }
 
-impl DurableLokiConfig {
+impl DurableTelemetryConfig {
     fn validate(&self) -> Result<(), LokiApiError> {
         if self.shard_count == 0 {
             return Err(LokiApiError::configuration("shard_count must be nonzero"));
@@ -96,7 +96,7 @@ impl DurableLokiConfig {
 
 /// Loki protocol backend whose acknowledged writes are durable shard-stream
 /// appends and whose reads execute on the owning ShardTelemetry stripe workers.
-pub struct DurableLokiStore {
+pub struct DurableTelemetryStore {
     _data_directory_lease: DataDirectoryLease,
     engine: Arc<StreamEngine>,
     service: TelemetryService,
@@ -123,10 +123,10 @@ pub struct RetentionReport {
     pub advanced_offsets: u64,
 }
 
-impl std::fmt::Debug for DurableLokiStore {
+impl std::fmt::Debug for DurableTelemetryStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("DurableLokiStore")
+            .debug_struct("DurableTelemetryStore")
             .field("tenant_partitions", &self.tenant_partitions)
             .field("ingest_stripes_per_tenant", &self.ingest_stripes_per_tenant)
             .field("indexed_ack_timeout", &self.indexed_ack_timeout)
@@ -134,9 +134,9 @@ impl std::fmt::Debug for DurableLokiStore {
     }
 }
 
-impl DurableLokiStore {
+impl DurableTelemetryStore {
     /// Opens or recovers a standalone durable store.
-    pub fn open(config: DurableLokiConfig) -> Result<Self, LokiApiError> {
+    pub fn open(config: DurableTelemetryConfig) -> Result<Self, LokiApiError> {
         config.validate()?;
         let data_directory_lease = DataDirectoryLease::acquire(&config.data_directory)?;
         let deletes = DeleteCatalog::open(config.data_directory.join("delete-catalog-v1.json"))?;
@@ -749,7 +749,7 @@ fn same_remote_write_sample(
         && left.exemplars == right.exemplars
 }
 
-impl LokiStore for DurableLokiStore {
+impl LokiStore for DurableTelemetryStore {
     fn push(&self, tenant: &str, entries: Vec<LokiEntry>) -> Result<(), LokiApiError> {
         if entries.is_empty() {
             return Ok(());
@@ -1074,7 +1074,7 @@ mod tests {
             "shard-telemetry-signals-store-{}-{nonce}",
             std::process::id()
         ));
-        let store = DurableLokiStore::open(DurableLokiConfig {
+        let store = DurableTelemetryStore::open(DurableTelemetryConfig {
             data_directory: directory.clone(),
             object_store_directory: None,
             recovery_journal: true,
@@ -1192,7 +1192,7 @@ mod tests {
             "shard-telemetry-loki-store-{}-{nonce}",
             std::process::id()
         ));
-        let store = DurableLokiStore::open(DurableLokiConfig {
+        let store = DurableTelemetryStore::open(DurableTelemetryConfig {
             data_directory: directory.clone(),
             object_store_directory: None,
             recovery_journal: false,
@@ -1226,7 +1226,7 @@ mod tests {
         assert_eq!(entries[0].labels["app"], "api");
         assert_eq!(entries[0].structured_metadata["trace_id"], "abc-100");
         drop(store);
-        let recovered = DurableLokiStore::open(DurableLokiConfig {
+        let recovered = DurableTelemetryStore::open(DurableTelemetryConfig {
             data_directory: directory.clone(),
             object_store_directory: None,
             recovery_journal: false,
@@ -1257,7 +1257,7 @@ mod tests {
             std::process::id()
         ));
         let object_directory = directory.join("objects");
-        let config = DurableLokiConfig {
+        let config = DurableTelemetryConfig {
             data_directory: directory.clone(),
             object_store_directory: Some(object_directory.clone()),
             recovery_journal: false,
@@ -1268,7 +1268,7 @@ mod tests {
             stripe: StripeConfig::default(),
             indexed_ack_timeout: Duration::from_secs(30),
         };
-        let store = DurableLokiStore::open(config.clone()).expect("store opens");
+        let store = DurableTelemetryStore::open(config.clone()).expect("store opens");
         store
             .push(
                 "tenant-a",
@@ -1309,7 +1309,7 @@ mod tests {
         assert!(object_directory.exists());
         drop(store);
 
-        let recovered = DurableLokiStore::open(config).expect("store recovers from tier root");
+        let recovered = DurableTelemetryStore::open(config).expect("store recovers from tier root");
         let entries = recovered.entries("tenant-a").expect("recovered cold query");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].line, "cold request completed");
@@ -1328,7 +1328,7 @@ mod tests {
             "shard-telemetry-delete-store-{}-{nonce}",
             std::process::id()
         ));
-        let config = DurableLokiConfig {
+        let config = DurableTelemetryConfig {
             data_directory: directory.clone(),
             object_store_directory: None,
             recovery_journal: false,
@@ -1339,7 +1339,7 @@ mod tests {
             stripe: StripeConfig::default(),
             indexed_ack_timeout: Duration::from_secs(30),
         };
-        let store = DurableLokiStore::open(config.clone()).expect("store");
+        let store = DurableTelemetryStore::open(config.clone()).expect("store");
         store
             .push(
                 "tenant-a",
@@ -1398,7 +1398,7 @@ mod tests {
         assert!(rows.iter().all(|row| !row.message.ends_with("101")));
         drop(store);
 
-        let recovered = DurableLokiStore::open(config).expect("recovered store");
+        let recovered = DurableTelemetryStore::open(config).expect("recovered store");
         assert_eq!(recovered.delete_requests("tenant-a").unwrap().len(), 1);
         assert_eq!(recovered.entries("tenant-a").unwrap().len(), 2);
         assert!(recovered.cancel_delete("tenant-a", &request_id).unwrap());
@@ -1418,7 +1418,7 @@ mod tests {
             std::process::id()
         ));
         let now = i64::try_from(nonce).expect("current timestamp fits i64");
-        let config = DurableLokiConfig {
+        let config = DurableTelemetryConfig {
             data_directory: directory.clone(),
             object_store_directory: None,
             recovery_journal: true,
@@ -1429,7 +1429,7 @@ mod tests {
             stripe: StripeConfig::default(),
             indexed_ack_timeout: Duration::from_secs(30),
         };
-        let store = DurableLokiStore::open(config.clone()).expect("store");
+        let store = DurableTelemetryStore::open(config.clone()).expect("store");
         store
             .push(
                 "tenant-a",
@@ -1484,7 +1484,7 @@ mod tests {
         assert_eq!(report.advanced_offsets, 1);
         assert_eq!(store.operational_metrics().retention_runs, 1);
         drop(store);
-        let recovered = DurableLokiStore::open(config).expect("restart after compaction");
+        let recovered = DurableTelemetryStore::open(config).expect("restart after compaction");
         assert_eq!(recovered.entries("tenant-a").unwrap().len(), 1);
         drop(recovered);
         fs::remove_dir_all(directory).expect("cleanup");
@@ -1500,7 +1500,7 @@ mod tests {
             "shard-telemetry-ingest-pack-{}-{nonce}",
             std::process::id()
         ));
-        let store = DurableLokiStore::open(DurableLokiConfig {
+        let store = DurableTelemetryStore::open(DurableTelemetryConfig {
             data_directory: directory.clone(),
             object_store_directory: None,
             recovery_journal: false,
@@ -1558,7 +1558,7 @@ mod tests {
             "shard-telemetry-analytics-store-{}-{nonce}",
             std::process::id()
         ));
-        let store = DurableLokiStore::open(DurableLokiConfig {
+        let store = DurableTelemetryStore::open(DurableTelemetryConfig {
             data_directory: directory.clone(),
             object_store_directory: None,
             recovery_journal: false,
