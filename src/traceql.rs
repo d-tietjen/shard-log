@@ -100,8 +100,8 @@ impl TraceqlEngine {
         end_time_unix_nanos: Option<u64>,
         limit: usize,
     ) -> Result<Vec<TraceqlTrace>, TraceqlError> {
-        let filter = TraceFilter::parse(expression)?;
-        let pushed_trace_id = filter.exact_trace_id();
+        let expression = SpansetExpr::parse(expression)?;
+        let pushed_trace_id = expression.exact_trace_id();
         let spans = self
             .store
             .query_traces(&TraceQuery {
@@ -115,18 +115,23 @@ impl TraceqlEngine {
             .map_err(|error| TraceqlError::new(error.to_string()))?;
         let mut traces = BTreeMap::<TraceId, Vec<DurableSpan>>::new();
         for span in spans {
-            if filter.matches(&span) {
-                traces.entry(span.trace_id).or_default().push(span);
-            }
+            traces.entry(span.trace_id).or_default().push(span);
         }
         let result_limit = limit.max(1).min(self.limits.max_traces);
         let mut results = traces
             .into_iter()
-            .map(|(trace_id, mut spans)| {
+            .filter_map(|(trace_id, mut spans)| {
                 spans.sort_unstable_by_key(|span| {
                     (span.start_time_unix_nanos, span.record_ref.offset)
                 });
-                summarize(trace_id, spans)
+                let selected = expression.evaluate(&spans);
+                (!selected.is_empty()).then(|| {
+                    let spans = selected
+                        .into_iter()
+                        .map(|index| spans[index].clone())
+                        .collect();
+                    summarize(trace_id, spans)
+                })
             })
             .collect::<Vec<_>>();
         results.sort_unstable_by_key(|trace| {
@@ -186,6 +191,285 @@ fn summarize(trace_id: TraceId, spans: Vec<DurableSpan>) -> TraceqlTrace {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StructuralRelation {
+    Descendant,
+    Ancestor,
+    Child,
+    Parent,
+    Sibling,
+}
+
+#[derive(Debug, Clone)]
+enum SpansetExpr {
+    Selector(TraceFilter),
+    And(Box<Self>, Box<Self>),
+    Or(Box<Self>, Box<Self>),
+    Structural {
+        left: Box<Self>,
+        right: Box<Self>,
+        relation: StructuralRelation,
+        union: bool,
+        negated: bool,
+    },
+}
+
+impl SpansetExpr {
+    fn parse(input: &str) -> Result<Self, TraceqlError> {
+        let input = trim_enclosing_parentheses(input.trim());
+        if input.is_empty() {
+            return Ok(Self::Selector(TraceFilter::True));
+        }
+        if let Some((index, token)) = find_top_level_operator(input, &["||"]) {
+            return Ok(Self::Or(
+                Box::new(Self::parse(&input[..index])?),
+                Box::new(Self::parse(&input[index + token.len()..])?),
+            ));
+        }
+        if let Some((index, token)) = find_top_level_operator(input, &["&&"]) {
+            return Ok(Self::And(
+                Box::new(Self::parse(&input[..index])?),
+                Box::new(Self::parse(&input[index + token.len()..])?),
+            ));
+        }
+        if let Some((index, token)) = find_top_level_operator(
+            input,
+            &[
+                "!>>", "!<<", "&>>", "&<<", "!>", "!<", "!~", "&>", "&<", "&~", ">>", "<<", ">",
+                "<", "~",
+            ],
+        ) {
+            let (relation, union, negated) = match token {
+                ">>" => (StructuralRelation::Descendant, false, false),
+                "<<" => (StructuralRelation::Ancestor, false, false),
+                ">" => (StructuralRelation::Child, false, false),
+                "<" => (StructuralRelation::Parent, false, false),
+                "~" => (StructuralRelation::Sibling, false, false),
+                "&>>" => (StructuralRelation::Descendant, true, false),
+                "&<<" => (StructuralRelation::Ancestor, true, false),
+                "&>" => (StructuralRelation::Child, true, false),
+                "&<" => (StructuralRelation::Parent, true, false),
+                "&~" => (StructuralRelation::Sibling, true, false),
+                "!>>" => (StructuralRelation::Descendant, false, true),
+                "!<<" => (StructuralRelation::Ancestor, false, true),
+                "!>" => (StructuralRelation::Child, false, true),
+                "!<" => (StructuralRelation::Parent, false, true),
+                "!~" => (StructuralRelation::Sibling, false, true),
+                _ => unreachable!("operator table is exhaustive"),
+            };
+            return Ok(Self::Structural {
+                left: Box::new(Self::parse(&input[..index])?),
+                right: Box::new(Self::parse(&input[index + token.len()..])?),
+                relation,
+                union,
+                negated,
+            });
+        }
+        Ok(Self::Selector(TraceFilter::parse(input)?))
+    }
+
+    fn evaluate(&self, spans: &[DurableSpan]) -> Vec<usize> {
+        match self {
+            Self::Selector(filter) => spans
+                .iter()
+                .enumerate()
+                .filter_map(|(index, span)| filter.matches(span, spans).then_some(index))
+                .collect(),
+            Self::And(left, right) => {
+                let left = left.evaluate(spans);
+                let right = right.evaluate(spans);
+                if left.is_empty() || right.is_empty() {
+                    Vec::new()
+                } else {
+                    ordered_union(left, right)
+                }
+            }
+            Self::Or(left, right) => ordered_union(left.evaluate(spans), right.evaluate(spans)),
+            Self::Structural {
+                left,
+                right,
+                relation,
+                union,
+                negated,
+            } => {
+                let left = left.evaluate(spans);
+                let right = right.evaluate(spans);
+                let mut matching_left = Vec::new();
+                let mut matching_right = Vec::new();
+                for right_index in right {
+                    let related = left.iter().copied().filter(|left_index| {
+                        spans_related(spans, *left_index, right_index, *relation)
+                    });
+                    let related = related.collect::<Vec<_>>();
+                    if (*negated && related.is_empty()) || (!*negated && !related.is_empty()) {
+                        matching_right.push(right_index);
+                        if *union && !*negated {
+                            matching_left.extend(related);
+                        }
+                    }
+                }
+                if *union {
+                    ordered_union(matching_left, matching_right)
+                } else {
+                    sorted_unique(matching_right)
+                }
+            }
+        }
+    }
+
+    fn exact_trace_id(&self) -> Option<TraceId> {
+        match self {
+            Self::Selector(filter) => filter.exact_trace_id(),
+            Self::And(left, right) | Self::Structural { left, right, .. } => {
+                left.exact_trace_id().or_else(|| right.exact_trace_id())
+            }
+            Self::Or(_, _) => None,
+        }
+    }
+}
+
+fn sorted_unique(mut indexes: Vec<usize>) -> Vec<usize> {
+    indexes.sort_unstable();
+    indexes.dedup();
+    indexes
+}
+
+fn ordered_union(mut left: Vec<usize>, right: Vec<usize>) -> Vec<usize> {
+    left.extend(right);
+    sorted_unique(left)
+}
+
+fn spans_related(
+    spans: &[DurableSpan],
+    left_index: usize,
+    right_index: usize,
+    relation: StructuralRelation,
+) -> bool {
+    if left_index == right_index {
+        return false;
+    }
+    let left = &spans[left_index];
+    let right = &spans[right_index];
+    match relation {
+        StructuralRelation::Descendant => is_ancestor(spans, left.span_id, right_index, false),
+        StructuralRelation::Ancestor => is_ancestor(spans, right.span_id, left_index, false),
+        StructuralRelation::Child => right.parent_span_id == Some(left.span_id),
+        StructuralRelation::Parent => left.parent_span_id == Some(right.span_id),
+        StructuralRelation::Sibling => {
+            left.parent_span_id.is_some() && left.parent_span_id == right.parent_span_id
+        }
+    }
+}
+
+fn is_ancestor(
+    spans: &[DurableSpan],
+    ancestor: crate::SpanId,
+    descendant_index: usize,
+    include_self: bool,
+) -> bool {
+    let mut current = if include_self {
+        Some(spans[descendant_index].span_id)
+    } else {
+        spans[descendant_index].parent_span_id
+    };
+    for _ in 0..spans.len() {
+        let Some(span_id) = current else {
+            return false;
+        };
+        if span_id == ancestor {
+            return true;
+        }
+        current = spans
+            .iter()
+            .find(|span| span.span_id == span_id)
+            .and_then(|span| span.parent_span_id);
+    }
+    false
+}
+
+fn find_top_level_operator<'a>(input: &'a str, operators: &[&'a str]) -> Option<(usize, &'a str)> {
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut braces = 0_u32;
+    let mut parentheses = 0_u32;
+    for (index, character) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quoted && character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if character == '"' {
+            quoted = !quoted;
+            continue;
+        }
+        if quoted {
+            continue;
+        }
+        match character {
+            '{' => braces = braces.saturating_add(1),
+            '}' => braces = braces.saturating_sub(1),
+            '(' => parentheses = parentheses.saturating_add(1),
+            ')' => parentheses = parentheses.saturating_sub(1),
+            _ if braces == 0 && parentheses == 0 => {
+                if let Some(operator) = operators
+                    .iter()
+                    .copied()
+                    .find(|operator| input[index..].starts_with(operator))
+                {
+                    return Some((index, operator));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn trim_enclosing_parentheses(mut input: &str) -> &str {
+    loop {
+        let Some(inner) = input
+            .strip_prefix('(')
+            .and_then(|value| value.strip_suffix(')'))
+        else {
+            return input;
+        };
+        if find_matching_parenthesis(input) != Some(input.len() - 1) {
+            return input;
+        }
+        input = inner.trim();
+    }
+}
+
+fn find_matching_parenthesis(input: &str) -> Option<usize> {
+    let mut depth = 0_u32;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, character) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if quoted && character == '\\' {
+            escaped = true;
+            continue;
+        }
+        if character == '"' {
+            quoted = !quoted;
+        } else if !quoted && character == '(' {
+            depth = depth.saturating_add(1);
+        } else if !quoted && character == ')' {
+            depth = depth.saturating_sub(1);
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
 #[derive(Debug, Clone)]
 enum TraceFilter {
     True,
@@ -231,12 +515,12 @@ impl TraceFilter {
         Condition::parse(body).map(Self::Condition)
     }
 
-    fn matches(&self, span: &DurableSpan) -> bool {
+    fn matches(&self, span: &DurableSpan, trace: &[DurableSpan]) -> bool {
         match self {
             Self::True => true,
-            Self::Condition(condition) => condition.matches(span),
-            Self::And(filters) => filters.iter().all(|filter| filter.matches(span)),
-            Self::Or(filters) => filters.iter().any(|filter| filter.matches(span)),
+            Self::Condition(condition) => condition.matches(span, trace),
+            Self::And(filters) => filters.iter().all(|filter| filter.matches(span, trace)),
+            Self::Or(filters) => filters.iter().any(|filter| filter.matches(span, trace)),
         }
     }
 
@@ -286,9 +570,9 @@ impl Condition {
         )))
     }
 
-    fn matches(&self, span: &DurableSpan) -> bool {
-        let observed = field_value(span, &self.field);
-        compare(observed.as_ref(), &self.value, self.operation)
+    fn matches(&self, span: &DurableSpan, trace: &[DurableSpan]) -> bool {
+        let observed = field_values(span, trace, &self.field);
+        compare(&observed, &self.value, self.operation)
     }
 
     fn exact_trace_id(&self) -> Option<TraceId> {
@@ -315,6 +599,7 @@ enum Comparison {
 
 #[derive(Debug, Clone)]
 enum Literal {
+    Nil,
     String(String),
     Integer(i64),
     Float(f64),
@@ -324,6 +609,9 @@ enum Literal {
 
 impl Literal {
     fn parse(input: &str) -> Result<Self, TraceqlError> {
+        if input == "nil" {
+            return Ok(Self::Nil);
+        }
         if input.starts_with('"') {
             return serde_json::from_str::<String>(input)
                 .map(Self::String)
@@ -354,36 +642,104 @@ enum ObservedValue {
     Duration(u64),
 }
 
-fn field_value(span: &DurableSpan, field: &str) -> Option<ObservedValue> {
-    match field {
+fn field_values(span: &DurableSpan, trace: &[DurableSpan], field: &str) -> Vec<ObservedValue> {
+    let singleton = match field {
         "name" | "span:name" => Some(ObservedValue::String(span.name.to_string())),
         "duration" | "span:duration" => Some(ObservedValue::Duration(span.duration_nanos)),
+        "traceDuration" | "trace:duration" => trace_duration(trace).map(ObservedValue::Duration),
+        "rootName" | "trace:rootName" => trace
+            .iter()
+            .find(|candidate| candidate.parent_span_id.is_none())
+            .map(|root| ObservedValue::String(root.name.to_string())),
+        "rootServiceName" | "trace:rootServiceName" => trace
+            .iter()
+            .find(|candidate| candidate.parent_span_id.is_none())
+            .and_then(|root| attribute(&root.resource.attributes, "service.name"))
+            .and_then(observed_telemetry_value),
         "kind" | "span:kind" => Some(ObservedValue::Integer(i64::from(span.kind))),
         "status" | "span:status" => Some(ObservedValue::Integer(i64::from(
             span.status.as_ref().map_or(0, |status| status.code),
         ))),
-        "statusMessage" | "span:statusMessage" => Some(ObservedValue::String(
-            span.status
-                .as_ref()
-                .map_or_else(String::new, |status| status.message.to_string()),
-        )),
+        "statusMessage" | "span:statusMessage" => span
+            .status
+            .as_ref()
+            .map(|status| ObservedValue::String(status.message.to_string())),
         "trace:id" => Some(ObservedValue::String(span.trace_id.to_string())),
         "span:id" => Some(ObservedValue::String(span.span_id.to_string())),
-        "parent" | "span:parent" => Some(ObservedValue::String(
-            span.parent_span_id
-                .map_or_else(String::new, |id| id.to_string()),
-        )),
-        _ => field
-            .strip_prefix("resource.")
-            .and_then(|key| attribute(&span.resource.attributes, key))
-            .or_else(|| {
-                field
-                    .strip_prefix("span.")
-                    .and_then(|key| attribute(&span.attributes, key))
-            })
-            .or_else(|| attribute(&span.attributes, field))
-            .and_then(observed_telemetry_value),
+        "parent" | "span:parent" => span
+            .parent_span_id
+            .map(|id| ObservedValue::String(id.to_string())),
+        "instrumentation:name" | "scope:name" => {
+            Some(ObservedValue::String(span.scope.name.to_string()))
+        }
+        "instrumentation:version" | "scope:version" => {
+            Some(ObservedValue::String(span.scope.version.to_string()))
+        }
+        _ => None,
+    };
+    if let Some(value) = singleton {
+        return vec![value];
     }
+
+    let mut observed = Vec::new();
+    match field {
+        "event:name" => observed.extend(
+            span.events
+                .iter()
+                .map(|event| ObservedValue::String(event.name.to_string())),
+        ),
+        "link:traceID" | "link:traceId" => observed.extend(
+            span.links
+                .iter()
+                .map(|link| ObservedValue::String(link.trace_id.to_string())),
+        ),
+        "link:spanID" | "link:spanId" => observed.extend(
+            span.links
+                .iter()
+                .map(|link| ObservedValue::String(link.span_id.to_string())),
+        ),
+        _ => {
+            let value = field
+                .strip_prefix("resource.")
+                .and_then(|key| attribute(&span.resource.attributes, key))
+                .or_else(|| {
+                    field
+                        .strip_prefix("span.")
+                        .and_then(|key| attribute(&span.attributes, key))
+                })
+                .or_else(|| {
+                    field
+                        .strip_prefix("instrumentation.")
+                        .and_then(|key| attribute(&span.scope.attributes, key))
+                })
+                .or_else(|| attribute(&span.attributes, field));
+            if let Some(value) = value {
+                append_observed_values(value, &mut observed);
+            } else if let Some(key) = field.strip_prefix("event.") {
+                for event in span.events.iter() {
+                    if let Some(value) = attribute(&event.attributes, key) {
+                        append_observed_values(value, &mut observed);
+                    }
+                }
+            } else if let Some(key) = field.strip_prefix("link.") {
+                for link in span.links.iter() {
+                    if let Some(value) = attribute(&link.attributes, key) {
+                        append_observed_values(value, &mut observed);
+                    }
+                }
+            }
+        }
+    }
+    observed
+}
+
+fn trace_duration(trace: &[DurableSpan]) -> Option<u64> {
+    let start = trace.iter().map(|span| span.start_time_unix_nanos).min()?;
+    let end = trace
+        .iter()
+        .filter_map(DurableSpan::end_time_unix_nanos)
+        .max()?;
+    end.checked_sub(start)
 }
 
 fn attribute<'a>(attributes: &'a [TelemetryAttribute], key: &str) -> Option<&'a TelemetryValue> {
@@ -400,11 +756,22 @@ fn observed_telemetry_value(value: &TelemetryValue) -> Option<ObservedValue> {
         TelemetryValue::Boolean(value) => Some(ObservedValue::Boolean(*value)),
         TelemetryValue::Integer(value) => Some(ObservedValue::Integer(*value)),
         TelemetryValue::DoubleBits(bits) => Some(ObservedValue::Float(f64::from_bits(*bits))),
+        TelemetryValue::StringTableIndex(value) => Some(ObservedValue::Integer(i64::from(*value))),
         TelemetryValue::Empty
         | TelemetryValue::Bytes(_)
         | TelemetryValue::Array(_)
-        | TelemetryValue::Map(_)
-        | TelemetryValue::StringTableIndex(_) => None,
+        | TelemetryValue::Map(_) => None,
+    }
+}
+
+fn append_observed_values(value: &TelemetryValue, output: &mut Vec<ObservedValue>) {
+    match value {
+        TelemetryValue::Array(values) => {
+            for value in values.iter() {
+                append_observed_values(value, output);
+            }
+        }
+        _ => output.extend(observed_telemetry_value(value)),
     }
 }
 
@@ -415,19 +782,36 @@ fn value_string(value: &TelemetryValue) -> Option<&str> {
     }
 }
 
-fn compare(observed: Option<&ObservedValue>, expected: &Literal, operation: Comparison) -> bool {
-    let Some(observed) = observed else {
-        return operation == Comparison::NotEqual || operation == Comparison::NotRegex;
-    };
-    if matches!(operation, Comparison::Regex | Comparison::NotRegex) {
+fn compare(observed: &[ObservedValue], expected: &Literal, operation: Comparison) -> bool {
+    if matches!(expected, Literal::Nil) {
+        return match operation {
+            Comparison::Equal => observed.is_empty(),
+            Comparison::NotEqual => !observed.is_empty(),
+            _ => false,
+        };
+    }
+    if observed.is_empty() {
+        return false;
+    }
+    match operation {
+        Comparison::NotEqual => observed
+            .iter()
+            .all(|value| !compare_one(value, expected, Comparison::Equal)),
+        Comparison::NotRegex => observed
+            .iter()
+            .all(|value| !compare_one(value, expected, Comparison::Regex)),
+        _ => observed
+            .iter()
+            .any(|value| compare_one(value, expected, operation)),
+    }
+}
+
+fn compare_one(observed: &ObservedValue, expected: &Literal, operation: Comparison) -> bool {
+    if operation == Comparison::Regex {
         let observed = observed_string(observed);
         let expected = literal_string(expected);
-        let matched = Regex::new(&expected).is_ok_and(|regex| regex.is_match(&observed));
-        return if operation == Comparison::Regex {
-            matched
-        } else {
-            !matched
-        };
+        return Regex::new(&format!("^(?:{expected})$"))
+            .is_ok_and(|regex| regex.is_match(&observed));
     }
     match (numeric_observed(observed), numeric_literal(expected)) {
         (Some(left), Some(right)) => compare_order(left, right, operation),
@@ -470,6 +854,7 @@ fn numeric_observed(value: &ObservedValue) -> Option<f64> {
 
 fn numeric_literal(value: &Literal) -> Option<f64> {
     match value {
+        Literal::Nil => None,
         Literal::Integer(value) => Some(*value as f64),
         Literal::Float(value) => Some(*value),
         Literal::Duration(value) => Some(*value as f64),
@@ -489,6 +874,7 @@ fn observed_string(value: &ObservedValue) -> String {
 
 fn literal_string(value: &Literal) -> String {
     match value {
+        Literal::Nil => "nil".to_owned(),
         Literal::String(value) => value.clone(),
         Literal::Integer(value) => value.to_string(),
         Literal::Float(value) => value.to_string(),
@@ -575,6 +961,39 @@ fn parse_trace_id(value: &str) -> Option<TraceId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use shard_stream_core::{LogicalOffset, LogicalPartitionId, ShardId, TopicId, TopicPartition};
+
+    use crate::{ResourceContext, ScopeContext, SpanId, TelemetryRecordRef, TelemetrySignal};
+
+    fn span(index: u8, parent: Option<u8>, name: &str) -> DurableSpan {
+        DurableSpan {
+            stream_shard_id: ShardId::new(0),
+            record_ref: TelemetryRecordRef::for_signal(
+                TelemetrySignal::Traces,
+                TopicPartition::new(TopicId::new(2), LogicalPartitionId::new(0)),
+                LogicalOffset::new(u64::from(index)),
+            ),
+            tenant: Arc::from("tenant"),
+            resource: Arc::new(ResourceContext::default()),
+            scope: Arc::new(ScopeContext::default()),
+            trace_id: TraceId::from_bytes([1; 16]).unwrap(),
+            span_id: SpanId::from_bytes([index; 8]).unwrap(),
+            parent_span_id: parent.map(|parent| SpanId::from_bytes([parent; 8]).unwrap()),
+            trace_state: Arc::from(""),
+            flags: 0,
+            name: Arc::from(name),
+            kind: 0,
+            start_time_unix_nanos: u64::from(index),
+            duration_nanos: 1,
+            attributes: Arc::default(),
+            dropped_attributes_count: 0,
+            events: Arc::default(),
+            dropped_events_count: 0,
+            links: Arc::default(),
+            dropped_links_count: 0,
+            status: None,
+        }
+    }
 
     #[test]
     fn clean_room_filter_parses_typed_conditions_and_boolean_groups() {
@@ -592,5 +1011,78 @@ mod tests {
         )
         .unwrap();
         assert_eq!(filter.exact_trace_id(), TraceId::from_bytes([1; 16]).ok());
+    }
+
+    #[test]
+    fn structural_operators_select_related_spans() {
+        let spans = vec![
+            span(1, None, "root"),
+            span(2, Some(1), "child"),
+            span(3, Some(2), "grandchild"),
+            span(4, Some(1), "sibling"),
+            span(5, None, "orphan"),
+        ];
+        let descendants = SpansetExpr::parse(r#"{ name = "root" } >> { name = "grandchild" }"#)
+            .unwrap()
+            .evaluate(&spans);
+        assert_eq!(descendants, vec![2]);
+
+        let siblings = SpansetExpr::parse(r#"{ name = "child" } ~ { name = "sibling" }"#)
+            .unwrap()
+            .evaluate(&spans);
+        assert_eq!(siblings, vec![3]);
+
+        let negative = SpansetExpr::parse(r#"{ name = "root" } !>> { name = "orphan" }"#)
+            .unwrap()
+            .evaluate(&spans);
+        assert_eq!(negative, vec![4]);
+    }
+
+    #[test]
+    fn union_structural_operator_returns_both_sides() {
+        let spans = vec![span(1, None, "root"), span(2, Some(1), "child")];
+        let selected = SpansetExpr::parse(r#"{ name = "root" } &> { name = "child" }"#)
+            .unwrap()
+            .evaluate(&spans);
+        assert_eq!(selected, vec![0, 1]);
+    }
+
+    #[test]
+    fn arrays_nil_and_regex_follow_traceql_match_semantics() {
+        let mut record = span(1, None, "checkout-handler");
+        record.attributes = Arc::new(vec![TelemetryAttribute::new(
+            "roles",
+            TelemetryValue::Array(Arc::new(vec![
+                TelemetryValue::String(Arc::from("reader")),
+                TelemetryValue::String(Arc::from("writer")),
+            ])),
+        )]);
+        let spans = vec![record];
+
+        assert_eq!(
+            SpansetExpr::parse(r#"{ span.roles = "writer" }"#)
+                .unwrap()
+                .evaluate(&spans),
+            vec![0]
+        );
+        assert!(
+            SpansetExpr::parse(r#"{ span.roles != "reader" }"#)
+                .unwrap()
+                .evaluate(&spans)
+                .is_empty()
+        );
+        assert_eq!(
+            SpansetExpr::parse(r#"{ span.missing = nil }"#)
+                .unwrap()
+                .evaluate(&spans),
+            vec![0]
+        );
+        assert!(
+            SpansetExpr::parse(r#"{ name =~ "checkout" }"#)
+                .unwrap()
+                .evaluate(&spans)
+                .is_empty(),
+            "TraceQL regexes are anchored"
+        );
     }
 }
