@@ -71,7 +71,7 @@ Retained evidence:
 ### Adam traces and metrics versus ClickHouse — 2026-08-04
 
 The exact public revision
-`b1b27118085c344cc1a8a82e04718df38d01c35d` was compared with ClickHouse
+`b05123a60104eb54c463f9f63d52a76f8e0109e0` was compared with ClickHouse
 26.5.1.882 three times sequentially on physical CPU 0. Each run used the same
 deterministic 262,144-record corpus per signal and 2,000 warm lookup
 iterations. The tables report medians.
@@ -86,28 +86,54 @@ called `sync_all`.
 
 | Signal | Engine | Canonical bytes | Durable bytes | Ratio | Durable encode |
 | --- | --- | ---: | ---: | ---: | ---: |
-| Traces | **ShardTelemetry** | 107,609,736 | **1,558,432** | **69.05x** | **261.28 MiB/s** |
-| Traces | ClickHouse | 107,609,736 | 5,753,460 | 18.70x | 106.90 MiB/s |
-| Metrics | **ShardTelemetry** | 126,451,328 | **2,244,829** | **56.33x** | **578.82 MiB/s** |
-| Metrics | ClickHouse | 126,451,328 | 3,882,804 | 32.57x | 113.77 MiB/s |
+| Traces | **ShardTelemetry** | 107,609,736 | **1,558,432** | **69.05x** | **268.55 MiB/s** |
+| Traces | ClickHouse | 107,609,736 | 5,753,460 | 18.70x | 103.66 MiB/s |
+| Metrics | **ShardTelemetry** | 126,451,328 | **2,244,829** | **56.33x** | **596.09 MiB/s** |
+| Metrics | ClickHouse | 126,451,328 | 3,882,804 | 32.57x | 110.64 MiB/s |
 
-ShardTelemetry used 72.91% fewer bytes and encoded 2.44x faster for traces. It
-used 42.19% fewer bytes and encoded 5.09x faster for metrics. The metric corpus
+ShardTelemetry used 72.91% fewer bytes and encoded 2.59x faster for traces. It
+used 42.19% fewer bytes and encoded 5.39x faster for metrics. The metric corpus
 contains exactly 128 series with 2,048 points each, so every series stays below
 the production 4,096-point chunk bound.
 
 | Warm lookup | Results | ShardTelemetry ops/s | ShardTelemetry p50 / p99 | ClickHouse ops/s | ClickHouse p50 / p99 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Trace ID | 8 | **1,174.60** | **0.796 / 1.697 ms** | 335.07 | 2 / 6 ms |
-| Exact metric series | 100 | 178.88 | 5.554 / **6.681 ms** | **269.92** | **3** / 9 ms |
+| Trace ID | 8 | **700,272.02** | **0.00138 / 0.00140 ms** | 338.36 | 2 / 6 ms |
+| Exact metric series | 100 | **12,297.18** | **0.080 / 0.124 ms** | 267.40 | 3 / 9 ms |
 
-ShardTelemetry completed 3.51x more trace-ID lookups per second. ClickHouse
-completed 1.51x more exact-series metric lookups per second and had the lower
-metric p50, while ShardTelemetry retained the lower metric p99. The
-ShardTelemetry measurements use the native Rust query API; ClickHouse uses one
-persistent `clickhouse-benchmark` client/server connection, whose percentile
-output is quantized to milliseconds. This is an engine-boundary comparison,
-not a same-wire-protocol claim.
+ShardTelemetry completed 2,069.59x more trace-ID lookups and 45.99x more exact
+metric-series lookups per second. Its trace p50 was 1,449x lower and its metric
+p50 was 37.44x lower. The ShardTelemetry measurements use the native Rust query
+API; ClickHouse uses one persistent `clickhouse-benchmark` client/server
+connection, whose percentile output is quantized to milliseconds. This is an
+engine-boundary comparison, not a same-wire-protocol claim.
+
+The improvement was profile-guided. The baseline revision recomputed a full
+series fingerprint for every decoded metric point, materialized every metric
+chunk before applying the result limit, scanned every trace head and resident
+trace block for an exact ID, and cloned the smallest complete correlation
+posting before intersecting and truncating it. The current paths instead use:
+
+- direct exact-series and exact-trace ownership lookups;
+- timestamp-ordered metric chunk pruning with conflict-safe cutoff;
+- trace-directory fragment pushdown into block-ID-keyed resident storage;
+- one identity check per exact metric series rather than one per point; and
+- bounded streaming correlation intersection with monotonic posting cursors.
+
+On the same 262,144-record corpus and 10,000 iterations, the profile workload
+fell from approximately 1.361 trillion to 72.36 billion sampled CPU cycles, a
+94.68% reduction, with zero lost samples. Metric lookup improved from a
+three-run median of 178.88 to 12,297.18 operations per second. Cross-signal
+correlation improved from 35.46 to 98,596.33 operations per second while
+retaining its 1,000-reference page and exact ordering.
+
+The final profile's largest self-costs are now the log hot-posting collector
+(9.25%), BLAKE3 canonical hashing (6.58%), correlation ingestion (5.81%), and
+hot log matching (3.78%). Metric decoding is 0.57% self time, and neither
+exact trace lookup nor metric lookup remains a leading flat hotspot. The next
+optimization work should therefore target limit-aware log-posting iteration
+and cached immutable resource, scope, attribute, and series identities rather
+than changing the trace or metric compression codecs.
 
 Before timing, ClickHouse returned the selected trace and the complete
 2,048-point metric series as byte-identical MessagePack. All three runs produced
@@ -119,16 +145,21 @@ attribute, trace, span-link, and exemplar postings across all three signals.
 Retained evidence:
 
 ```text
-/home/dtietjen/shard-telemetry-signal-clickhouse-head-to-head/measured-b1b2711-r{1,2,3}
+/home/dtietjen/shard-telemetry-signal-clickhouse-head-to-head/optimized-b05123a-r{1,2,3}
+/home/dtietjen/shard-telemetry-profiles/b1b2711-baseline
+/home/dtietjen/shard-telemetry-profiles/b05123a-final
 ```
 
 The three `summary.tsv` SHA-256 values are, in run order:
 
 ```text
-7879cedfb8bd732b39bb9ab8f12dac6aecd1b6d3816e73d58775c3038def0adf
-018b6b06a69e77b90a5cd502cec868e0f2d233082cd36402296b27108aacd858
-dcc60d8f27ef0b968b46dd1c24e0b53ccb7f4ecca704d8ab7570cd5dcb1c94ca
+ca64e0c303a1f1addb76b8bdc03e39431467b664fe0a4d96c4cfeaa075dd4ded
+f4fc215d8ea58c7fabfaa3e1219f4385428a9035afa425e83a95b56a165a2b82
+2df2e3af2c2ce0fbf6dcb08be5136e464517314854c75ce1bda2223e395131f5
 ```
+
+The final `perf.data` SHA-256 is
+`72bbf5ef59b6fab5aae8b7676a9d68fb8b9d4b66d5e49ac498ee73e791831712`.
 
 These are deterministic production-like records, not retained production
 captures. A publishable production-corpus claim still requires the planned
